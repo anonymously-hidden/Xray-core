@@ -1838,3 +1838,29 @@ func TestSlotTailBodyIsNotTailMarked(t *testing.T) {
 		t.Fatal("a body download must not use the tail request pool")
 	}
 }
+
+func TestTakeSpareSkipsStale(t *testing.T) {
+	cfg := &Config{}
+	p := params{sessionTTL: 5 * time.Minute}
+
+	stale, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("newLocalStorage: %v", err)
+	}
+	fresh, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("newLocalStorage: %v", err)
+	}
+
+	box := spareBoxFor(cfg)
+	box.ch <- spareRing{storage: stale, session: "old", at: time.Now().Add(-time.Hour)}
+	box.ch <- spareRing{storage: fresh, session: "new", at: time.Now()}
+
+	spare, ok := takeSpare(cfg, p)
+	if !ok || spare.session != "new" {
+		t.Fatalf("takeSpare returned %q ok=%v, want the fresh spare \"new\"", spare.session, ok)
+	}
+	if _, ok := takeSpare(cfg, p); ok {
+		t.Fatal("takeSpare returned a second spare from an empty box")
+	}
+}

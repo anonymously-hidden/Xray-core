@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -23,6 +24,11 @@ const (
 	streamsDir   = "streams"
 	uplinkDir    = "c2s"
 	downlinkDir  = "s2c"
+)
+
+const (
+	spareCount    = 2
+	spareIdleStop = 10 * time.Minute
 )
 
 func init() {
@@ -80,30 +86,137 @@ func streamConfig(streamSettings *internet.MemoryStreamConfig) (*Config, error) 
 	return config, nil
 }
 
+type spareRing struct {
+	storage Storage
+	session string
+	table   [2]slotTable
+	at      time.Time
+}
+
+type spareBox struct {
+	ch   chan spareRing
+	busy atomic.Bool
+	last atomic.Int64
+}
+
+var spareBoxes sync.Map
+
+func spareBoxFor(config *Config) *spareBox {
+	if b, ok := spareBoxes.Load(config); ok {
+		return b.(*spareBox)
+	}
+	b, _ := spareBoxes.LoadOrStore(config, &spareBox{ch: make(chan spareRing, spareCount)})
+	return b.(*spareBox)
+}
+
+func takeSpare(config *Config, p params) (spareRing, bool) {
+	box := spareBoxFor(config)
+	for {
+		select {
+		case s := <-box.ch:
+			if time.Since(s.at) < p.sessionTTL*2/3 {
+				return s, true
+			}
+			s.storage.Close()
+		default:
+			return spareRing{}, false
+		}
+	}
+}
+
+func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
+	spareBoxFor(config).last.Store(time.Now().UnixNano())
+	fillSpares(streamSettings, config, p)
+}
+
+func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
+	box := spareBoxFor(config)
+	if !box.busy.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer box.busy.Store(false)
+		for n := len(box.ch); n > 0; n-- {
+			select {
+			case s := <-box.ch:
+				if time.Since(s.at) < p.sessionTTL/3 {
+					box.ch <- s
+				} else {
+					s.storage.Close()
+				}
+			default:
+			}
+		}
+		for len(box.ch) < cap(box.ch) {
+			time.Sleep(2 * time.Second)
+			storage, err := newStorage(streamSettings)
+			if err != nil {
+				return
+			}
+			slots, ok := storage.(slotStore)
+			if !ok {
+				storage.Close()
+				return
+			}
+			session, err := newSessionID()
+			if err != nil {
+				storage.Close()
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			table, err := buildSlotTable(ctx, slots, session, p)
+			cancel()
+			if err != nil {
+				storage.Close()
+				return
+			}
+			select {
+			case box.ch <- spareRing{storage: storage, session: session, table: table, at: time.Now()}:
+			default:
+				storage.Close()
+				return
+			}
+		}
+		time.AfterFunc(p.sessionTTL/4, func() {
+			if time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
+				fillSpares(streamSettings, config, p)
+			}
+		})
+	}()
+}
+
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	config, err := streamConfig(streamSettings)
 	if err != nil {
 		return nil, err
 	}
 
-	storage, err := newStorage(streamSettings)
-	if err != nil {
-		return nil, err
-	}
-
-	session, err := newSessionID()
-	if err != nil {
-		storage.Close()
-		return nil, err
-	}
-
 	p := paramsFromConfig(config)
 
+	spare, warm := takeSpare(config, p)
+	storage, session := spare.storage, spare.session
+	if !warm {
+		storage, err = newStorage(streamSettings)
+		if err != nil {
+			return nil, err
+		}
+		session, err = newSessionID()
+		if err != nil {
+			storage.Close()
+			return nil, err
+		}
+	}
+
 	if slots, ok := storage.(slotStore); ok {
-		table, err := buildSlotTable(ctx, slots, session, p)
-		if err == nil {
+		table := spare.table
+		var built error
+		if !warm {
+			table, built = buildSlotTable(ctx, slots, session, p)
+		}
+		if built == nil {
 			announce := encodeAnnounce(slotAnnounce{Uplink: table[0], Downlink: table[1]})
 			if err := storage.Put(ctx, announceName(session, time.Now()), []byte(announce)); err == nil {
+				warmSpares(streamSettings, config, p)
 				errors.LogInfo(ctx, "opened session ", session, " on a slot ring of depth ",
 					len(table[0].Slots))
 				return newSlotConn(context.Background(), slots, slotAnnounce{
@@ -115,7 +228,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			}
 		} else {
 			errors.LogWarning(ctx, "failed to build the slot ring, falling back to the ",
-				"segment protocol: ", err)
+				"segment protocol: ", built)
 		}
 	}
 
