@@ -1900,6 +1900,129 @@ func TestSlotTailBodyIsNotTailMarked(t *testing.T) {
 	}
 }
 
+func TestSlotPromotedTailWakesAtOnce(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newParkStore()
+	p := simSlotParams(slotInlineLimit, 4)
+	p.eagerWindow = 5 * time.Second
+	table := slotTable{Slots: []string{"s0", "s1", "s2", "s3"}}
+	if err := store.writeSlot(ctx, "s0", 0, slotModeInline, []byte("head")); err != nil {
+		t.Fatalf("head write: %v", err)
+	}
+	r := &slotReader{
+		ctx:   ctx,
+		store: store,
+		table: table,
+		tune: slotTiming{
+			huntFloor:       20 * time.Millisecond,
+			huntCeiling:     40 * time.Millisecond,
+			tailMin:         2 * time.Second,
+			tailMax:         2 * time.Second,
+			fetchAhead:      4,
+			notFoundTimeout: time.Minute,
+		},
+		params:    p,
+		ch:        make(chan []byte, 8),
+		wake:      make(chan struct{}, 1),
+		acked:     -1,
+		ackWanted: -1,
+		lastHit:   time.Now(),
+	}
+	go r.run()
+	select {
+	case <-r.ch:
+	case <-time.After(time.Second):
+		t.Fatal("head segment not delivered")
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if err := store.writeSlot(ctx, "s1", 1, slotModeInline, []byte("one")); err != nil {
+		t.Fatalf("publish seq 1: %v", err)
+	}
+	if err := store.writeSlot(ctx, "s2", 2, slotModeInline, []byte("two")); err != nil {
+		t.Fatalf("publish seq 2: %v", err)
+	}
+	published := time.Now()
+	for _, seq := range []int64{1, 2} {
+		select {
+		case <-r.ch:
+		case <-time.After(time.Second):
+			t.Fatalf("segment %d not delivered after %v", seq, time.Since(published))
+		}
+	}
+	if d := time.Since(published); d > 700*time.Millisecond {
+		t.Fatalf("promoted tails took %v, want <= 700ms: consuming a segment must wake the next at once", d)
+	}
+}
+
+type slowBodyStore struct {
+	slotStore
+	frame slotFrame
+	body  []byte
+	calls atomic.Int32
+}
+
+func (s *slowBodyStore) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
+	return s.frame, true, nil
+}
+
+func (s *slowBodyStore) readSlotBody(ctx context.Context, id string) ([]byte, error) {
+	if s.calls.Add(1) == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return s.body, nil
+}
+
+func TestSlotBodyHedge(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body := []byte("0123456789")
+	store := &slowBodyStore{frame: newMediaFrame(1, body), body: body}
+	r := &slotReader{
+		ctx:   ctx,
+		store: store,
+		table: slotTable{Slots: []string{"a", "b"}},
+		tune: slotTiming{
+			huntFloor:       5 * time.Millisecond,
+			huntCeiling:     10 * time.Millisecond,
+			tailMin:         10 * time.Millisecond,
+			tailMax:         20 * time.Millisecond,
+			notFoundTimeout: time.Minute,
+			bodyHedge:       50 * time.Millisecond,
+		},
+	}
+	f := &slotFetch{ready: make(chan struct{})}
+	go r.collect(1, 0, f)
+	select {
+	case <-f.ready:
+	case <-time.After(time.Second):
+		t.Fatal("hedged media body was not fetched")
+	}
+	if f.err != nil || string(f.body) != string(body) {
+		t.Fatalf("hedged body: body %q err %v", f.body, f.err)
+	}
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("body reads = %d, want 2: one stalled read hedged by one fresh attempt", n)
+	}
+}
+
+func TestSlotReaderAckStride(t *testing.T) {
+	for _, want := range []struct {
+		depth  int
+		stride int
+	}{{1, 1}, {2, 1}, {7, 1}, {8, 2}, {16, 4}} {
+		ctx, cancel := context.WithCancel(context.Background())
+		r := newSlotReader(ctx, newSimSlots(), slotTable{Slots: make([]string, want.depth), Watermark: "w"},
+			simSlotParams(262144, want.depth))
+		if got := r.tune.ackStride; got != want.stride {
+			t.Fatalf("ring depth %d: ackStride = %d, want %d", want.depth, got, want.stride)
+		}
+		cancel()
+	}
+}
+
 func TestTakeSpareSkipsStale(t *testing.T) {
 	cfg := &Config{}
 	p := params{sessionTTL: 5 * time.Minute}

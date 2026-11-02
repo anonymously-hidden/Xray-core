@@ -45,6 +45,7 @@ var (
 	slotCloseGrace      = 10 * time.Second
 	slotHedgeTick       = 250 * time.Millisecond
 	slotHedgeBudget     = time.Second
+	slotBodyHedge       = 2 * time.Second
 )
 
 type slotTiming struct {
@@ -61,6 +62,7 @@ type slotTiming struct {
 	notFoundTimeout time.Duration
 	hedgeTick       time.Duration
 	hedgeBudget     time.Duration
+	bodyHedge       time.Duration
 }
 
 func takeSlotTiming() slotTiming {
@@ -78,6 +80,7 @@ func takeSlotTiming() slotTiming {
 		notFoundTimeout: slotNotFoundTimeout,
 		hedgeTick:       slotHedgeTick,
 		hedgeBudget:     slotHedgeBudget,
+		bodyHedge:       slotBodyHedge,
 	}
 }
 
@@ -679,6 +682,7 @@ type slotReader struct {
 	ch   chan []byte
 	wake chan struct{}
 	kick chan struct{}
+	poke map[int64]chan struct{}
 
 	mu          sync.Mutex
 	seq         int64
@@ -704,6 +708,10 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		acked:     -1,
 		ackWanted: -1,
 		lastHit:   time.Now(),
+	}
+	stride := len(table.Slots) / 4
+	if stride > r.tune.ackStride {
+		r.tune.ackStride = stride
 	}
 	go r.run()
 	go r.ackLoop()
@@ -828,6 +836,18 @@ func (r *slotReader) isHead(seq int64) bool {
 }
 
 func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
+	own := make(chan struct{}, 1)
+	r.mu.Lock()
+	if r.poke == nil {
+		r.poke = make(map[int64]chan struct{})
+	}
+	r.poke[seq] = own
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.poke, seq)
+		r.mu.Unlock()
+	}()
 	if offset > 0 {
 		if !r.sleep(time.Duration(float64(offset) * r.interval())) {
 			return
@@ -888,22 +908,22 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 			case slotModeInline:
 				f.body = frame.Data
 			case slotModeMedia:
-				body, berr := r.store.readSlotBody(r.ctx, r.slotID(seq))
+				body, berr := r.readBody(seq)
 				if berr != nil {
-					if !r.hold(backoff, ceiling, head) {
+					if !r.hold(backoff, ceiling, head, own) {
 						return
 					}
 					continue
 				}
 				if frame.Checked && (len(body) != frame.Len || crc32.ChecksumIEEE(body) != frame.Crc) {
-					if !r.hold(backoff, ceiling, head) {
+					if !r.hold(backoff, ceiling, head, own) {
 						return
 					}
 					continue
 				}
 				f.body = body
 			default:
-				if !r.hold(backoff, ceiling, head) {
+				if !r.hold(backoff, ceiling, head, own) {
 					return
 				}
 				continue
@@ -943,7 +963,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 				backoff = ceiling
 			}
 		}
-		if !r.hold(backoff, ceiling, head) {
+		if !r.hold(backoff, ceiling, head, own) {
 			return
 		}
 	}
@@ -1007,6 +1027,53 @@ func (r *slotReader) readPipelined(seq int64) (slotFrame, bool, error) {
 	}
 }
 
+func (r *slotReader) readBody(seq int64) ([]byte, error) {
+	id := r.slotID(seq)
+	if r.tune.bodyHedge <= 0 {
+		return r.store.readSlotBody(r.ctx, id)
+	}
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
+	type bodyRead struct {
+		body []byte
+		err  error
+	}
+	results := make(chan bodyRead, 2)
+	launch := func() {
+		go func() {
+			body, err := r.store.readSlotBody(ctx, id)
+			results <- bodyRead{body: body, err: err}
+		}()
+	}
+	launch()
+	outstanding := 1
+	hedged := false
+	timer := time.NewTimer(r.tune.bodyHedge)
+	defer timer.Stop()
+	var last bodyRead
+	for {
+		select {
+		case res := <-results:
+			outstanding--
+			if res.err == nil {
+				return res.body, nil
+			}
+			last = res
+			if outstanding == 0 {
+				return nil, last.err
+			}
+		case <-timer.C:
+			if !hedged {
+				hedged = true
+				launch()
+				outstanding++
+			}
+		case <-r.ctx.Done():
+			return nil, r.ctx.Err()
+		}
+	}
+}
+
 func (r *slotReader) interval() float64 {
 	r.mu.Lock()
 	gap := r.intervalAvg
@@ -1054,7 +1121,7 @@ func (r *slotReader) armed() {
 	r.mu.Unlock()
 }
 
-func (r *slotReader) hold(d, ceiling time.Duration, head bool) bool {
+func (r *slotReader) hold(d, ceiling time.Duration, head bool, own <-chan struct{}) bool {
 	r.mu.Lock()
 	if time.Since(r.lastHit) > r.eagerWindow && ceiling < r.maxPollInterval {
 		ceiling = r.maxPollInterval
@@ -1078,6 +1145,8 @@ func (r *slotReader) hold(d, ceiling time.Duration, head bool) bool {
 		return false
 	case <-wake:
 		return true
+	case <-own:
+		return true
 	case <-timer.C:
 		return true
 	}
@@ -1088,6 +1157,12 @@ func (r *slotReader) consumed(seq int64) {
 	r.seq = seq + 1
 	r.started = true
 	r.ackWanted = seq
+	if own, ok := r.poke[seq+1]; ok {
+		select {
+		case own <- struct{}{}:
+		default:
+		}
+	}
 	r.mu.Unlock()
 
 	r.armed()
