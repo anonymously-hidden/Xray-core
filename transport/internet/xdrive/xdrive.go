@@ -311,6 +311,7 @@ type Listener struct {
 	active    map[string]bool
 	handled   map[string]time.Time
 	idleSince map[string]time.Time
+	warm      Storage
 }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -339,6 +340,7 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 
 	go listener.acceptLoop(ctx)
 	go listener.collectLoop(ctx)
+	go listener.refillWarm()
 
 	return listener, nil
 }
@@ -448,7 +450,7 @@ func (l *Listener) newSessionConn(session string) *Conn {
 func (l *Listener) newSlotSessionConn(session string, table slotAnnounce) *slotConn {
 	store, _ := l.storage.(slotStore)
 	shared := true
-	if s, err := newStorage(l.streamSettings); err == nil {
+	if s := l.takeWarm(); s != nil {
 		if slots, ok := s.(slotStore); ok {
 			store, shared = slots, false
 		} else {
@@ -469,6 +471,38 @@ func (l *Listener) release(session string) {
 	l.mu.Lock()
 	delete(l.active, session)
 	l.mu.Unlock()
+}
+
+func (l *Listener) takeWarm() Storage {
+	l.mu.Lock()
+	s := l.warm
+	l.warm = nil
+	l.mu.Unlock()
+	go l.refillWarm()
+	if s != nil {
+		return s
+	}
+	fresh, err := newStorage(l.streamSettings)
+	if err != nil {
+		return nil
+	}
+	return fresh
+}
+
+func (l *Listener) refillWarm() {
+	s, err := newStorage(l.streamSettings)
+	if err != nil {
+		return
+	}
+	l.mu.Lock()
+	keep := l.warm == nil && l.ctx.Err() == nil
+	if keep {
+		l.warm = s
+	}
+	l.mu.Unlock()
+	if !keep {
+		s.Close()
+	}
 }
 
 func (l *Listener) collectLoop(logCtx context.Context) {
@@ -539,5 +573,12 @@ func (l *Listener) Addr() net.Addr {
 
 func (l *Listener) Close() error {
 	l.cancel()
+	l.mu.Lock()
+	warm := l.warm
+	l.warm = nil
+	l.mu.Unlock()
+	if warm != nil {
+		warm.Close()
+	}
 	return l.storage.Close()
 }
