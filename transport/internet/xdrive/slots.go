@@ -315,6 +315,13 @@ func slotRampStart(segmentBytes int) int {
 	return segmentBytes
 }
 
+func slotTag(id string) string {
+	if len(id) > 6 {
+		return id[len(id)-6:]
+	}
+	return id
+}
+
 func (w *slotWriter) setWake(fn func()) {
 	w.mu.Lock()
 	w.wake = fn
@@ -571,10 +578,12 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 	}()
 
 	var lastErr error
+	began := time.Now()
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
 	}
+	awaited := time.Since(began)
 	for attempt := 0; attempt < slotWriteAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -590,6 +599,7 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 		if len(chunk) <= slotInlineLimit {
 			mode = slotModeInline
 		}
+		putAt := time.Now()
 		if err := w.store.writeSlot(w.ctx, id, seq, mode, chunk); err != nil {
 			lastErr = err
 			if w.ctx.Err() != nil {
@@ -597,6 +607,8 @@ func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
 			}
 			continue
 		}
+		errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
+			" mode=", mode, " await=", awaited, " put=", time.Since(putAt), " try=", attempt)
 		return
 	}
 	w.fail(errors.New("failed to store segment ", seq).Base(lastErr))
@@ -762,6 +774,8 @@ type slotFetch struct {
 	fatal   bool
 	err     error
 	nfSince time.Time
+	born    time.Time
+	readyAt time.Time
 }
 
 func (r *slotReader) run() {
@@ -790,7 +804,7 @@ func (r *slotReader) run() {
 			if _, ok := pending[next]; ok {
 				continue
 			}
-			fetch := &slotFetch{ready: make(chan struct{})}
+			fetch := &slotFetch{ready: make(chan struct{}), born: time.Now()}
 			pending[next] = fetch
 			go r.collect(next, i, fetch)
 		}
@@ -819,6 +833,10 @@ func (r *slotReader) run() {
 		}
 		delete(pending, head)
 		r.consumed(head)
+		if !fetch.readyAt.IsZero() {
+			errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
+				fetch.readyAt.Sub(fetch.born), " blocked=", time.Since(fetch.readyAt), " bytes=", len(fetch.body))
+		}
 
 		select {
 		case r.ch <- fetch.body:
@@ -929,6 +947,7 @@ func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
 				continue
 			}
 			r.armed()
+			f.readyAt = time.Now()
 			close(f.ready)
 			return
 		}
