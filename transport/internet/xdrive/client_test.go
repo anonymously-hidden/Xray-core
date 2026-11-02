@@ -99,3 +99,38 @@ func TestServiceSNIOverride(t *testing.T) {
 		t.Fatalf("explicit serverName gave SNI %q, want www.google.com", got)
 	}
 }
+
+type countingRoundTripper struct {
+	calls int
+}
+
+func (rt *countingRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	rt.calls++
+	return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+}
+
+func TestServiceTransportAlternates(t *testing.T) {
+	a := &countingRoundTripper{}
+	b := &countingRoundTripper{}
+	plain := &countingRoundTripper{}
+	tr := &serviceTransport{plain: plain, secure: []http.RoundTripper{a, b}}
+
+	for i := 0; i < 10; i++ {
+		req, err := http.NewRequest(http.MethodGet, "https://x/", nil)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("round trip: %v", err)
+		}
+		resp.Body.Close()
+	}
+
+	if a.calls != 5 || b.calls != 5 {
+		t.Fatalf("the two secure connections got %d and %d requests, want 5 each", a.calls, b.calls)
+	}
+	if plain.calls != 0 {
+		t.Fatalf("the plain connection got %d https requests, want 0", plain.calls)
+	}
+}

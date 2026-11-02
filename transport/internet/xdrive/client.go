@@ -4,6 +4,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -16,12 +17,13 @@ import (
 
 type serviceTransport struct {
 	plain  http.RoundTripper
-	secure http.RoundTripper
+	secure []http.RoundTripper
+	next   atomic.Uint32
 }
 
 func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Scheme == "https" {
-		return t.secure.RoundTrip(r)
+		return t.secure[int(t.next.Add(1)%uint32(len(t.secure)))].RoundTrip(r)
 	}
 	return t.plain.RoundTrip(r)
 }
@@ -30,8 +32,10 @@ func (t *serviceTransport) CloseIdleConnections() {
 	if c, ok := t.plain.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
 	}
-	if c, ok := t.secure.(interface{ CloseIdleConnections() }); ok {
-		c.CloseIdleConnections()
+	for _, s := range t.secure {
+		if c, ok := s.(interface{ CloseIdleConnections() }); ok {
+			c.CloseIdleConnections()
+		}
 	}
 }
 
@@ -116,16 +120,18 @@ func newServiceClient(streamSettings *internet.MemoryStreamConfig, timeout time.
 		return tls.Client(conn, gotlsConfig), nil
 	}
 
-	var secure http.RoundTripper
-	if overHTTP2 {
-		secure = &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
-				return dialTLS(ctx, addr)
-			},
-			IdleConnTimeout: net.ConnIdleTimeout,
+	newSecure := func() http.RoundTripper {
+		if overHTTP2 {
+			return &http2.Transport{
+				DialTLSContext: func(ctx context.Context, network, addr string, cfg *gotls.Config) (net.Conn, error) {
+					return dialTLS(ctx, addr)
+				},
+				IdleConnTimeout: net.ConnIdleTimeout,
+				ReadIdleTimeout: 4 * time.Second,
+				PingTimeout:     2 * time.Second,
+			}
 		}
-	} else {
-		secure = &http.Transport{
+		return &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return dialTLS(ctx, addr)
 			},
@@ -135,6 +141,7 @@ func newServiceClient(streamSettings *internet.MemoryStreamConfig, timeout time.
 			MaxConnsPerHost:     maxConns,
 		}
 	}
+	secure := []http.RoundTripper{newSecure(), newSecure()}
 
 	return &http.Client{
 		Transport: &serviceTransport{
