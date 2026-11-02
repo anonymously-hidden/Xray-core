@@ -559,12 +559,13 @@ func (l *Listener) collect() error {
 	}
 	l.mu.Unlock()
 
+	var first error
 	for _, session := range expired {
-		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil {
-			return err
+		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil && first == nil {
+			first = err
 		}
 	}
-	return nil
+	return first
 }
 
 func (l *Listener) Addr() net.Addr {
