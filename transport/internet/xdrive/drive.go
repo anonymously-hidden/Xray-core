@@ -873,12 +873,27 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var first error
 	for childName, file := range children {
-		if err := s.deleteID(ctx, childName, file.id); err != nil {
-			return err
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(name, id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := s.deleteID(ctx, name, id); err != nil {
+				mu.Lock()
+				if first == nil {
+					first = err
+				}
+				mu.Unlock()
+			}
+		}(childName, file.id)
 	}
-	return nil
+	wg.Wait()
+	return first
 }
 
 func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error) {
