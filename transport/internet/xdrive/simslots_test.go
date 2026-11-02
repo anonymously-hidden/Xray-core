@@ -1791,6 +1791,67 @@ func TestSlotMediumPayloadSplitsInline(t *testing.T) {
 	}
 }
 
+func TestSlotBurstSplitsUpToEightChunks(t *testing.T) {
+	p := simSlotParams(262144, 16)
+	client, server, store := newSimSlotPair(t, p)
+	defer client.Close()
+	defer server.Close()
+	server.writer.mu.Lock()
+	server.writer.segBytes = p.segmentBytes
+	server.writer.mu.Unlock()
+	const size = 100 * 1024
+	if _, err := server.Write(make([]byte, size)); err != nil {
+		t.Fatal(err)
+	}
+	if err := simReadN(t, client, size); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, bodies, _, _ := store.counters(); bodies != 0 {
+		t.Fatalf("bodies = %d, want 0: a 100 KiB burst should travel as inline slices", bodies)
+	}
+}
+
+type blockingSlotStore struct {
+	slotStore
+	started atomic.Int32
+	release chan struct{}
+}
+
+func (s *blockingSlotStore) writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error {
+	s.started.Add(1)
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestSlotSmallFlushesBeyondFour(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &blockingSlotStore{release: make(chan struct{})}
+	defer close(store.release)
+
+	ids := make([]string, 16)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i)
+	}
+	w := newSlotWriter(ctx, store, slotTable{Slots: ids, Watermark: "w"}, simSlotParams(262144, 16))
+
+	for i := 0; i < 7; i++ {
+		if _, err := w.Write([]byte("x")); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if n := store.started.Load(); n < 7 {
+		t.Fatalf("small flushes started = %d, want >= 7: half a 16-deep ring must stay in flight", n)
+	}
+}
+
 type markStore struct {
 	slotStore
 	frame  slotFrame

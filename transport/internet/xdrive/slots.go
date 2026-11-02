@@ -18,7 +18,7 @@ const (
 	slotMagic       = "XDRVSL02"
 	slotMagicV1     = "XDRVSL01"
 	slotInlineLimit = 14 * 1024
-	slotSplitLimit  = 4 * slotInlineLimit
+	slotSplitLimit  = 8 * slotInlineLimit
 	slotDepthLimit  = 16
 
 	slotModeInline = 1
@@ -349,7 +349,7 @@ func (w *slotWriter) flushLoop() {
 			w.mu.Lock()
 			done := w.closed || w.err != nil
 			ready := false
-			if !done && len(w.buf) > 0 && w.partial < maxPartialInflight {
+			if !done && len(w.buf) > 0 && w.partial < max(maxPartialInflight, cap(w.slots)/2) {
 				busy := len(w.slots) > 0
 				grew := len(w.buf) > last
 				last = len(w.buf)
