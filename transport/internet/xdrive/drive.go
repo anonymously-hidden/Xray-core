@@ -25,8 +25,8 @@ const (
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
 	driveMaxInflight      = 40
-	driveReservedInflight = 2
-	driveTailInflight     = 6
+	driveReservedInflight = 6
+	driveTailInflight     = 9
 	slotHeaderAttempts    = 4
 	driveInlineLimit      = 16 * 1024
 	driveTimeout          = 60 * time.Second
@@ -1063,7 +1063,11 @@ func (s *driveStorage) writeSlot(ctx context.Context, id string, seq int64, mode
 }
 
 func (s *driveStorage) readSlot(ctx context.Context, id string) (slotFrame, bool, error) {
-	status, payload, err := s.doBudget(ctx, http.MethodGet,
+	do := s.doBudget
+	if ctx.Value(tailMark{}) == nil {
+		do = s.doBudgetReserved
+	}
+	status, payload, err := do(ctx, http.MethodGet,
 		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
 		slotReadAttemptTimeout, queryTotalTimeout)
 	if err != nil {
@@ -1119,7 +1123,7 @@ func (s *driveStorage) writeWatermark(ctx context.Context, id string, seq int64)
 }
 
 func (s *driveStorage) readWatermark(ctx context.Context, id string) (int64, error) {
-	status, payload, err := s.doBudget(ctx, http.MethodGet,
+	status, payload, err := s.doBudgetReserved(ctx, http.MethodGet,
 		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil,
 		slotReadAttemptTimeout, queryTotalTimeout)
 	if err != nil {
