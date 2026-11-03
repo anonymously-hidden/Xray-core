@@ -309,6 +309,21 @@ func TestSlotStaleBody(t *testing.T) {
 	readAll(t, server, payload)
 }
 
+func TestSlotBurstSplitsInline(t *testing.T) {
+	store := newMemSlots()
+	client, server := slotPair(t, store, 8, 512<<10)
+	payload := randomPayload(90 << 10)
+	errs := make(chan error, 1)
+	writeAll(client, payload, true, errs)
+	readAll(t, server, payload)
+	store.mu.Lock()
+	bodies := len(store.bodies)
+	store.mu.Unlock()
+	if bodies != 0 {
+		t.Fatalf("a burst of 90 KiB went in %d bodies, want none", bodies)
+	}
+}
+
 type stuckBodySlots struct {
 	*memSlots
 	calls atomic.Int32
