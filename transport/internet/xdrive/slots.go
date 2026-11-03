@@ -42,8 +42,8 @@ const (
 var (
 	// the head is asked for between slotHuntFloor and slotHuntCeiling, a segment
 	// behind it at about the pace that segments come
-	slotHuntFloor   = 50 * time.Millisecond
-	slotHuntCeiling = 100 * time.Millisecond
+	slotHuntFloor   = 10 * time.Millisecond
+	slotHuntCeiling = 25 * time.Millisecond
 	slotTailMin     = 150 * time.Millisecond
 	slotTailMax     = 800 * time.Millisecond
 	slotFetchAhead  = 10
