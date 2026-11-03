@@ -54,6 +54,8 @@ var (
 	slotCloseGrace   = 10 * time.Second
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
+	slotHedgeTick    = 250 * time.Millisecond
+	slotHedgeBudget  = time.Second
 )
 
 // slotStore is a storage of objects that are written and read again by id,
@@ -612,7 +614,16 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	backoff := slotHuntFloor
 	var goneSince, warnedAt time.Time
 	for {
-		description, err := r.store.readDescription(ctx, id)
+		var description string
+		var err error
+		r.mu.Lock()
+		hot := time.Since(r.activeAt) <= r.eagerWindow
+		r.mu.Unlock()
+		if hot && r.isHead(seq) {
+			description, err = r.readHedged(ctx, id, seq)
+		} else {
+			description, err = r.store.readDescription(ctx, id)
+		}
 		frame, ok := decodeSlot(description)
 		switch {
 		case err == nil && ok && frame.seq == seq:
@@ -717,6 +728,58 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string) ([]byte, err
 			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		}
+	}
+}
+
+func (r *slotReader) readHedged(ctx context.Context, id string, seq int64) (string, error) {
+	if slotHedgeTick <= 0 {
+		return r.store.readDescription(ctx, id)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		description string
+		err         error
+	}
+	results := make(chan result, 32)
+	launch := func() {
+		go func() {
+			d, err := r.store.readDescription(ctx, id)
+			results <- result{d, err}
+		}()
+	}
+	deadline := time.Now().Add(slotHedgeBudget)
+	ticker := time.NewTicker(slotHedgeTick)
+	defer ticker.Stop()
+
+	launch()
+	outstanding := 1
+	var last result
+	for {
+		select {
+		case res := <-results:
+			outstanding--
+			if res.err != nil {
+				return res.description, res.err
+			}
+			if f, ok := decodeSlot(res.description); ok && f.seq == seq {
+				return res.description, nil
+			}
+			last = res
+			if outstanding == 0 && !time.Now().Before(deadline) {
+				return last.description, nil
+			}
+		case <-ticker.C:
+			if outstanding < 2 && time.Now().Before(deadline) {
+				launch()
+				outstanding++
+			} else if outstanding == 0 {
+				return last.description, nil
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
 	}
 }
