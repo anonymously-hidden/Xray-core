@@ -617,7 +617,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		f.readyAt = time.Now()
 		close(f.ready)
 	}()
-	if offset > 0 && !r.hold(ctx, time.Duration(offset)*r.pace(), f.promoted, nil) {
+	if offset > 0 && !r.hold(ctx, slotTailMin, f.promoted, nil) {
 		return
 	}
 

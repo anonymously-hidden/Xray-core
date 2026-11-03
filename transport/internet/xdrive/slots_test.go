@@ -413,3 +413,20 @@ func TestSlotHeadReadOverlaps(t *testing.T) {
 		}
 	}
 }
+
+func TestSlotBurstReadsTogether(t *testing.T) {
+	client, server := slotPair(t, newMemSlots(), 16, 512<<10)
+	payload := randomPayload(8 * slotInlineLimit)
+	go client.Write(payload)
+	start := time.Now()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the burst came back changed")
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("a burst of 8 segments took %v to read", took)
+	}
+}
