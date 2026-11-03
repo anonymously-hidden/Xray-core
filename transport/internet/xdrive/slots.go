@@ -346,15 +346,21 @@ func (w *slotWriter) upload(seq int64, chunk []byte) {
 	if len(chunk) <= slotInlineLimit {
 		mode = slotInline
 	}
+	began := time.Now()
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
 	}
+	awaited := time.Since(began)
+	putAt := time.Now()
 	if err := w.write(seq, mode, chunk); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		// the slot is free, the reader learns there what happened
 		w.write(seq, slotErr, nil)
+		return
 	}
+	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
+		" mode=", mode, " await=", awaited, " put=", time.Since(putAt))
 }
 
 func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
@@ -533,6 +539,8 @@ type slotFetch struct {
 	body     []byte
 	end      bool
 	err      error
+	born     time.Time
+	readyAt  time.Time
 }
 
 func (r *slotReader) run() {
@@ -553,7 +561,7 @@ func (r *slotReader) run() {
 		for i := range window {
 			seq := head + int64(i)
 			if fetches[seq] == nil {
-				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{})}
+				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), born: time.Now()}
 				go r.fetch(ctx, seq, i, fetches[seq])
 			}
 		}
@@ -578,6 +586,8 @@ func (r *slotReader) run() {
 		r.head++
 		r.started = true
 		r.mu.Unlock()
+		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
+			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body))
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 		}
@@ -603,7 +613,10 @@ func (r *slotReader) isHead(seq int64) bool {
 // fetch asks for the slot of seq until it holds seq: the head often, a segment
 // behind it at the pace that segments come, as it would wait for the head anyway
 func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
-	defer close(f.ready)
+	defer func() {
+		f.readyAt = time.Now()
+		close(f.ready)
+	}()
 	if offset > 0 && !r.hold(ctx, time.Duration(offset)*r.pace(), f.promoted, nil) {
 		return
 	}
@@ -814,4 +827,11 @@ func (r *slotReader) Err() error {
 		return r.err
 	}
 	return io.EOF
+}
+
+func slotTag(id string) string {
+	if len(id) > 6 {
+		return id[len(id)-6:]
+	}
+	return id
 }
