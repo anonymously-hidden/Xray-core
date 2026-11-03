@@ -52,6 +52,7 @@ var (
 	slotStallTimeout = 60 * time.Second
 	slotCloseGrace   = 10 * time.Second
 	slotGoneTimeout  = 60 * time.Second
+	slotBodyHedge    = 2 * time.Second
 )
 
 // slotStore is a storage of objects that are written and read again by id,
@@ -618,7 +619,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.hit()
 				return
 			case slotMedia:
-				if body, err := r.store.readBody(ctx, id); err == nil && frame.holds(body) {
+				if body, err := r.readBodyHedged(ctx, id); err == nil && frame.holds(body) {
 					f.body = body
 					r.hit()
 					return
@@ -658,6 +659,51 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		if !r.hold(ctx, wait, a, b) {
 			return
+		}
+	}
+}
+
+func (r *slotReader) readBodyHedged(ctx context.Context, id string) ([]byte, error) {
+	if slotBodyHedge <= 0 {
+		return r.store.readBody(ctx, id)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type result struct {
+		body []byte
+		err  error
+	}
+	results := make(chan result, 2)
+	launch := func() {
+		go func() {
+			body, err := r.store.readBody(ctx, id)
+			results <- result{body, err}
+		}()
+	}
+	launch()
+	outstanding := 1
+	timer := time.NewTimer(slotBodyHedge)
+	defer timer.Stop()
+	var last result
+	for {
+		select {
+		case res := <-results:
+			outstanding--
+			if res.err == nil {
+				return res.body, nil
+			}
+			last = res
+			if outstanding == 0 {
+				return nil, last.err
+			}
+		case <-timer.C:
+			if outstanding == 1 {
+				launch()
+				outstanding++
+			}
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -306,4 +307,33 @@ func TestSlotStaleBody(t *testing.T) {
 	errs := make(chan error, 1)
 	writeAll(client, payload, true, errs)
 	readAll(t, server, payload)
+}
+
+type stuckBodySlots struct {
+	*memSlots
+	calls atomic.Int32
+}
+
+func (s *stuckBodySlots) readBody(ctx context.Context, id string) ([]byte, error) {
+	if s.calls.Add(1) == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return s.memSlots.readBody(ctx, id)
+}
+
+func TestSlotBodyHedge(t *testing.T) {
+	old := slotBodyHedge
+	slotBodyHedge = 50 * time.Millisecond
+	defer func() { slotBodyHedge = old }()
+
+	store := &stuckBodySlots{memSlots: newMemSlots()}
+	client, server := slotPair(t, store, 2, 64<<10)
+	payload := randomPayload(200 << 10)
+	errs := make(chan error, 1)
+	writeAll(client, payload, true, errs)
+	readAll(t, server, payload)
+	if store.calls.Load() < 2 {
+		t.Fatalf("the stuck body read was not hedged, %d reads", store.calls.Load())
+	}
 }
