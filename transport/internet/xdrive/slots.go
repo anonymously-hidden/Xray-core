@@ -179,7 +179,7 @@ func makeRing(ctx context.Context, store slotStore, session string, p params) (r
 }
 
 func readWatermark(ctx context.Context, store slotStore, id string) (int64, error) {
-	d, err := store.readDescription(ctx, id)
+	d, err := store.readDescription(context.WithValue(ctx, laneKey{}, true), id)
 	if err != nil || d == "" {
 		return -1, err
 	}
@@ -785,7 +785,7 @@ func (r *slotReader) ackLoop() {
 			if want <= acked {
 				break
 			}
-			if err := r.store.setSlot(r.ctx, r.table.Watermark, strconv.FormatInt(want, 10), nil); err == nil {
+			if err := r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil); err == nil {
 				acked, wait = want, slotAckRetry
 				continue
 			}
