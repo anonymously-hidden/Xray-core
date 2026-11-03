@@ -107,6 +107,13 @@ func spareBoxFor(config *Config) *spareBox {
 	return b.(*spareBox)
 }
 
+func dropSpare(s spareRing) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	s.storage.Delete(ctx, sessionPrefix(s.session))
+	s.storage.Close()
+}
+
 func takeSpare(config *Config, p params) (spareRing, bool) {
 	box := spareBoxFor(config)
 	for {
@@ -115,7 +122,7 @@ func takeSpare(config *Config, p params) (spareRing, bool) {
 			if time.Since(s.at) < p.sessionTTL*2/3 {
 				return s, true
 			}
-			s.storage.Close()
+			go dropSpare(s)
 		default:
 			return spareRing{}, false
 		}
@@ -140,7 +147,7 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 				if time.Since(s.at) < p.sessionTTL/3 {
 					box.ch <- s
 				} else {
-					s.storage.Close()
+					dropSpare(s)
 				}
 			default:
 			}
@@ -166,7 +173,7 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 			r, err := makeRing(ctx, slots, session, p)
 			cancel()
 			if err != nil {
-				storage.Close()
+				dropSpare(spareRing{storage: storage, session: session})
 				return
 			}
 			select {

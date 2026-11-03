@@ -375,3 +375,18 @@ func TestTakeSpareSkipsStale(t *testing.T) {
 		t.Fatal("takeSpare returned a second spare")
 	}
 }
+
+func TestDropSpareDeletesSession(t *testing.T) {
+	st, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := sessionPrefix("gone") + "/" + uplinkDir + "/s0"
+	if err := st.Put(context.Background(), name, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	dropSpare(spareRing{storage: st, session: "gone"})
+	if got, _ := st.List(context.Background(), sessionPrefix("gone")); len(got) != 0 {
+		t.Fatalf("%d entries left of a dropped spare", len(got))
+	}
+}
