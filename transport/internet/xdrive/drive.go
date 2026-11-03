@@ -36,6 +36,7 @@ var (
 	driveFilesURL       = "https://www.googleapis.com/drive/v3/files"
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
+	driveCooldown       = 2 * time.Second
 )
 
 type driveStorage struct {
@@ -65,6 +66,9 @@ type driveShared struct {
 
 	idMu sync.Mutex
 	ids  map[string]string
+
+	coolMu    sync.Mutex
+	coolUntil time.Time
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -219,6 +223,17 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	backoff := s.backoff
 	var lastErr error
 
+	s.coolMu.Lock()
+	until := s.coolUntil
+	s.coolMu.Unlock()
+	if d := time.Until(until); d > 0 {
+		select {
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		case <-time.After(d):
+		}
+	}
+
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -287,18 +302,28 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			lastErr = errors.New("Drive is rate limiting: ", string(payload))
 			errors.LogWarning(ctx, "rate limited by Drive, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
+			s.cool()
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
+			if resp.StatusCode == http.StatusTooManyRequests {
+				s.cool()
+			}
 			continue
 		}
 		return resp.StatusCode, payload, nil
 	}
 
 	return 0, nil, lastErr
+}
+
+func (s *driveStorage) cool() {
+	s.coolMu.Lock()
+	s.coolUntil = time.Now().Add(jitter(driveCooldown))
+	s.coolMu.Unlock()
 }
 
 func (s *driveStorage) invalidateToken() {
