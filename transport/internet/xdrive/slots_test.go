@@ -390,3 +390,26 @@ func TestDropSpareDeletesSession(t *testing.T) {
 		t.Fatalf("%d entries left of a dropped spare", len(got))
 	}
 }
+
+type stuckHeadSlots struct {
+	*memSlots
+	calls atomic.Int32
+}
+
+func (s *stuckHeadSlots) readDescription(ctx context.Context, id string) (string, error) {
+	if s.calls.Add(1) == 1 {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	return s.memSlots.readDescription(ctx, id)
+}
+
+func TestSlotHeadReadOverlaps(t *testing.T) {
+	client, server := slotPair(t, &stuckHeadSlots{memSlots: newMemSlots()}, 4, 64<<10)
+	for _, c := range [][2]*Conn{{client, server}, {server, client}} {
+		c[0].Write([]byte("ping"))
+		if _, err := io.ReadFull(c[1], make([]byte, 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

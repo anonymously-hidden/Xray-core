@@ -25,7 +25,7 @@ const (
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
 	driveMaxInflight      = 40
-	driveReservedInflight = 6
+	driveReservedInflight = 8
 	driveInlineLimit      = 12000
 	// driveTimeout ends a request that makes no progress for that long
 	driveTimeout = 60 * time.Second

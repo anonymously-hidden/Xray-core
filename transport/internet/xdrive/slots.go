@@ -625,7 +625,16 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	backoff := slotHuntFloor
 	var goneSince, warnedAt time.Time
 	for {
-		description, err := r.store.readDescription(ctx, id)
+		var description string
+		var err error
+		r.mu.Lock()
+		hot := time.Since(r.activeAt) <= r.eagerWindow
+		r.mu.Unlock()
+		if hot && r.isHead(seq) {
+			description, err = r.readHead(ctx, id, seq)
+		} else {
+			description, err = r.store.readDescription(ctx, id)
+		}
 		frame, ok := decodeSlot(description)
 		switch {
 		case err == nil && ok && frame.seq == seq:
@@ -685,6 +694,60 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		if !r.hold(ctx, wait, a, b) {
 			return
+		}
+	}
+}
+
+func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ctx = context.WithValue(ctx, laneKey{}, true)
+
+	type result struct {
+		description string
+		err         error
+	}
+	results := make(chan result, 4)
+	outstanding := 0
+	launch := func() {
+		outstanding++
+		go func() {
+			description, err := r.store.readDescription(ctx, id)
+			results <- result{description, err}
+		}()
+	}
+	launch()
+	ticker := time.NewTicker(slotHuntCeiling)
+	defer ticker.Stop()
+	var last result
+	seen := false
+	for {
+		select {
+		case res := <-results:
+			outstanding--
+			if res.err != nil {
+				return res.description, res.err
+			}
+			if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
+				return res.description, nil
+			}
+			last, seen = res, true
+		case <-ticker.C:
+			r.mu.Lock()
+			idle := time.Since(r.activeAt) > r.eagerWindow
+			r.mu.Unlock()
+			switch {
+			case idle && seen:
+				return last.description, nil
+			case !idle && outstanding < 3:
+				launch()
+			}
+		case <-r.wake:
+			if outstanding < 3 {
+				launch()
+			}
+		case <-ctx.Done():
+			return "", ctx.Err()
 		}
 	}
 }
