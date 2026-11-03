@@ -352,3 +352,26 @@ func TestSlotBodyHedge(t *testing.T) {
 		t.Fatalf("the stuck body read was not hedged, %d reads", store.calls.Load())
 	}
 }
+
+func TestTakeSpareSkipsStale(t *testing.T) {
+	cfg := &Config{}
+	p := params{sessionTTL: 5 * time.Minute}
+	st1, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st2, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	box := spareBoxFor(cfg)
+	box.ch <- spareRing{storage: st1, session: "old", at: time.Now().Add(-time.Hour)}
+	box.ch <- spareRing{storage: st2, session: "new", at: time.Now()}
+	got, ok := takeSpare(cfg, p)
+	if !ok || got.session != "new" {
+		t.Fatalf("takeSpare gave %q, %v, want the fresh one", got.session, ok)
+	}
+	if _, ok := takeSpare(cfg, p); ok {
+		t.Fatal("takeSpare returned a second spare")
+	}
+}

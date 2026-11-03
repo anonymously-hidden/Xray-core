@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -24,6 +25,11 @@ const (
 	streamsDir   = "streams"
 	uplinkDir    = "c2s"
 	downlinkDir  = "s2c"
+)
+
+const (
+	spareCount    = 2
+	spareIdleStop = 10 * time.Minute
 )
 
 func init() {
@@ -78,30 +84,136 @@ func streamConfig(streamSettings *internet.MemoryStreamConfig) (*Config, error) 
 	return config, nil
 }
 
+type spareRing struct {
+	storage Storage
+	session string
+	ring    ring
+	at      time.Time
+}
+
+type spareBox struct {
+	ch   chan spareRing
+	busy atomic.Bool
+	last atomic.Int64
+}
+
+var spareBoxes sync.Map
+
+func spareBoxFor(config *Config) *spareBox {
+	if b, ok := spareBoxes.Load(config); ok {
+		return b.(*spareBox)
+	}
+	b, _ := spareBoxes.LoadOrStore(config, &spareBox{ch: make(chan spareRing, spareCount)})
+	return b.(*spareBox)
+}
+
+func takeSpare(config *Config, p params) (spareRing, bool) {
+	box := spareBoxFor(config)
+	for {
+		select {
+		case s := <-box.ch:
+			if time.Since(s.at) < p.sessionTTL*2/3 {
+				return s, true
+			}
+			s.storage.Close()
+		default:
+			return spareRing{}, false
+		}
+	}
+}
+
+func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
+	spareBoxFor(config).last.Store(time.Now().UnixNano())
+	fillSpares(streamSettings, config, p)
+}
+
+func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
+	box := spareBoxFor(config)
+	if !box.busy.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer box.busy.Store(false)
+		for n := len(box.ch); n > 0; n-- {
+			select {
+			case s := <-box.ch:
+				if time.Since(s.at) < p.sessionTTL/3 {
+					box.ch <- s
+				} else {
+					s.storage.Close()
+				}
+			default:
+			}
+		}
+		for len(box.ch) < cap(box.ch) {
+			time.Sleep(2 * time.Second)
+			storage, err := newStorage(streamSettings)
+			if err != nil {
+				return
+			}
+			storage = sessionStorage(storage)
+			slots, ok := storage.(slotStore)
+			if !ok {
+				storage.Close()
+				return
+			}
+			session, err := newSessionID()
+			if err != nil {
+				storage.Close()
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			r, err := makeRing(ctx, slots, session, p)
+			cancel()
+			if err != nil {
+				storage.Close()
+				return
+			}
+			select {
+			case box.ch <- spareRing{storage: storage, session: session, ring: r, at: time.Now()}:
+			default:
+				storage.Close()
+				return
+			}
+		}
+		time.AfterFunc(p.sessionTTL/4, func() {
+			if time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
+				fillSpares(streamSettings, config, p)
+			}
+		})
+	}()
+}
+
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	config, err := streamConfig(streamSettings)
 	if err != nil {
 		return nil, err
 	}
 
-	storage, err := newStorage(streamSettings)
-	if err != nil {
-		return nil, err
-	}
-	storage = sessionStorage(storage)
-
-	session, err := newSessionID()
-	if err != nil {
-		storage.Close()
-		return nil, err
-	}
-
 	p := paramsFromConfig(config)
+
+	spare, warm := takeSpare(config, p)
+	storage, session, r := spare.storage, spare.session, spare.ring
+	if !warm {
+		storage, err = newStorage(streamSettings)
+		if err != nil {
+			return nil, err
+		}
+		storage = sessionStorage(storage)
+
+		session, err = newSessionID()
+		if err != nil {
+			storage.Close()
+			return nil, err
+		}
+	}
+
 	var announce []byte
-	var r ring
 	slots, ok := storage.(slotStore)
 	if ok {
-		if r, err = makeRing(ctx, slots, session, p); err == nil {
+		if warm {
+			announce, _ = json.Marshal(r)
+		} else if r, err = makeRing(ctx, slots, session, p); err == nil {
 			announce, _ = json.Marshal(r)
 		} else {
 			ok = false
@@ -115,6 +227,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	if ok {
+		warmSpares(streamSettings, config, p)
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
 		return newSlotConn(context.Background(), slots, r.Up, r.Down, p, func() {
 			storage.Close()
