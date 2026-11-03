@@ -4,11 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -24,11 +24,6 @@ const (
 	streamsDir   = "streams"
 	uplinkDir    = "c2s"
 	downlinkDir  = "s2c"
-)
-
-const (
-	spareCount    = 2
-	spareIdleStop = 10 * time.Minute
 )
 
 func init() {
@@ -76,113 +71,11 @@ func downlinkPrefix(session string) string {
 }
 
 func streamConfig(streamSettings *internet.MemoryStreamConfig) (*Config, error) {
-	if streamSettings == nil {
-		return nil, errors.New("invalid protocol settings")
-	}
 	config, ok := streamSettings.ProtocolSettings.(*Config)
 	if !ok || config == nil {
 		return nil, errors.New("invalid protocol settings")
 	}
 	return config, nil
-}
-
-type spareRing struct {
-	storage Storage
-	session string
-	table   [2]slotTable
-	at      time.Time
-}
-
-type spareBox struct {
-	ch   chan spareRing
-	busy atomic.Bool
-	last atomic.Int64
-}
-
-var spareBoxes sync.Map
-
-func spareBoxFor(config *Config) *spareBox {
-	if b, ok := spareBoxes.Load(config); ok {
-		return b.(*spareBox)
-	}
-	b, _ := spareBoxes.LoadOrStore(config, &spareBox{ch: make(chan spareRing, spareCount)})
-	return b.(*spareBox)
-}
-
-func takeSpare(config *Config, p params) (spareRing, bool) {
-	box := spareBoxFor(config)
-	for {
-		select {
-		case s := <-box.ch:
-			if time.Since(s.at) < p.sessionTTL*2/3 {
-				return s, true
-			}
-			s.storage.Close()
-		default:
-			return spareRing{}, false
-		}
-	}
-}
-
-func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	spareBoxFor(config).last.Store(time.Now().UnixNano())
-	fillSpares(streamSettings, config, p)
-}
-
-func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	box := spareBoxFor(config)
-	if !box.busy.CompareAndSwap(false, true) {
-		return
-	}
-	go func() {
-		defer box.busy.Store(false)
-		for n := len(box.ch); n > 0; n-- {
-			select {
-			case s := <-box.ch:
-				if time.Since(s.at) < p.sessionTTL/3 {
-					box.ch <- s
-				} else {
-					s.storage.Close()
-				}
-			default:
-			}
-		}
-		for len(box.ch) < cap(box.ch) {
-			time.Sleep(2 * time.Second)
-			storage, err := newStorage(streamSettings)
-			if err != nil {
-				return
-			}
-			slots, ok := storage.(slotStore)
-			if !ok {
-				storage.Close()
-				return
-			}
-			session, err := newSessionID()
-			if err != nil {
-				storage.Close()
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			table, err := buildSlotTable(ctx, slots, session, p)
-			cancel()
-			if err != nil {
-				storage.Close()
-				return
-			}
-			select {
-			case box.ch <- spareRing{storage: storage, session: session, table: table, at: time.Now()}:
-			default:
-				storage.Close()
-				return
-			}
-		}
-		time.AfterFunc(p.sessionTTL/4, func() {
-			if time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
-				fillSpares(streamSettings, config, p)
-			}
-		})
-	}()
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
@@ -191,127 +84,60 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, err
 	}
 
+	storage, err := newStorage(streamSettings)
+	if err != nil {
+		return nil, err
+	}
+	storage = sessionStorage(storage)
+
+	session, err := newSessionID()
+	if err != nil {
+		storage.Close()
+		return nil, err
+	}
+
 	p := paramsFromConfig(config)
-
-	spare, warm := takeSpare(config, p)
-	storage, session := spare.storage, spare.session
-	if !warm {
-		storage, err = newStorage(streamSettings)
-		if err != nil {
-			return nil, err
-		}
-		session, err = newSessionID()
-		if err != nil {
-			storage.Close()
-			return nil, err
-		}
-	}
-
-	if slots, ok := storage.(slotStore); ok {
-		table := spare.table
-		var built error
-		if !warm {
-			table, built = buildSlotTable(ctx, slots, session, p)
-		}
-		if built == nil {
-			announce := encodeAnnounce(slotAnnounce{Uplink: table[0], Downlink: table[1]})
-			if err := storage.Put(ctx, announceName(session, time.Now()), []byte(announce)); err == nil {
-				warmSpares(streamSettings, config, p)
-				errors.LogInfo(ctx, "opened session ", session, " on a slot ring of depth ",
-					len(table[0].Slots))
-				return newSlotConn(context.Background(), slots, slotAnnounce{
-					Uplink: table[0], Downlink: table[1],
-				}, p, func() { storage.Close() }), nil
-			} else {
-				errors.LogWarning(ctx, "failed to announce the session on slots, ",
-					"falling back to the segment protocol: ", err)
-			}
+	var announce []byte
+	var r ring
+	slots, ok := storage.(slotStore)
+	if ok {
+		if r, err = makeRing(ctx, slots, session, p); err == nil {
+			announce, _ = json.Marshal(r)
 		} else {
-			errors.LogWarning(ctx, "failed to build the slot ring, falling back to the ",
-				"segment protocol: ", built)
+			ok = false
+			errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
 		}
 	}
 
-	if err := storage.Put(ctx, announceName(session, time.Now()), nil); err != nil {
+	if err := storage.Put(ctx, announceName(session, time.Now()), announce); err != nil {
 		storage.Close()
 		return nil, errors.New("failed to announce session ", session).Base(err)
 	}
 
+	if ok {
+		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
+		return newSlotConn(context.Background(), slots, r.Up, r.Down, p, func() {
+			storage.Close()
+		}), nil
+	}
 	errors.LogInfo(ctx, "opened session ", session)
-
 	return newConn(context.Background(), storage,
 		uplinkPrefix(session), downlinkPrefix(session), p, func() {
 			storage.Close()
 		}), nil
 }
 
-func buildSlotTable(ctx context.Context, store slotStore, session string, p params) ([2]slotTable, error) {
-	depth := p.concurrency
-	if depth > slotDepthLimit {
-		depth = slotDepthLimit
-	}
-	if depth < 2 {
-		depth = 2
-	}
-
-	var out [2]slotTable
-	for i := range out {
-		out[i] = slotTable{Slots: make([]string, depth)}
-	}
-	dirs := [2]string{uplinkDir, downlinkDir}
-
-	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		fail error
-	)
-	create := func(name string, set func(id string)) {
-		defer wg.Done()
-		id, err := store.makeSlot(ctx, name)
-		mu.Lock()
-		defer mu.Unlock()
-		if err != nil {
-			if fail == nil {
-				fail = err
-			}
-			return
-		}
-		set(id)
-	}
-	for d := range dirs {
-		for i := 0; i < depth; i++ {
-			d, i := d, i
-			wg.Add(1)
-			go create(sessionPrefix(session)+"/"+dirs[d]+"/s"+strconv.Itoa(i), func(id string) {
-				out[d].Slots[i] = id
-			})
-		}
-		d := d
-		wg.Add(1)
-		go create(sessionPrefix(session)+"/"+dirs[d]+"/w", func(id string) {
-			out[d].Watermark = id
-		})
-	}
-	wg.Wait()
-	if fail != nil {
-		return out, fail
-	}
-	return out, nil
-}
-
 type Listener struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	storage        Storage
-	streamSettings *internet.MemoryStreamConfig
-	addConn        internet.ConnHandler
+	ctx     context.Context
+	cancel  context.CancelFunc
+	storage Storage
+	addConn internet.ConnHandler
 	params
 
 	mu        sync.Mutex
 	active    map[string]bool
 	handled   map[string]time.Time
 	idleSince map[string]time.Time
-	warm      Storage
 }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -327,20 +153,18 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 
 	listenerCtx, cancel := context.WithCancel(context.Background())
 	listener := &Listener{
-		ctx:            listenerCtx,
-		cancel:         cancel,
-		storage:        storage,
-		streamSettings: streamSettings,
-		addConn:        addConn,
-		params:         paramsFromConfig(config),
-		active:         make(map[string]bool),
-		handled:        make(map[string]time.Time),
-		idleSince:      make(map[string]time.Time),
+		ctx:       listenerCtx,
+		cancel:    cancel,
+		storage:   storage,
+		addConn:   addConn,
+		params:    paramsFromConfig(config),
+		active:    make(map[string]bool),
+		handled:   make(map[string]time.Time),
+		idleSince: make(map[string]time.Time),
 	}
 
 	go listener.acceptLoop(ctx)
 	go listener.collectLoop(ctx)
-	go listener.refillWarm()
 
 	return listener, nil
 }
@@ -401,19 +225,8 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 			continue
 		}
 		go l.drop(full)
-
-		if listed.Inline != nil {
-			if table, ok := decodeAnnounce(string(listed.Inline)); ok {
-				errors.LogInfo(logCtx, "accepted session ", session, " on a slot ring")
-				l.addConn(l.newSlotSessionConn(session, table))
-				accepted = true
-				continue
-			}
-		}
-
-		errors.LogInfo(logCtx, "accepted session ", session)
 		accepted = true
-		l.addConn(l.newSessionConn(session))
+		l.addConn(l.newSessionConn(logCtx, session, listed.Inline))
 	}
 	return accepted, nil
 }
@@ -433,76 +246,24 @@ func (l *Listener) claim(session string) bool {
 	return true
 }
 
-func (l *Listener) newSessionConn(session string) *Conn {
-	storage := l.storage
-	if s, err := newStorage(l.streamSettings); err == nil {
-		storage = s
+// newSessionConn takes a session in the slots that its announcement has, or
+// in segments if it has none
+func (l *Listener) newSessionConn(logCtx context.Context, session string, announce []byte) *Conn {
+	storage := sessionStorage(l.storage)
+	onClose := func() {
+		storage.Close()
+		l.mu.Lock()
+		delete(l.active, session)
+		l.mu.Unlock()
 	}
-	return newConn(l.ctx, storage,
-		downlinkPrefix(session), uplinkPrefix(session), l.params, func() {
-			if storage != l.storage {
-				storage.Close()
-			}
-			l.release(session)
-		})
-}
-
-func (l *Listener) newSlotSessionConn(session string, table slotAnnounce) *slotConn {
-	store, _ := l.storage.(slotStore)
-	shared := true
-	if s := l.takeWarm(); s != nil {
-		if slots, ok := s.(slotStore); ok {
-			store, shared = slots, false
-		} else {
-			s.Close()
+	if slots, ok := storage.(slotStore); ok {
+		if r, ok := decodeRing(announce); ok {
+			errors.LogInfo(logCtx, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
+			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, onClose)
 		}
 	}
-	return newSlotConn(l.ctx, store, slotAnnounce{
-		Uplink: table.Downlink, Downlink: table.Uplink,
-	}, l.params, func() {
-		if !shared && store != nil {
-			store.Close()
-		}
-		l.release(session)
-	})
-}
-
-func (l *Listener) release(session string) {
-	l.mu.Lock()
-	delete(l.active, session)
-	l.mu.Unlock()
-}
-
-func (l *Listener) takeWarm() Storage {
-	l.mu.Lock()
-	s := l.warm
-	l.warm = nil
-	l.mu.Unlock()
-	go l.refillWarm()
-	if s != nil {
-		return s
-	}
-	fresh, err := newStorage(l.streamSettings)
-	if err != nil {
-		return nil
-	}
-	return fresh
-}
-
-func (l *Listener) refillWarm() {
-	s, err := newStorage(l.streamSettings)
-	if err != nil {
-		return
-	}
-	l.mu.Lock()
-	keep := l.warm == nil && l.ctx.Err() == nil
-	if keep {
-		l.warm = s
-	}
-	l.mu.Unlock()
-	if !keep {
-		s.Close()
-	}
+	errors.LogInfo(logCtx, "accepted session ", session)
+	return newConn(l.ctx, storage, downlinkPrefix(session), uplinkPrefix(session), l.params, onClose)
 }
 
 func (l *Listener) collectLoop(logCtx context.Context) {
@@ -559,13 +320,12 @@ func (l *Listener) collect() error {
 	}
 	l.mu.Unlock()
 
-	var first error
 	for _, session := range expired {
-		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil && first == nil {
-			first = err
+		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil {
+			return err
 		}
 	}
-	return first
+	return nil
 }
 
 func (l *Listener) Addr() net.Addr {
@@ -574,12 +334,5 @@ func (l *Listener) Addr() net.Addr {
 
 func (l *Listener) Close() error {
 	l.cancel()
-	l.mu.Lock()
-	warm := l.warm
-	l.warm = nil
-	l.mu.Unlock()
-	if warm != nil {
-		warm.Close()
-	}
 	return l.storage.Close()
 }

@@ -1,6 +1,7 @@
 package xdrive
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -14,278 +15,199 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
+// A session on a slotStore is carried in a ring of slots for each direction,
+// objects that both peers know by id: segment n is written to slot n % depth
+// and read from it, with nothing to list and no index to wait for. The reader
+// of a direction keeps how far it has read in a watermark, and the writer
+// reuses a slot only once that says what was in it before was taken
+
 const (
-	slotMagic       = "XDRVSL02"
-	slotMagicV1     = "XDRVSL01"
-	slotInlineLimit = 14 * 1024
-	slotSplitLimit  = 8 * slotInlineLimit
-	slotDepthLimit  = 16
+	slotMagic     = "XDRVSL01"
+	slotHeaderLen = len(slotMagic) + 8 + 1 + 4 + 4
+	// slotInlineLimit is how large a segment is at most to go in the description
+	// of its slot, which takes one request less than a body
+	slotInlineLimit = 14 << 10
+	slotDepthLimit  = 8
+	// inlineRampSegments segments of one size in a row double it, from
+	// slotInlineLimit up to segmentBytes
+	inlineRampSegments = 8
 
-	slotModeInline = 1
-	slotModeMedia  = 2
-	slotModeEnd    = 3
-	slotModeErr    = 4
-
-	slotHeaderLen   = len(slotMagic) + 8 + 1 + 4 + 4
-	slotHeaderLenV1 = len(slotMagicV1) + 8 + 1 + 4
+	slotInline = 1
+	slotMedia  = 2
+	slotEnd    = 3
+	slotErr    = 4
 )
 
 var (
-	slotHuntCeiling     = 100 * time.Millisecond
-	slotHuntFloor       = 50 * time.Millisecond
-	slotTailMin         = 150 * time.Millisecond
-	slotTailMax         = 800 * time.Millisecond
-	slotFetchAhead      = 10
-	slotAckStride       = 1
-	slotAckRetry        = 30 * time.Millisecond
-	slotWriteAttempts   = 3
-	slotNotFoundTimeout = 60 * time.Second
-	slotWatermarkTTL    = 100 * time.Millisecond
-	slotStallTimeout    = 60 * time.Second
-	slotCloseGrace      = 10 * time.Second
-	slotHedgeTick       = 250 * time.Millisecond
-	slotHedgeBudget     = time.Second
-	slotBodyHedge       = 2 * time.Second
+	// the head is asked for between slotHuntFloor and slotHuntCeiling, a segment
+	// behind it at about the pace that segments come
+	slotHuntFloor   = 50 * time.Millisecond
+	slotHuntCeiling = 200 * time.Millisecond
+	slotTailMin     = 150 * time.Millisecond
+	slotTailMax     = 800 * time.Millisecond
+	slotFetchAhead  = 6
+
+	slotAckRetry     = 100 * time.Millisecond
+	slotWatermarkTTL = 250 * time.Millisecond
+	slotStallTimeout = 60 * time.Second
+	slotCloseGrace   = 10 * time.Second
+	slotGoneTimeout  = 60 * time.Second
 )
 
-type slotTiming struct {
-	ackRetry        time.Duration
-	ackStride       int
-	ackTTL          time.Duration
-	stallTimeout    time.Duration
-	closeGrace      time.Duration
-	huntFloor       time.Duration
-	huntCeiling     time.Duration
-	tailMin         time.Duration
-	tailMax         time.Duration
-	fetchAhead      int
-	notFoundTimeout time.Duration
-	hedgeTick       time.Duration
-	hedgeBudget     time.Duration
-	bodyHedge       time.Duration
+// slotStore is a storage of objects that are written and read again by id,
+// each with a description and a body
+type slotStore interface {
+	makeSlot(ctx context.Context, name string) (string, error)
+	// setSlot sets the description of a slot and, unless body is nil, its body
+	setSlot(ctx context.Context, id, description string, body []byte) error
+	readDescription(ctx context.Context, id string) (string, error)
+	readBody(ctx context.Context, id string) ([]byte, error)
 }
 
-func takeSlotTiming() slotTiming {
-	return slotTiming{
-		ackRetry:        slotAckRetry,
-		ackStride:       slotAckStride,
-		ackTTL:          slotWatermarkTTL,
-		stallTimeout:    slotStallTimeout,
-		closeGrace:      slotCloseGrace,
-		huntFloor:       slotHuntFloor,
-		huntCeiling:     slotHuntCeiling,
-		tailMin:         slotTailMin,
-		tailMax:         slotTailMax,
-		fetchAhead:      slotFetchAhead,
-		notFoundTimeout: slotNotFoundTimeout,
-		hedgeTick:       slotHedgeTick,
-		hedgeBudget:     slotHedgeBudget,
-		bodyHedge:       slotBodyHedge,
-	}
-}
-
+// slotFrame is what the description of a slot says: which segment it holds,
+// and either the segment itself or the size and checksum of the body that does
 type slotFrame struct {
-	Seq     int64
-	Mode    uint8
-	Data    []byte
-	Len     int
-	Crc     uint32
-	Checked bool
+	seq  int64
+	mode byte
+	size int
+	crc  uint32
+	data []byte
 }
 
-func newInlineFrame(seq int64, data []byte) slotFrame {
-	return slotFrame{
-		Seq:     seq,
-		Mode:    slotModeInline,
-		Data:    data,
-		Len:     len(data),
-		Crc:     crc32.ChecksumIEEE(data),
-		Checked: true,
+func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
+	f := slotFrame{seq: seq, mode: mode, size: len(data), crc: crc32.ChecksumIEEE(data)}
+	if mode == slotInline {
+		f.data = data
 	}
+	return f
 }
 
-func newMediaFrame(seq int64, data []byte) slotFrame {
-	return slotFrame{
-		Seq:     seq,
-		Mode:    slotModeMedia,
-		Len:     len(data),
-		Crc:     crc32.ChecksumIEEE(data),
-		Checked: true,
-	}
-}
-
-func encodeSlot(f slotFrame) string {
-	buf := make([]byte, slotHeaderLen+len(f.Data))
-	copy(buf, slotMagic)
-	pos := len(slotMagic)
-	binary.BigEndian.PutUint64(buf[pos:], uint64(f.Seq))
-	pos += 8
-	buf[pos] = f.Mode
-	pos++
-	binary.BigEndian.PutUint32(buf[pos:], uint32(f.Len))
-	pos += 4
-	binary.BigEndian.PutUint32(buf[pos:], f.Crc)
-	pos += 4
-	copy(buf[pos:], f.Data)
-	return base64.StdEncoding.EncodeToString(buf)
+func (f slotFrame) encode() string {
+	b := make([]byte, slotHeaderLen, slotHeaderLen+len(f.data))
+	copy(b, slotMagic)
+	binary.BigEndian.PutUint64(b[8:], uint64(f.seq))
+	b[16] = f.mode
+	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
+	binary.BigEndian.PutUint32(b[21:], f.crc)
+	return base64.StdEncoding.EncodeToString(append(b, f.data...))
 }
 
 func decodeSlot(description string) (slotFrame, bool) {
-	if description == "" {
+	b, err := base64.StdEncoding.DecodeString(description)
+	if err != nil || len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
 		return slotFrame{}, false
 	}
-	raw, err := base64.StdEncoding.DecodeString(description)
-	if err != nil || len(raw) < slotHeaderLenV1 {
-		return slotFrame{}, false
+	f := slotFrame{
+		seq:  int64(binary.BigEndian.Uint64(b[8:])),
+		mode: b[16],
+		size: int(binary.BigEndian.Uint32(b[17:])),
+		crc:  binary.BigEndian.Uint32(b[21:]),
 	}
-	switch string(raw[:len(slotMagic)]) {
-	case slotMagic:
-		return decodeSlotV2(raw)
-	case slotMagicV1:
-		return decodeSlotV1(raw)
-	default:
-		return slotFrame{}, false
+	if f.mode == slotInline {
+		f.data = b[slotHeaderLen:]
+		if !f.holds(f.data) {
+			return slotFrame{}, false
+		}
 	}
-}
-
-func decodeSlotV2(raw []byte) (slotFrame, bool) {
-	if len(raw) < slotHeaderLen {
-		return slotFrame{}, false
-	}
-	pos := len(slotMagic)
-	f := slotFrame{Checked: true, Seq: int64(binary.BigEndian.Uint64(raw[pos:]))}
-	pos += 8
-	f.Mode = raw[pos]
-	pos++
-	f.Len = int(binary.BigEndian.Uint32(raw[pos:]))
-	pos += 4
-	f.Crc = binary.BigEndian.Uint32(raw[pos:])
-	pos += 4
-	if f.Mode != slotModeInline {
-		return f, true
-	}
-	if f.Len <= 0 || f.Len != len(raw)-pos {
-		return slotFrame{}, false
-	}
-	payload := raw[pos:]
-	if crc32.ChecksumIEEE(payload) != f.Crc {
-		return slotFrame{}, false
-	}
-	f.Data = payload
 	return f, true
 }
 
-func decodeSlotV1(raw []byte) (slotFrame, bool) {
-	pos := len(slotMagicV1)
-	f := slotFrame{Seq: int64(binary.BigEndian.Uint64(raw[pos:]))}
-	pos += 8
-	f.Mode = raw[pos]
-	pos++
-	length := int(binary.BigEndian.Uint32(raw[pos:]))
-	pos += 4
-	if f.Mode != slotModeInline {
-		return f, true
-	}
-	if length <= 0 || length != len(raw)-pos {
-		return slotFrame{}, false
-	}
-	f.Data = raw[pos:]
-	f.Len = length
-	return f, true
+// holds reports whether body is the one that f is about, which a body read
+// right after its description need not be yet
+func (f slotFrame) holds(body []byte) bool {
+	return len(body) == f.size && crc32.ChecksumIEEE(body) == f.crc
 }
 
-func encodeWatermark(seq int64) string {
-	return base64.StdEncoding.EncodeToString([]byte(strconv.FormatInt(seq, 10)))
-}
-
-func decodeWatermark(description string) int64 {
-	raw, err := base64.StdEncoding.DecodeString(description)
-	if err != nil {
-		return -1
-	}
-	seq, err := strconv.ParseInt(string(raw), 10, 64)
-	if err != nil {
-		return -1
-	}
-	return seq
-}
-
-type slotStore interface {
-	makeSlot(ctx context.Context, name string) (string, error)
-	writeSlot(ctx context.Context, id string, seq int64, mode uint8, data []byte) error
-	readSlot(ctx context.Context, id string) (slotFrame, bool, error)
-	readSlotBody(ctx context.Context, id string) ([]byte, error)
-	writeWatermark(ctx context.Context, id string, seq int64) error
-	readWatermark(ctx context.Context, id string) (int64, error)
-	Close() error
-}
-
+// slotTable is the ring of one direction: the ids of its slots and of the
+// watermark of its reader
 type slotTable struct {
-	Slots     []string `json:"slots"`
-	Watermark string   `json:"watermark"`
+	Slots     []string `json:"s"`
+	Watermark string   `json:"w"`
 }
 
-type slotAnnounce struct {
-	Uplink   slotTable `json:"u"`
-	Downlink slotTable `json:"d"`
+// ring is what a client announces a session with, the tables are named from
+// its side
+type ring struct {
+	Up   slotTable `json:"u"`
+	Down slotTable `json:"d"`
 }
 
-func encodeAnnounce(a slotAnnounce) string {
-	raw, err := json.Marshal(a)
-	if err != nil {
-		return ""
+func decodeRing(b []byte) (ring, bool) {
+	var r ring
+	if json.Unmarshal(b, &r) != nil || len(r.Up.Slots) == 0 || len(r.Down.Slots) == 0 ||
+		r.Up.Watermark == "" || r.Down.Watermark == "" {
+		return ring{}, false
 	}
-	return base64.StdEncoding.EncodeToString(raw)
+	return r, true
 }
 
-func decodeAnnounce(description string) (slotAnnounce, bool) {
-	raw, err := base64.StdEncoding.DecodeString(description)
-	if err != nil {
-		return slotAnnounce{}, false
+// makeRing makes the slots and watermarks of a session, all at once
+func makeRing(ctx context.Context, store slotStore, session string, p params) (ring, error) {
+	depth := min(max(p.concurrency, 2), slotDepthLimit)
+	r := ring{
+		Up:   slotTable{Slots: make([]string, depth)},
+		Down: slotTable{Slots: make([]string, depth)},
 	}
-	var a slotAnnounce
-	if json.Unmarshal(raw, &a) != nil {
-		return slotAnnounce{}, false
+	var (
+		wg      sync.WaitGroup
+		errOnce sync.Once
+		err     error
+	)
+	create := func(id *string, name string) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var e error
+			if *id, e = store.makeSlot(ctx, name); e != nil {
+				errOnce.Do(func() { err = e })
+			}
+		}()
 	}
-	if len(a.Uplink.Slots) == 0 || len(a.Downlink.Slots) == 0 ||
-		a.Uplink.Watermark == "" || a.Downlink.Watermark == "" {
-		return slotAnnounce{}, false
+	for _, t := range []struct {
+		table  *slotTable
+		prefix string
+	}{{&r.Up, uplinkPrefix(session)}, {&r.Down, downlinkPrefix(session)}} {
+		for i := range t.table.Slots {
+			create(&t.table.Slots[i], t.prefix+"/s"+strconv.Itoa(i))
+		}
+		create(&t.table.Watermark, t.prefix+"/w")
 	}
-	return a, true
+	wg.Wait()
+	return r, err
+}
+
+func readWatermark(ctx context.Context, store slotStore, id string) (int64, error) {
+	d, err := store.readDescription(ctx, id)
+	if err != nil || d == "" {
+		return -1, err
+	}
+	return strconv.ParseInt(d, 10, 64)
 }
 
 type slotWriter struct {
 	ctx   context.Context
 	store slotStore
 	table slotTable
-	tune  slotTiming
 	params
+	// slots has a token for each segment on its way, at most one for each slot
+	slots chan struct{}
+	wg    sync.WaitGroup
 
 	mu       sync.Mutex
 	buf      []byte
 	seq      int64
-	segBytes int
-	ramped   int
-	partial  int
+	size     int
+	full     int
+	lastSize int
+	held     int
 	closed   bool
 	err      error
+
+	// ackMu is held while the watermark is read, which other uploads wait for
+	ackMu    sync.Mutex
 	acked    int64
-	ackAt    time.Time
-	progAt   time.Time
-	wake     func()
-
-	slots   chan struct{}
-	pending chan struct{}
-	wg      sync.WaitGroup
-
-	wmMu     sync.Mutex
-	wmFlight *wmCall
-}
-
-type wmCall struct {
-	done  chan struct{}
-	acked int64
-	err   error
+	ackedAt  time.Time
+	progress time.Time
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
@@ -293,52 +215,29 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		ctx:      ctx,
 		store:    store,
 		table:    table,
-		tune:     takeSlotTiming(),
 		params:   p,
-		segBytes: p.segmentBytes,
 		slots:    make(chan struct{}, len(table.Slots)),
-		pending:  make(chan struct{}, 2*len(table.Slots)),
+		size:     min(slotInlineLimit, p.segmentBytes),
 		acked:    -1,
-		progAt:   time.Now(),
-	}
-	if start := slotRampStart(p.segmentBytes); start < p.segmentBytes {
-		w.segBytes = start
+		progress: time.Now(),
 	}
 	go w.flushLoop()
 	return w
 }
 
-func slotRampStart(segmentBytes int) int {
-	if slotInlineLimit < segmentBytes {
-		return slotInlineLimit
-	}
-	return segmentBytes
-}
-
-func slotTag(id string) string {
-	if len(id) > 6 {
-		return id[len(id)-6:]
-	}
-	return id
-}
-
-func (w *slotWriter) setWake(fn func()) {
-	w.mu.Lock()
-	w.wake = fn
-	w.mu.Unlock()
-}
-
 func (w *slotWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
 	if w.err != nil {
 		return 0, w.err
 	}
 	if w.closed {
 		return 0, io.ErrClosedPipe
 	}
+
 	w.buf = append(w.buf, p...)
-	for len(w.buf) >= w.segBytes {
+	for len(w.buf) >= w.size {
 		if err := w.flushLocked(); err != nil {
 			return 0, err
 		}
@@ -349,33 +248,17 @@ func (w *slotWriter) Write(p []byte) (int, error) {
 func (w *slotWriter) flushLoop() {
 	ticker := time.NewTicker(w.flushInterval)
 	defer ticker.Stop()
-	held := 0
-	var last int
+
 	for {
 		select {
 		case <-w.ctx.Done():
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			done := w.closed || w.err != nil
-			ready := false
-			if !done && len(w.buf) > 0 && w.partial < max(maxPartialInflight, cap(w.slots)/2) {
-				busy := len(w.slots) > 0
-				grew := len(w.buf) > last
-				last = len(w.buf)
-				switch {
-				case busy && held < maxCoalescedTicks && len(w.buf) < w.segBytes/2:
-					held++
-				case grew && held < maxCoalescedTicks:
-					held++
-				default:
-					held = 0
-					ready = true
-				}
-			}
-			if ready {
+			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
 				w.flushLocked()
 			}
+			done := w.closed || w.err != nil
 			w.mu.Unlock()
 			if done {
 				return
@@ -384,183 +267,140 @@ func (w *slotWriter) flushLoop() {
 	}
 }
 
-func (w *slotWriter) flushLocked() error {
-	if len(w.buf) == 0 {
-		return nil
-	}
-	if w.err != nil {
-		return w.err
-	}
+func (w *slotWriter) readyToFlush() bool {
+	grew := len(w.buf) > w.lastSize
+	w.lastSize = len(w.buf)
 
+	if grew && w.held < maxCoalescedTicks {
+		w.held++
+		return false
+	}
+	w.held = 0
+	return true
+}
+
+// flushLocked sends a segment off buf once a slot is free, which it waits for
+// without w.mu, so that a reader that falls behind holds Write back. w.mu is
+// held
+func (w *slotWriter) flushLocked() error {
 	w.mu.Unlock()
 	select {
-	case w.pending <- struct{}{}:
+	case w.slots <- struct{}{}:
 	case <-w.ctx.Done():
 		w.mu.Lock()
 		return w.ctx.Err()
 	}
-	saturated := false
-	select {
-	case w.slots <- struct{}{}:
-	default:
-		saturated = true
-		select {
-		case w.slots <- struct{}{}:
-		case <-w.ctx.Done():
-			<-w.pending
-			w.mu.Lock()
-			return w.ctx.Err()
-		}
-	}
 	w.mu.Lock()
-	if len(w.buf) == 0 || w.err != nil {
-		err := w.err
-		if err == nil {
-			err = w.ctx.Err()
-		}
+	if w.err != nil || len(w.buf) == 0 {
 		<-w.slots
-		<-w.pending
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-	if (saturated || len(w.slots)*4 > cap(w.slots)*3) && len(w.buf) >= w.segBytes && w.segBytes < w.segmentBytes {
-		w.segBytes = w.segmentBytes
-		w.ramped = 0
+		return w.err
 	}
 
-	n := len(w.buf)
-	if n > w.segBytes {
-		n = w.segBytes
+	n := min(len(w.buf), w.size)
+	if len(w.buf) > 4*slotInlineLimit {
+		// a burst goes at the full size at once
+		n = min(len(w.buf), w.segmentBytes)
 	}
-	if floor := 4 * slotRampStart(w.segmentBytes); len(w.buf) > floor && w.segmentBytes > n {
-		n = w.segmentBytes
-		if n > len(w.buf) {
-			n = len(w.buf)
+	if n == w.size && w.size < w.segmentBytes {
+		if w.full++; w.full == inlineRampSegments {
+			w.full = 0
+			w.size = min(2*w.size, w.segmentBytes)
 		}
 	}
-	split := n > slotInlineLimit && n <= slotSplitLimit && cap(w.slots)-len(w.slots) >= (n+slotInlineLimit-1)/slotInlineLimit
-	if split {
-		n = slotInlineLimit
-	}
-	part := n < w.segBytes && !split
 
-	chunk := make([]byte, n)
-	copy(chunk, w.buf[:n])
+	chunk := bytes.Clone(w.buf[:n])
+	w.buf = append(w.buf[:0], w.buf[n:]...)
 	seq := w.seq
 	w.seq++
-	if n == len(w.buf) {
-		w.buf = w.buf[:0]
-	} else {
-		w.buf = append(w.buf[:0], w.buf[n:]...)
-	}
+	w.lastSize = len(w.buf)
+	w.held = 0
 
-	if !part && n == w.segBytes && w.segBytes < w.segmentBytes {
-		w.ramped++
-		if w.ramped >= len(w.table.Slots) {
-			w.ramped = 0
-			if m := w.segBytes * 2; m <= w.segmentBytes {
-				w.segBytes = m
-			}
-		}
-	}
-	if part {
-		w.partial++
-	}
-
-	id := w.slotID(seq)
-	wake := w.wake
 	w.wg.Add(1)
-	w.mu.Unlock()
-
-	if wake != nil {
-		wake()
-	}
-	go w.upload(id, seq, chunk, part)
-
-	w.mu.Lock()
-	if split && len(w.buf) > 0 {
-		return w.flushLocked()
-	}
+	go w.upload(seq, chunk)
 	return nil
 }
 
 func (w *slotWriter) slotID(seq int64) string {
-	return w.table.Slots[int(seq%int64(len(w.table.Slots)))]
+	return w.table.Slots[seq%int64(len(w.table.Slots))]
 }
 
-func (w *slotWriter) readWatermarkShared() (int64, error) {
-	w.wmMu.Lock()
-	if w.wmFlight != nil {
-		f := w.wmFlight
-		w.wmMu.Unlock()
-		<-f.done
-		return f.acked, f.err
+func (w *slotWriter) upload(seq int64, chunk []byte) {
+	defer w.wg.Done()
+	defer func() { <-w.slots }()
+
+	mode := byte(slotMedia)
+	if len(chunk) <= slotInlineLimit {
+		mode = slotInline
 	}
-	f := &wmCall{done: make(chan struct{})}
-	w.wmFlight = f
-	w.wmMu.Unlock()
-	f.acked, f.err = w.store.readWatermark(w.ctx, w.table.Watermark)
-	w.wmMu.Lock()
-	w.wmFlight = nil
-	w.wmMu.Unlock()
-	close(f.done)
-	return f.acked, f.err
+	if err := w.await(seq); err != nil {
+		w.fail(errors.New("failed to store segment ", seq).Base(err))
+		return
+	}
+	if err := w.write(seq, mode, chunk); err != nil {
+		w.fail(errors.New("failed to store segment ", seq).Base(err))
+		// the slot is free, the reader learns there what happened
+		w.write(seq, slotErr, nil)
+	}
 }
 
+func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
+	f := newSlotFrame(seq, mode, data)
+	var body []byte
+	if mode == slotMedia {
+		body = data
+	}
+	return w.store.setSlot(w.ctx, w.slotID(seq), f.encode(), body)
+}
+
+// drained reports whether the reader took what the slot of seq held a lap
+// before. The watermark is read again only after slotWatermarkTTL, as one
+// that is old costs a wait but never what is in a slot
 func (w *slotWriter) drained(seq int64) (bool, error) {
-	depth := int64(len(w.table.Slots))
-	w.mu.Lock()
-	known, refreshed := w.acked, time.Since(w.ackAt)
-	w.mu.Unlock()
-	if known >= seq-depth {
+	w.ackMu.Lock()
+	defer w.ackMu.Unlock()
+
+	before := seq - int64(len(w.table.Slots))
+	if w.acked >= before {
 		return true, nil
 	}
-	if refreshed < w.tune.ackTTL {
+	if time.Since(w.ackedAt) < slotWatermarkTTL {
 		return false, nil
 	}
-	acked, err := w.readWatermarkShared()
+	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark)
 	if err != nil {
 		return false, err
 	}
-	now := time.Now()
-	w.mu.Lock()
+	w.ackedAt = time.Now()
 	if acked > w.acked {
-		w.acked = acked
-		w.progAt = now
+		w.acked, w.progress = acked, w.ackedAt
 	}
-	w.ackAt = now
-	w.mu.Unlock()
-	return acked >= seq-depth, nil
+	return w.acked >= before, nil
 }
 
+// await waits for drained, for slotStallTimeout at most, or slotCloseGrace
+// without progress once the writer is closed
 func (w *slotWriter) await(seq int64) error {
 	start := time.Now()
-	wait := 100 * time.Millisecond
+	wait := slotAckRetry
 	for {
 		ok, err := w.drained(seq)
-		if err == nil && ok {
+		if ok {
 			return nil
 		}
 		w.mu.Lock()
-		closing := w.closed
-		prog := w.progAt
+		closed := w.closed
 		w.mu.Unlock()
-		stalled := time.Since(prog)
-		if s := time.Since(start); s < stalled {
-			stalled = s
+		w.ackMu.Lock()
+		still := time.Since(w.progress)
+		w.ackMu.Unlock()
+		if time.Since(start) > slotStallTimeout || closed && still > slotCloseGrace {
+			return errors.New("the reader took nothing from slot ", w.slotID(seq), " for ", still).Base(err)
 		}
-		if stalled > w.tune.stallTimeout || (closing && time.Since(prog) > w.tune.closeGrace) {
-			return errors.New("the reader stopped acknowledging slot ", w.slotID(seq)).Base(err)
-		}
+
 		if err != nil {
-			wait *= 2
-			if wait > 2*time.Second {
-				wait = 2 * time.Second
-			}
+			wait = min(2*wait, 2*time.Second)
 		} else {
-			wait = 100 * time.Millisecond
+			wait = slotAckRetry
 		}
 		select {
 		case <-w.ctx.Done():
@@ -570,88 +410,12 @@ func (w *slotWriter) await(seq int64) error {
 	}
 }
 
-func (w *slotWriter) upload(id string, seq int64, chunk []byte, part bool) {
-	defer func() {
-		<-w.pending
-		w.unpark(part)
-		w.wg.Done()
-	}()
-
-	var lastErr error
-	began := time.Now()
-	if err := w.await(seq); err != nil {
-		w.fail(errors.New("failed to store segment ", seq).Base(err))
-		return
-	}
-	awaited := time.Since(began)
-	for attempt := 0; attempt < slotWriteAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-w.ctx.Done():
-				return
-			case <-time.After(time.Duration(attempt) * 200 * time.Millisecond):
-			}
-			if frame, ok, err := w.store.readSlot(w.ctx, id); err == nil && ok && frame.Seq >= seq {
-				return
-			}
-		}
-		mode := uint8(slotModeMedia)
-		if len(chunk) <= slotInlineLimit {
-			mode = slotModeInline
-		}
-		putAt := time.Now()
-		if err := w.store.writeSlot(w.ctx, id, seq, mode, chunk); err != nil {
-			lastErr = err
-			if w.ctx.Err() != nil {
-				return
-			}
-			continue
-		}
-		errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
-			" mode=", mode, " await=", awaited, " put=", time.Since(putAt), " try=", attempt)
-		return
-	}
-	w.fail(errors.New("failed to store segment ", seq).Base(lastErr))
-	w.signalErr(id, seq)
-}
-
-func (w *slotWriter) signalErr(id string, seq int64) {
-	w.mu.Lock()
-	consumed := w.acked >= seq-int64(len(w.table.Slots))
-	w.mu.Unlock()
-	if !consumed {
-		return
-	}
-	_ = w.store.writeSlot(w.ctx, id, seq, slotModeErr, nil)
-}
-
-func (w *slotWriter) unpark(part bool) {
-	<-w.slots
-	w.release(part)
-}
-
-func (w *slotWriter) release(part bool) {
-	if !part {
-		return
-	}
-	w.mu.Lock()
-	w.partial--
-	w.mu.Unlock()
-}
-
 func (w *slotWriter) fail(err error) {
 	w.mu.Lock()
+	defer w.mu.Unlock()
 	if w.err == nil {
 		w.err = err
-		errors.LogWarning(w.ctx, "xdrive slot writer failed: ", err)
 	}
-	w.mu.Unlock()
-}
-
-func (w *slotWriter) Err() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.err
 }
 
 func (w *slotWriter) Close() error {
@@ -661,13 +425,18 @@ func (w *slotWriter) Close() error {
 		return nil
 	}
 	w.closed = true
-	w.progAt = time.Now()
 	for len(w.buf) > 0 && w.err == nil {
-		w.flushLocked()
+		if err := w.flushLocked(); err != nil {
+			w.mu.Unlock()
+			return err
+		}
 	}
 	seq := w.seq
-	w.seq++
 	w.mu.Unlock()
+
+	w.ackMu.Lock()
+	w.progress = time.Now()
+	w.ackMu.Unlock()
 
 	w.wg.Wait()
 
@@ -675,61 +444,60 @@ func (w *slotWriter) Close() error {
 	err := w.err
 	w.mu.Unlock()
 	if err != nil {
-		w.signalErr(w.slotID(seq), seq)
 		return err
 	}
 	if err := w.await(seq); err != nil {
 		return err
 	}
-	return w.store.writeSlot(w.ctx, w.slotID(seq), seq, slotModeEnd, nil)
+	return w.write(seq, slotEnd, nil)
 }
 
 type slotReader struct {
 	ctx   context.Context
 	store slotStore
 	table slotTable
-	tune  slotTiming
 	params
 
 	ch   chan []byte
 	wake chan struct{}
-	kick chan struct{}
-	poke map[int64]chan struct{}
+	acks chan struct{}
 
-	mu          sync.Mutex
-	seq         int64
-	acked       int64
-	ackWanted   int64
-	started     bool
-	lastHit     time.Time
-	intervalAvg float64
-	warnAt      time.Time
-	eof         bool
-	stopped     string
+	mu      sync.Mutex
+	head    int64
+	started bool
+	// hitAt is when a segment last came and gap the time between them, activeAt
+	// when a segment came, was seen coming or Wake. Nothing for the eager window
+	// is idle, and active is closed when that ends
+	hitAt    time.Time
+	gap      time.Duration
+	activeAt time.Time
+	active   chan struct{}
+	err      error
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params) *slotReader {
 	r := &slotReader{
-		ctx:       ctx,
-		store:     store,
-		table:     table,
-		tune:      takeSlotTiming(),
-		params:    p,
-		ch:        make(chan []byte, p.concurrency),
-		wake:      make(chan struct{}, 1),
-		acked:     -1,
-		ackWanted: -1,
-		lastHit:   time.Now(),
-	}
-	stride := len(table.Slots) / 4
-	if stride > r.tune.ackStride {
-		r.tune.ackStride = stride
+		ctx:      ctx,
+		store:    store,
+		table:    table,
+		params:   p,
+		ch:       make(chan []byte, p.concurrency),
+		wake:     make(chan struct{}, 1),
+		acks:     make(chan struct{}, 1),
+		hitAt:    time.Now(),
+		activeAt: time.Now(),
+		active:   make(chan struct{}),
 	}
 	go r.run()
 	go r.ackLoop()
 	return r
 }
 
+func (r *slotReader) chunks() <-chan []byte {
+	return r.ch
+}
+
+// Wake has the head asked for now, as an answer is likely to come
 func (r *slotReader) Wake() {
 	r.mu.Lock()
 	r.touch()
@@ -740,108 +508,73 @@ func (r *slotReader) Wake() {
 	}
 }
 
-func (r *slotReader) touch() {
-	if r.kick == nil {
-		r.kick = make(chan struct{})
-	}
-	if time.Since(r.lastHit) > r.eagerWindow {
-		close(r.kick)
-		r.kick = make(chan struct{})
-	}
-	r.lastHit = time.Now()
-}
-
-func (r *slotReader) parked(seq int64) <-chan struct{} {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.eagerWindow <= 0 || r.seq >= seq-1 || time.Since(r.lastHit) <= r.eagerWindow {
-		return nil
-	}
-	if r.kick == nil {
-		r.kick = make(chan struct{})
-	}
-	return r.kick
-}
-
 func (r *slotReader) slotID(seq int64) string {
-	return r.table.Slots[int(seq%int64(len(r.table.Slots)))]
+	return r.table.Slots[seq%int64(len(r.table.Slots))]
 }
 
 type slotFetch struct {
-	ready   chan struct{}
-	body    []byte
-	end     bool
-	fatal   bool
-	err     error
-	nfSince time.Time
-	born    time.Time
-	readyAt time.Time
+	ready chan struct{}
+	// promoted is closed when the segment becomes the head
+	promoted chan struct{}
+	body     []byte
+	end      bool
+	err      error
 }
 
 func (r *slotReader) run() {
 	defer close(r.ch)
-	pending := make(map[int64]*slotFetch, r.tune.fetchAhead+1)
+	ctx, cancel := context.WithCancel(r.ctx)
+	defer cancel()
 
+	fetches := make(map[int64]*slotFetch)
 	for {
-		if r.ctx.Err() != nil {
-			r.stop("the session ended: " + r.ctx.Err().Error())
-			return
-		}
 		r.mu.Lock()
-		head := r.seq
-		started := r.started
+		head, started := r.head, r.started
 		r.mu.Unlock()
 
 		window := 1
 		if started {
-			window = r.tune.fetchAhead
-			if depth := len(r.table.Slots); window > depth {
-				window = depth
-			}
+			window = min(slotFetchAhead, len(r.table.Slots))
 		}
-		for i := 0; i < window; i++ {
-			next := head + int64(i)
-			if _, ok := pending[next]; ok {
-				continue
+		for i := range window {
+			seq := head + int64(i)
+			if fetches[seq] == nil {
+				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{})}
+				go r.fetch(ctx, seq, i, fetches[seq])
 			}
-			fetch := &slotFetch{ready: make(chan struct{}), born: time.Now()}
-			pending[next] = fetch
-			go r.collect(next, i, fetch)
 		}
 
-		fetch := pending[head]
+		f := fetches[head]
 		select {
-		case <-fetch.ready:
-		case <-r.ctx.Done():
-			r.stop("the session ended while waiting for segment " + strconv.FormatInt(head, 10))
+		case <-f.ready:
+		case <-ctx.Done():
 			return
 		}
-		if fetch.end {
-			r.mu.Lock()
-			r.eof = true
-			r.mu.Unlock()
-			r.stop("the peer closed the stream")
+		delete(fetches, head)
+		if f.err != nil {
+			r.setErr(f.err)
 			return
 		}
-		if fetch.err != nil {
-			r.stop(fetch.err.Error())
+		if f.end {
 			return
 		}
-		if fetch.fatal {
-			r.stop("the peer failed to store segment " + strconv.FormatInt(head, 10))
-			return
+
+		// the slot is free once the bytes are here, not once they are read
+		r.mu.Lock()
+		r.head++
+		r.started = true
+		r.mu.Unlock()
+		if next := fetches[head+1]; next != nil {
+			close(next.promoted)
 		}
-		delete(pending, head)
-		r.consumed(head)
-		if !fetch.readyAt.IsZero() {
-			errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
-				fetch.readyAt.Sub(fetch.born), " blocked=", time.Since(fetch.readyAt), " bytes=", len(fetch.body))
+		select {
+		case r.acks <- struct{}{}:
+		default:
 		}
 
 		select {
-		case r.ch <- fetch.body:
-		case <-r.ctx.Done():
-			r.stop("the session ended while delivering")
+		case r.ch <- f.body:
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -850,395 +583,176 @@ func (r *slotReader) run() {
 func (r *slotReader) isHead(seq int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.seq == seq
+	return r.head == seq
 }
 
-func (r *slotReader) collect(seq int64, offset int, f *slotFetch) {
-	own := make(chan struct{}, 1)
-	r.mu.Lock()
-	if r.poke == nil {
-		r.poke = make(map[int64]chan struct{})
+// fetch asks for the slot of seq until it holds seq: the head often, a segment
+// behind it at the pace that segments come, as it would wait for the head anyway
+func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
+	defer close(f.ready)
+	if offset > 0 && !r.hold(ctx, time.Duration(offset)*r.pace(), f.promoted, nil) {
+		return
 	}
-	r.poke[seq] = own
-	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		delete(r.poke, seq)
-		r.mu.Unlock()
-	}()
-	if offset > 0 {
-		if !r.sleep(time.Duration(float64(offset) * r.interval())) {
-			return
-		}
-	}
-	head := r.isHead(seq)
-	backoff, ceiling := r.tune.huntFloor, r.tune.huntCeiling
-	wasHead := head
-	for {
-		if r.ctx.Err() != nil {
-			return
-		}
-		head = r.isHead(seq)
-		if head && !wasHead {
-			backoff, ceiling = r.tune.huntFloor, r.tune.huntCeiling
-		} else if !head {
-			backoff = time.Duration(r.interval() * float64(time.Second))
-			if backoff < r.tune.tailMin {
-				backoff = r.tune.tailMin
-			}
-			if backoff > r.tune.tailMax {
-				backoff = r.tune.tailMax
-			}
-			ceiling = backoff
-		}
-		wasHead = head
-		if !head {
-			if ch := r.parked(seq); ch != nil {
-				select {
-				case <-ch:
-				case <-r.ctx.Done():
-					return
-				case <-time.After(time.Second):
-				}
-				continue
-			}
-		}
-		readCtx := r.ctx
-		if !head {
-			readCtx = context.WithValue(r.ctx, tailMark{}, true)
-		}
-		var (
-			frame slotFrame
-			ok    bool
-			err   error
-		)
-		if head && r.tune.hedgeTick > 0 {
-			frame, ok, err = r.readPipelined(seq)
-		} else {
-			frame, ok, err = r.store.readSlot(readCtx, r.slotID(seq))
-		}
-		if err == nil && ok && frame.Seq == seq {
-			switch frame.Mode {
-			case slotModeEnd:
-				f.end = true
-			case slotModeErr:
-				f.fatal = true
-			case slotModeInline:
-				f.body = frame.Data
-			case slotModeMedia:
-				body, berr := r.readBody(seq)
-				if berr != nil {
-					if !r.hold(backoff, ceiling, head, own) {
-						return
-					}
-					continue
-				}
-				if frame.Checked && (len(body) != frame.Len || crc32.ChecksumIEEE(body) != frame.Crc) {
-					if !r.hold(backoff, ceiling, head, own) {
-						return
-					}
-					continue
-				}
-				f.body = body
-			default:
-				if !r.hold(backoff, ceiling, head, own) {
-					return
-				}
-				continue
-			}
-			r.armed()
-			f.readyAt = time.Now()
-			close(f.ready)
-			return
-		}
 
-		if err == errNotFound {
-			if f.nfSince.IsZero() {
-				f.nfSince = time.Now()
-			} else if head && time.Since(f.nfSince) >= r.tune.notFoundTimeout {
-				f.err = errors.New("slot ", r.slotID(seq), " for segment ", seq, " is gone").Base(errNotFound)
-				close(f.ready)
+	id := r.slotID(seq)
+	backoff := slotHuntFloor
+	var goneSince, warnedAt time.Time
+	for {
+		description, err := r.store.readDescription(ctx, id)
+		frame, ok := decodeSlot(description)
+		switch {
+		case err == nil && ok && frame.seq == seq:
+			// what follows it is asked for while its body comes
+			r.mu.Lock()
+			r.touch()
+			r.mu.Unlock()
+			switch frame.mode {
+			case slotEnd:
+				f.end = true
+				return
+			case slotErr:
+				f.err = errors.New("the peer could not store segment ", seq)
+				return
+			case slotInline:
+				f.body = frame.data
+				r.hit()
+				return
+			case slotMedia:
+				if body, err := r.store.readBody(ctx, id); err == nil && frame.holds(body) {
+					f.body = body
+					r.hit()
+					return
+				}
+			}
+		case err == errNotFound:
+			if goneSince.IsZero() {
+				goneSince = time.Now()
+			} else if time.Since(goneSince) > slotGoneTimeout && r.isHead(seq) {
+				f.err = errors.New("slot ", id, " of segment ", seq, " is gone").Base(err)
 				return
 			}
-		} else {
-			f.nfSince = time.Time{}
-			if err != nil && r.ctx.Err() == nil {
-				warn := false
-				r.mu.Lock()
-				if time.Since(r.warnAt) >= 10*time.Second {
-					r.warnAt = time.Now()
-					warn = true
-				}
-				r.mu.Unlock()
-				if warn {
-					errors.LogWarning(r.ctx, "xdrive slot read failed: ", err)
-				}
+		case err != nil:
+			goneSince = time.Time{}
+			if ctx.Err() == nil && time.Since(warnedAt) > 10*time.Second {
+				warnedAt = time.Now()
+				errors.LogWarningInner(ctx, err, "failed to read slot ", id)
 			}
 		}
 
-		if head {
-			backoff *= 2
-			if backoff > ceiling {
-				backoff = ceiling
+		r.mu.Lock()
+		head, idle, active := r.head == seq, time.Since(r.activeAt) > r.eagerWindow, r.active
+		r.mu.Unlock()
+		wait, a, b := backoff, (<-chan struct{})(r.wake), (<-chan struct{})(nil)
+		switch {
+		case head:
+			ceiling := slotHuntCeiling
+			if idle {
+				ceiling = max(ceiling, r.maxPollInterval)
 			}
+			backoff = min(2*backoff, ceiling)
+		case idle:
+			// only the head is asked for until something comes
+			wait, a, b, backoff = 0, f.promoted, active, slotHuntFloor
+		default:
+			wait, a, backoff = min(max(r.pace(), slotTailMin), slotTailMax), f.promoted, slotHuntFloor
 		}
-		if !r.hold(backoff, ceiling, head, own) {
+		if !r.hold(ctx, wait, a, b) {
 			return
 		}
 	}
 }
 
-type slotRead struct {
-	frame slotFrame
-	ok    bool
-	err   error
-}
-
-type tailMark struct{}
-
-func (r *slotReader) hot() bool {
+// pace is about how long segments take to come one after the other
+func (r *slotReader) pace() time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return time.Since(r.lastHit) < r.eagerWindow
+	return min(max(r.gap, 300*time.Millisecond), 3*time.Second)
 }
 
-func (r *slotReader) readPipelined(seq int64) (slotFrame, bool, error) {
-	id := r.slotID(seq)
-	ctx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
-
-	results := make(chan slotRead, 32)
-	launch := func() {
-		go func() {
-			frame, ok, err := r.store.readSlot(ctx, id)
-			results <- slotRead{frame: frame, ok: ok, err: err}
-		}()
-	}
-
-	deadline := time.Now().Add(r.tune.hedgeBudget)
-	ticker := time.NewTicker(r.tune.hedgeTick)
-	defer ticker.Stop()
-
-	launch()
-	outstanding := 1
-	var last slotRead
-	for {
-		select {
-		case res := <-results:
-			outstanding--
-			if res.err != nil || (res.ok && res.frame.Seq == seq) {
-				return res.frame, res.ok, res.err
-			}
-			last = res
-			if outstanding == 0 && !time.Now().Before(deadline) {
-				return last.frame, last.ok, nil
-			}
-		case <-ticker.C:
-			if outstanding < 2 && time.Now().Before(deadline) {
-				launch()
-				outstanding++
-			} else if outstanding == 0 {
-				return last.frame, last.ok, nil
-			}
-		case <-r.ctx.Done():
-			return slotFrame{}, false, r.ctx.Err()
-		}
-	}
-}
-
-func (r *slotReader) readBody(seq int64) ([]byte, error) {
-	id := r.slotID(seq)
-	if r.tune.bodyHedge <= 0 {
-		return r.store.readSlotBody(r.ctx, id)
-	}
-	ctx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
-	type bodyRead struct {
-		body []byte
-		err  error
-	}
-	results := make(chan bodyRead, 2)
-	launch := func() {
-		go func() {
-			body, err := r.store.readSlotBody(ctx, id)
-			results <- bodyRead{body: body, err: err}
-		}()
-	}
-	launch()
-	outstanding := 1
-	hedged := false
-	timer := time.NewTimer(r.tune.bodyHedge)
-	defer timer.Stop()
-	var last bodyRead
-	for {
-		select {
-		case res := <-results:
-			outstanding--
-			if res.err == nil {
-				return res.body, nil
-			}
-			last = res
-			if outstanding == 0 {
-				return nil, last.err
-			}
-		case <-timer.C:
-			if !hedged {
-				hedged = true
-				launch()
-				outstanding++
-			}
-		case <-r.ctx.Done():
-			return nil, r.ctx.Err()
-		}
-	}
-}
-
-func (r *slotReader) interval() float64 {
+func (r *slotReader) hit() {
 	r.mu.Lock()
-	gap := r.intervalAvg
-	r.mu.Unlock()
-	if gap < 0.3 {
-		return 0.3
+	defer r.mu.Unlock()
+	if gap := time.Since(r.hitAt); r.gap == 0 {
+		r.gap = gap
+	} else {
+		r.gap = (r.gap + gap) / 2
 	}
-	if gap > 3 {
-		return 3
-	}
-	return gap
-}
-
-func (r *slotReader) noteInterval() {
-	r.mu.Lock()
-	if !r.lastHit.IsZero() {
-		gap := time.Since(r.lastHit).Seconds()
-		if r.intervalAvg == 0 {
-			r.intervalAvg = gap
-		} else {
-			r.intervalAvg = (r.intervalAvg + gap) / 2
-		}
-	}
-	r.mu.Unlock()
-}
-
-func (r *slotReader) sleep(d time.Duration) bool {
-	if d <= 0 {
-		return r.ctx.Err() == nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-r.ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-func (r *slotReader) armed() {
-	r.noteInterval()
-	r.mu.Lock()
+	r.hitAt = time.Now()
 	r.touch()
-	r.mu.Unlock()
 }
 
-func (r *slotReader) hold(d, ceiling time.Duration, head bool, own <-chan struct{}) bool {
-	r.mu.Lock()
-	if time.Since(r.lastHit) > r.eagerWindow && ceiling < r.maxPollInterval {
-		ceiling = r.maxPollInterval
+// touch notes that something came or is likely to. r.mu is held
+func (r *slotReader) touch() {
+	if time.Since(r.activeAt) > r.eagerWindow {
+		close(r.active)
+		r.active = make(chan struct{})
 	}
-	r.mu.Unlock()
+	r.activeAt = time.Now()
+}
 
-	if d > ceiling {
-		d = ceiling
+// hold waits d, unless d is 0, or until a or b is closed or has a value
+func (r *slotReader) hold(ctx context.Context, d time.Duration, a, b <-chan struct{}) bool {
+	var timeout <-chan time.Time
+	if d > 0 {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		timeout = timer.C
 	}
-	if d < 5*time.Millisecond {
-		d = 5 * time.Millisecond
-	}
-	var wake <-chan struct{}
-	if head {
-		wake = r.wake
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
 	select {
-	case <-r.ctx.Done():
+	case <-ctx.Done():
 		return false
-	case <-wake:
-		return true
-	case <-own:
-		return true
-	case <-timer.C:
-		return true
+	case <-a:
+	case <-b:
+	case <-timeout:
 	}
+	return true
 }
 
-func (r *slotReader) consumed(seq int64) {
-	r.mu.Lock()
-	r.seq = seq + 1
-	r.started = true
-	r.ackWanted = seq
-	if own, ok := r.poke[seq+1]; ok {
-		select {
-		case own <- struct{}{}:
-		default:
-		}
-	}
-	r.mu.Unlock()
-
-	r.armed()
-}
-
+// ackLoop writes the watermark when the head moves, the last head only if it
+// moved more than once meanwhile
 func (r *slotReader) ackLoop() {
-	wait := r.tune.ackRetry
+	acked := int64(-1)
+	wait := slotAckRetry
 	for {
-		if r.ctx.Err() != nil {
+		select {
+		case <-r.ctx.Done():
 			return
+		case <-r.acks:
 		}
-		r.mu.Lock()
-		want, acked := r.ackWanted, r.acked
-		r.mu.Unlock()
-
-		if want > acked && want-acked >= int64(r.tune.ackStride) {
-			if err := r.store.writeWatermark(r.ctx, r.table.Watermark, want); err == nil {
-				r.mu.Lock()
-				if want > r.acked {
-					r.acked = want
-				}
-				r.mu.Unlock()
-				wait = r.tune.ackRetry
+		for {
+			r.mu.Lock()
+			want := r.head - 1
+			r.mu.Unlock()
+			if want <= acked {
+				break
+			}
+			if err := r.store.setSlot(r.ctx, r.table.Watermark, strconv.FormatInt(want, 10), nil); err == nil {
+				acked, wait = want, slotAckRetry
 				continue
 			}
-			wait *= 2
-			if wait > 5*time.Second {
-				wait = 5 * time.Second
+			wait = min(2*wait, 5*time.Second)
+			select {
+			case <-r.ctx.Done():
+				return
+			case <-time.After(wait):
 			}
 		}
-		select {
-		case <-r.ctx.Done():
-			return
-		case <-time.After(wait):
-		}
 	}
 }
 
-func (r *slotReader) stop(reason string) {
-	r.mu.Lock()
-	if r.stopped == "" {
-		r.stopped = reason
-	}
-	r.mu.Unlock()
-}
-
-func (r *slotReader) Stopped() string {
+func (r *slotReader) setErr(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stopped
+	if r.err == nil {
+		r.err = err
+	}
 }
 
 func (r *slotReader) Err() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.eof {
-		return io.EOF
+	if r.err != nil {
+		return r.err
 	}
-	return errors.New(r.stopped)
+	return io.EOF
 }

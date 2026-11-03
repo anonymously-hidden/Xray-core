@@ -3,12 +3,10 @@ package xdrive
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
-	stdnet "net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -31,30 +29,14 @@ type fakeFile struct {
 type fakeDrive struct {
 	server *httptest.Server
 
-	mu               sync.Mutex
-	files            map[string]*fakeFile
-	nextID           int
-	failOnce         map[string]bool
-	failStatus       map[string]int
-	failBody         map[string]string
-	tokens           int
-	hosts            map[string]bool
-	addrs            map[string]bool
-	orLists          int
-	containsLists    int
-	lastQuery        string
-	listDelay        time.Duration
-	listDelayNext    time.Duration
-	uploadDelay      time.Duration
-	createStatus     int
-	mediaUploads     int
-	multipartUploads int
-	hold             time.Duration
-	holdPrefix       string
-	inflight         int
-	maxInflight      int
-	starts           int
-	lastStart        time.Time
+	mu         sync.Mutex
+	files      map[string]*fakeFile
+	nextID     int
+	failOnce   map[string]bool
+	failStatus map[string]int
+	failBody   map[string]string
+	tokens     int
+	hosts      map[string]bool
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -66,7 +48,6 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		failStatus: make(map[string]int),
 		failBody:   make(map[string]string),
 		hosts:      make(map[string]bool),
-		addrs:      make(map[string]bool),
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -76,49 +57,31 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 		return func(w http.ResponseWriter, r *http.Request) {
 			drive.mu.Lock()
 			drive.hosts[r.Host] = true
-			drive.addrs[r.RemoteAddr] = true
-			hold := drive.hold
-			if drive.holdPrefix != "" && !strings.HasPrefix(r.URL.Path, drive.holdPrefix) {
-				hold = 0
-			}
-			drive.starts++
-			drive.lastStart = time.Now()
 			drive.mu.Unlock()
-			if hold > 0 {
-				drive.mu.Lock()
-				drive.inflight++
-				if drive.inflight > drive.maxInflight {
-					drive.maxInflight = drive.inflight
-				}
-				drive.mu.Unlock()
-				time.Sleep(hold)
-				drive.mu.Lock()
-				drive.inflight--
-				drive.mu.Unlock()
-			}
 			next(w, r)
 		}
 	}
 	mux.HandleFunc("/token", record(drive.handleToken))
 	mux.HandleFunc("/upload", record(drive.handleUpload))
-	mux.HandleFunc("/upload/", record(drive.handleUploadBody))
+	mux.HandleFunc("/upload/", record(drive.handleUpload))
 	mux.HandleFunc("/files", record(drive.handleFiles))
 	mux.HandleFunc("/files/", record(drive.handleFile))
 	drive.server = httptest.NewServer(mux)
 
-	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL, driveUpdateURL}
+	resetSharedStorage()
+
+	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL}
 	previousBackoff := driveInitialBackoff
 	driveTokenURL = drive.server.URL + "/token"
 	driveFilesURL = drive.server.URL + "/files"
-	driveUploadURL = drive.server.URL + "/upload?uploadType=multipart&fields=id"
-	driveUpdateURL = drive.server.URL + "/upload"
+	driveUploadURL = drive.server.URL + "/upload"
 	driveInitialBackoff = 5 * time.Millisecond
 
 	t.Cleanup(func() {
-		driveTokenURL, driveFilesURL = previous[0], previous[1]
-		driveUploadURL, driveUpdateURL = previous[2], previous[3]
+		driveTokenURL, driveFilesURL, driveUploadURL = previous[0], previous[1], previous[2]
 		driveInitialBackoff = previousBackoff
 		drive.server.Close()
+		resetSharedStorage()
 	})
 	return drive
 }
@@ -134,9 +97,6 @@ func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
-	d.mu.Lock()
-	d.mediaUploads++
-	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -160,7 +120,8 @@ func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var metadata struct {
-		Name string `json:"name"`
+		Name        string `json:"name"`
+		Description string `json:"description"`
 	}
 	if err := json.NewDecoder(metaPart).Decode(&metadata); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -172,6 +133,22 @@ func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
 		data, _ = io.ReadAll(dataPart)
 	}
 
+	if id, ok := strings.CutPrefix(r.URL.Path, "/upload/"); ok {
+		// an update of the body and description of a file
+		d.mu.Lock()
+		file := d.files[id]
+		if file != nil {
+			file.data, file.description = data, metadata.Description
+		}
+		d.mu.Unlock()
+		if file == nil || r.Method != http.MethodPatch {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"id": id})
+		return
+	}
+
 	d.mu.Lock()
 	d.nextID++
 	id := fmt.Sprintf("id-%d", d.nextID)
@@ -179,73 +156,6 @@ func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
 	d.mu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]string{"id": id, "name": metadata.Name})
-}
-
-// handleUploadBody replaces the body of a file that already exists, which is
-// what the slot transport does for a segment too large for a description.
-func (d *fakeDrive) handleUploadBody(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPatch {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	if d.shouldFail("upload") {
-		if status, body := d.failure("upload"); status != 0 {
-			w.WriteHeader(status)
-			w.Write([]byte(body))
-			return
-		}
-		w.WriteHeader(http.StatusTooManyRequests)
-		return
-	}
-	id := strings.TrimPrefix(r.URL.Path, "/upload/")
-	ctype := r.Header.Get("Content-Type")
-	if mt, params, err := mime.ParseMediaType(ctype); err == nil && strings.HasPrefix(mt, "multipart/") {
-		reader := multipart.NewReader(r.Body, params["boundary"])
-		metaPart, err := reader.NextPart()
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		var metadata struct {
-			Description string `json:"description"`
-		}
-		if err := json.NewDecoder(metaPart).Decode(&metadata); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		var data []byte
-		if dataPart, err := reader.NextPart(); err == nil {
-			data, _ = io.ReadAll(dataPart)
-		}
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		file, ok := d.files[id]
-		if !ok {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		file.data = data
-		file.description = metadata.Description
-		d.mediaUploads++
-		d.multipartUploads++
-		json.NewEncoder(w).Encode(map[string]string{"id": id})
-		return
-	}
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	file, ok := d.files[id]
-	if !ok {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	file.data = data
-	d.mediaUploads++
-	json.NewEncoder(w).Encode(map[string]string{"id": id})
 }
 
 func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -257,24 +167,6 @@ func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
-	d.mu.Lock()
-	delay := d.uploadDelay
-	d.uploadDelay = 0
-	d.mu.Unlock()
-	if delay > 0 {
-		select {
-		case <-time.After(delay):
-		case <-r.Context().Done():
-			return
-		}
-	}
-	d.mu.Lock()
-	status := d.createStatus
-	d.mu.Unlock()
-	if status != 0 {
-		w.WriteHeader(status)
-		return
-	}
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -304,40 +196,13 @@ func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	exact, prefix := parseFakeQuery(query)
-	or := parseFakeOr(query)
-
-	d.mu.Lock()
-	d.lastQuery = query
-	if len(or) > 0 {
-		d.orLists++
-	} else if prefix != "" {
-		d.containsLists++
-	}
-	delay := d.listDelay
-	d.listDelay = 0
-	if delay == 0 {
-		delay = d.listDelayNext
-		d.listDelayNext = 0
-	}
-	d.mu.Unlock()
-	if delay > 0 {
-		select {
-		case <-time.After(delay):
-		case <-r.Context().Done():
-			return
-		}
-	}
 	if d.shouldFail("list") {
-		if status, body := d.failure("list"); status != 0 {
-			w.WriteHeader(status)
-			w.Write([]byte(body))
-			return
-		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+
+	query := r.URL.Query().Get("q")
+	exact, prefix := parseFakeQuery(query)
 
 	type entry struct {
 		ID          string `json:"id"`
@@ -352,13 +217,6 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 	for _, file := range d.files {
 		match := false
 		switch {
-		case len(or) > 0:
-			for _, name := range or {
-				if file.name == name {
-					match = true
-					break
-				}
-			}
 		case exact != "":
 			match = file.name == exact
 		case prefix != "":
@@ -383,19 +241,10 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 	if ok && r.Method == http.MethodDelete {
 		delete(d.files, id)
 	}
-	if ok && r.Method == http.MethodPatch {
-		var meta struct {
-			Name        string `json:"name"`
-			Description string `json:"description"`
-		}
-		body, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(body, &meta)
-		if meta.Description != "" {
-			file.description = meta.Description
-		}
-		if meta.Name != "" {
-			file.name = meta.Name
-		}
+	var snapshot fakeFile
+	if ok {
+		// a file can be updated, its fields are read here
+		snapshot = *file
 	}
 	d.mu.Unlock()
 
@@ -408,20 +257,24 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodPatch {
+		var meta struct {
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		d.mu.Lock()
+		file.description = meta.Description
+		d.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]string{"id": id})
 		return
 	}
 	if strings.Contains(r.URL.RawQuery, "fields=description") {
-		d.mu.Lock()
-		description := file.description
-		d.mu.Unlock()
-		json.NewEncoder(w).Encode(map[string]string{"description": description})
+		json.NewEncoder(w).Encode(map[string]string{"description": snapshot.description})
 		return
 	}
-	d.mu.Lock()
-	data := file.data
-	d.mu.Unlock()
-	w.Write(data)
+	w.Write(snapshot.data)
 }
 
 func (d *fakeDrive) shouldFail(kind string) bool {
@@ -467,16 +320,6 @@ func (d *fakeDrive) seenHosts() []string {
 	return out
 }
 
-func (d *fakeDrive) seenAddrs() []string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	out := make([]string, 0, len(d.addrs))
-	for a := range d.addrs {
-		out = append(out, a)
-	}
-	return out
-}
-
 func (d *fakeDrive) count() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -491,19 +334,6 @@ func parseFakeQuery(query string) (exact, prefix string) {
 		return "", value
 	}
 	return "", ""
-}
-
-func parseFakeOr(query string) []string {
-	if !strings.Contains(query, " or ") {
-		return nil
-	}
-	var names []string
-	for _, part := range strings.Split(query, " or ") {
-		if value, ok := cutQuoted(part, "name = '"); ok {
-			names = append(names, value)
-		}
-	}
-	return names
 }
 
 func cutQuoted(query, marker string) (string, bool) {
@@ -524,7 +354,7 @@ func driveSettings() *internet.MemoryStreamConfig {
 		ProtocolName: protocolName,
 		ProtocolSettings: &Config{
 			RemoteFolder:      "folder-id",
-			Service:           "Google Drive",
+			Service:           "google-drive",
 			Secrets:           []string{"client", "secret", "refresh"},
 			FlushIntervalMs:   5,
 			PollIntervalMs:    5,
@@ -755,8 +585,8 @@ func TestDriveRetryRateLimit(t *testing.T) {
 	}
 }
 
-func TestDriveSessionClients(t *testing.T) {
-	drive := newFakeDrive(t)
+func TestDriveSharedClient(t *testing.T) {
+	newFakeDrive(t)
 
 	first, err := newStorage(driveSettings())
 	if err != nil {
@@ -766,137 +596,24 @@ func TestDriveSessionClients(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
-	if first == second {
-		t.Fatal("same settings shared one storage")
+	if first != second {
+		t.Fatal("same settings did not share one storage")
 	}
-
-	ctx := context.Background()
-	if err := first.Put(ctx, "streams/a/c2s/000000000.seg", []byte("x")); err != nil {
-		t.Fatalf("first Put: %v", err)
-	}
-	if err := second.Put(ctx, "streams/b/c2s/000000000.seg", []byte("x")); err != nil {
-		t.Fatalf("second Put: %v", err)
-	}
-
-	if addrs := drive.seenAddrs(); len(addrs) != 2 {
-		t.Fatalf("fake drive saw %d client addresses, want 2", len(addrs))
+	// a session has an inflight of its own, as large
+	session := sessionStorage(first).(*driveStorage)
+	defer session.Close()
+	if session.inflight == first.(*driveStorage).inflight || cap(session.inflight) != driveMaxInflight {
+		t.Fatalf("a session shares inflight or has cap %d", cap(session.inflight))
 	}
 }
 
-func TestDriveAttemptTimeoutFailsFast(t *testing.T) {
+func TestDriveOldServiceName(t *testing.T) {
 	newFakeDrive(t)
 
-	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				time.Sleep(5 * time.Second)
-				c.Close()
-			}()
-		}
-	}()
-
-	previousFilesURL := driveFilesURL
-	previousTimeout := driveAttemptTimeout
-	previousFastWait := driveFastRetryWait
-	driveFilesURL = "http://" + ln.Addr().String()
-	driveAttemptTimeout = 50 * time.Millisecond
-	driveFastRetryWait = 5 * time.Millisecond
-	t.Cleanup(func() {
-		driveFilesURL = previousFilesURL
-		driveAttemptTimeout = previousTimeout
-		driveFastRetryWait = previousFastWait
-	})
-
-	storage := newDriveBackend(t)
-	start := time.Now()
-	_, _, err = storage.do(context.Background(), http.MethodPost, storage.filesURL+"?fields=id",
-		"application/json; charset=UTF-8", []byte(`{"name":"hung"}`))
-	elapsed := time.Since(start)
-	if err == nil {
-		t.Fatal("do() to a hung endpoint succeeded")
-	}
-	if elapsed > 5*time.Second {
-		t.Fatalf("hung do() took %v, want fast failure", elapsed)
-	}
-}
-
-func TestDriveFastRetryRecoversImmediately(t *testing.T) {
-	drive := newFakeDrive(t)
-
-	fakeAddr := strings.TrimPrefix(drive.server.URL, "http://")
-	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	var mu sync.Mutex
-	conns := 0
-	go func() {
-		for {
-			downstream, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			conns++
-			first := conns == 1
-			mu.Unlock()
-			if first {
-				downstream.Close()
-				continue
-			}
-			upstream, err := stdnet.Dial("tcp", fakeAddr)
-			if err != nil {
-				downstream.Close()
-				continue
-			}
-			go func() {
-				io.Copy(upstream, downstream)
-				upstream.Close()
-				downstream.Close()
-			}()
-			go func() {
-				io.Copy(downstream, upstream)
-				upstream.Close()
-				downstream.Close()
-			}()
-		}
-	}()
-
-	previousFilesURL := driveFilesURL
-	previousBackoff := driveInitialBackoff
-	previousMaxBackoff := driveMaxBackoff
-	previousFastWait := driveFastRetryWait
-	previousFastRetries := driveFastRetries
-	driveFilesURL = "http://" + ln.Addr().String()
-	driveInitialBackoff = 2 * time.Second
-	driveMaxBackoff = 2 * time.Second
-	driveFastRetryWait = 5 * time.Millisecond
-	driveFastRetries = 2
-	t.Cleanup(func() {
-		driveFilesURL = previousFilesURL
-		driveInitialBackoff = previousBackoff
-		driveMaxBackoff = previousMaxBackoff
-		driveFastRetryWait = previousFastWait
-		driveFastRetries = previousFastRetries
-	})
-
-	storage := newDriveBackend(t)
-	start := time.Now()
-	if err := storage.Put(context.Background(), "streams/flaky/000000000.seg", []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("recovery after one transport failure took %v, want fast retry", elapsed)
+	settings := driveSettings()
+	settings.ProtocolSettings.(*Config).Service = "Google Drive"
+	if _, err := newStorage(settings); err != nil {
+		t.Fatalf("newStorage: %v", err)
 	}
 }
 
@@ -983,36 +700,6 @@ func TestDriveInlineGet(t *testing.T) {
 	}
 }
 
-func TestDriveMidInline(t *testing.T) {
-	newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	payload := make([]byte, 15000)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	if err := storage.Put(ctx, "streams/abc/c2s/000000000.seg", payload); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	entries, err := storage.List(ctx, "streams/abc/c2s")
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if len(entries) != 1 || string(entries[0].Inline) != string(payload) {
-		t.Fatalf("listing did not carry the 15KB payload inline")
-	}
-
-	got, err := storage.Get(ctx, "streams/abc/c2s/000000000.seg")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("Get returned %d bytes, want %d", len(got), len(payload))
-	}
-}
-
 func TestDriveFronting(t *testing.T) {
 	drive := newFakeDrive(t)
 
@@ -1052,473 +739,5 @@ func TestDriveFronting(t *testing.T) {
 		if host != "www.googleapis.com" {
 			t.Fatalf("inner host was %q, want www.googleapis.com regardless of address", host)
 		}
-	}
-}
-
-func TestDriveWarmupFetchesToken(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-
-	waitFor(t, "warmup token fetch", func() bool {
-		drive.mu.Lock()
-		defer drive.mu.Unlock()
-		return drive.tokens == 1
-	})
-	time.Sleep(200 * time.Millisecond)
-	drive.mu.Lock()
-	tokens := drive.tokens
-	drive.mu.Unlock()
-	if tokens != 1 {
-		t.Fatalf("fake saw %d token requests, want exactly 1", tokens)
-	}
-	if err := storage.Put(context.Background(), "sessions/warm", []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	drive.mu.Lock()
-	tokens = drive.tokens
-	drive.mu.Unlock()
-	if tokens != 1 {
-		t.Fatalf("fake saw %d token requests after Put, want still 1", tokens)
-	}
-}
-
-func TestProbeHedgeCapped(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	if err := storage.Put(ctx, objectName("streams/hedgecap", 0, segSuffix), []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	drive.mu.Lock()
-	drive.listDelay = 1500 * time.Millisecond
-	drive.mu.Unlock()
-	start := time.Now()
-	if _, err := storage.probe(ctx, "streams/hedgecap", 0); err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if d := time.Since(start); d >= 1300*time.Millisecond {
-		t.Fatalf("first probe took %v, want under 1.3s", d)
-	}
-
-	drive.mu.Lock()
-	drive.listDelay = 1500 * time.Millisecond
-	drive.mu.Unlock()
-	start = time.Now()
-	if _, err := storage.probe(ctx, "streams/hedgecap", 0); err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if d := time.Since(start); d < 1300*time.Millisecond {
-		t.Fatalf("second probe took %v, want at least 1.3s without a hedge", d)
-	}
-	waitFor(t, "slow queries to land", func() bool {
-		orLists, _ := driveCounts(drive)
-		return orLists == 3
-	})
-}
-
-func TestProbeHedgeRecovers(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	if err := storage.Put(ctx, objectName("streams/hedgeerr", 0, segSuffix), []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	drive.mu.Lock()
-	drive.listDelay = 1200 * time.Millisecond
-	drive.listDelayNext = 300 * time.Millisecond
-	drive.mu.Unlock()
-	drive.failOnceWith("list", http.StatusNotFound, "gone")
-
-	entries, err := storage.probe(ctx, "streams/hedgeerr", 0)
-	if err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("probe returned %d entries, want 1", len(entries))
-	}
-	waitFor(t, "hedged query to land", func() bool {
-		orLists, _ := driveCounts(drive)
-		return orLists == 2
-	})
-}
-
-func TestProbeHedgeAfterFastProbes(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	if err := storage.Put(ctx, objectName("streams/hedgefast", 0, segSuffix), []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-
-	for i := 0; i < 20; i++ {
-		if _, err := storage.probe(ctx, "streams/hedgefast", 0); err != nil {
-			t.Fatalf("probe: %v", err)
-		}
-	}
-
-	drive.mu.Lock()
-	drive.listDelay = 1500 * time.Millisecond
-	drive.mu.Unlock()
-	start := time.Now()
-	if _, err := storage.probe(ctx, "streams/hedgefast", 0); err != nil {
-		t.Fatalf("probe: %v", err)
-	}
-	if d := time.Since(start); d >= 1300*time.Millisecond {
-		t.Fatalf("slow probe took %v, want under 1.3s", d)
-	}
-	waitFor(t, "hedged query to land", func() bool {
-		orLists, _ := driveCounts(drive)
-		return orLists == 22
-	})
-}
-
-func TestPutRejectedFallsBackToMedia(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	payload := []byte("hello media")
-	drive.failOnceWith("upload", http.StatusBadRequest, "bad description")
-	if err := storage.Put(ctx, "sessions/rejected", payload); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	drive.mu.Lock()
-	uploads := drive.mediaUploads
-	drive.mu.Unlock()
-	if uploads != 1 {
-		t.Fatalf("fake saw %d media uploads, want 1", uploads)
-	}
-	got, err := storage.Get(ctx, "sessions/rejected")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("Get returned %q, want %q", got, payload)
-	}
-}
-
-func TestPutServerErrorSkipsMediaPath(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	drive.mu.Lock()
-	drive.createStatus = http.StatusInternalServerError
-	drive.mu.Unlock()
-
-	if err := storage.Put(ctx, "sessions/err500", []byte("x")); err == nil {
-		t.Fatal("Put succeeded after persistent 500s")
-	}
-	drive.mu.Lock()
-	uploads := drive.mediaUploads
-	drive.mu.Unlock()
-	if uploads != 0 {
-		t.Fatalf("fake saw %d media uploads, want 0", uploads)
-	}
-}
-
-func TestPutCancelledSkipsMediaPath(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := storage.Put(ctx, "sessions/cancelled", []byte("x"))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Put returned %v, want context.Canceled", err)
-	}
-	drive.mu.Lock()
-	uploads := drive.mediaUploads
-	drive.mu.Unlock()
-	if uploads != 0 {
-		t.Fatalf("fake saw %d media uploads, want 0", uploads)
-	}
-}
-
-func TestNoCooldownAfterServerError(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	drive.failOnceWith("upload", http.StatusInternalServerError, "boom")
-	done := make(chan error, 1)
-	go func() {
-		done <- storage.Put(ctx, "sessions/abc", []byte("x"))
-	}()
-	time.Sleep(20 * time.Millisecond)
-
-	start := time.Now()
-	if _, err := storage.List(ctx, "sessions"); err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if d := time.Since(start); d > 100*time.Millisecond {
-		t.Fatalf("List after a 500 took %v, want under 100ms", d)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-}
-
-func TestCooldownAfterRateLimit(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	drive.failNext("upload")
-	if err := storage.Put(ctx, "sessions/abc", nil); err != nil {
-		t.Fatalf("Put did not survive a 429: %v", err)
-	}
-
-	start := time.Now()
-	if _, err := storage.List(ctx, "sessions"); err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	if d := time.Since(start); d < driveCooldown/2 {
-		t.Fatalf("request after a 429 took %v, want at least %v", d, driveCooldown/2)
-	}
-}
-
-func TestMetaWriteSurvivesSlowAttempt(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	previousAttempt := driveMetaAttemptTimeout
-	driveMetaAttemptTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { driveMetaAttemptTimeout = previousAttempt })
-
-	drive.mu.Lock()
-	drive.uploadDelay = 250 * time.Millisecond
-	drive.mu.Unlock()
-	drive.failOnceWith("upload", http.StatusInternalServerError, "boom")
-
-	start := time.Now()
-	if err := storage.Put(ctx, "sessions/slowwrite", []byte("x")); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
-	if d := time.Since(start); d <= 150*time.Millisecond {
-		t.Fatalf("Put took %v, want more than the scaled 15s budget", d)
-	}
-}
-
-func TestSlotReadSurvivesStalledAttempt(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	id, err := storage.makeSlot(ctx, "streams/stallread/s0")
-	if err != nil {
-		t.Fatalf("makeSlot: %v", err)
-	}
-	if err := storage.writeSlot(ctx, id, 0, slotModeInline, []byte("x")); err != nil {
-		t.Fatalf("writeSlot: %v", err)
-	}
-
-	fakeAddr := strings.TrimPrefix(drive.server.URL, "http://")
-	ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-	var mu sync.Mutex
-	conns := 0
-	go func() {
-		for {
-			downstream, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			conns++
-			first := conns == 1
-			mu.Unlock()
-			if first {
-				go func() {
-					time.Sleep(2 * time.Second)
-					downstream.Close()
-				}()
-				continue
-			}
-			upstream, err := stdnet.Dial("tcp", fakeAddr)
-			if err != nil {
-				downstream.Close()
-				continue
-			}
-			go func() {
-				io.Copy(upstream, downstream)
-				upstream.Close()
-				downstream.Close()
-			}()
-			go func() {
-				io.Copy(downstream, upstream)
-				upstream.Close()
-				downstream.Close()
-			}()
-		}
-	}()
-
-	previousFilesURL := storage.filesURL
-	previousAttempt := slotReadAttemptTimeout
-	previousFastWait := driveFastRetryWait
-	storage.filesURL = "http://" + ln.Addr().String() + "/files"
-	slotReadAttemptTimeout = 150 * time.Millisecond
-	driveFastRetryWait = 5 * time.Millisecond
-	t.Cleanup(func() {
-		storage.filesURL = previousFilesURL
-		slotReadAttemptTimeout = previousAttempt
-		driveFastRetryWait = previousFastWait
-	})
-
-	start := time.Now()
-	frame, ok, err := storage.readSlot(ctx, id)
-	if err != nil || !ok {
-		t.Fatalf("readSlot: %v ok=%v", ok, err)
-	}
-	if frame.Seq != 0 {
-		t.Fatalf("read seq %d, want 0", frame.Seq)
-	}
-	if d := time.Since(start); d > time.Second {
-		t.Fatalf("readSlot took %v, want the stalled attempt cut short", d)
-	}
-}
-
-func TestTailReadsAreCapped(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	id, err := storage.makeSlot(ctx, "streams/tailcap/s0")
-	if err != nil {
-		t.Fatalf("makeSlot: %v", err)
-	}
-
-	drive.mu.Lock()
-	drive.hold = 100 * time.Millisecond
-	drive.holdPrefix = "/files/" + id
-	wave := drive.starts
-	drive.mu.Unlock()
-	var pending sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		marked := context.WithValue(ctx, tailMark{}, true)
-		pending.Add(1)
-		go func() {
-			defer pending.Done()
-			_, _, _ = storage.readSlot(marked, id)
-		}()
-	}
-	waitFor(t, "the tail wave to reach the fake Drive", func() bool {
-		drive.mu.Lock()
-		defer drive.mu.Unlock()
-		return drive.starts >= wave+driveTailInflight
-	})
-	drive.mu.Lock()
-	peak := drive.maxInflight
-	drive.mu.Unlock()
-	if peak > driveTailInflight {
-		t.Fatalf("max concurrent tail requests = %d, want <= %d", peak, driveTailInflight)
-	}
-	if peak == 0 {
-		t.Fatal("no tail requests reached the fake Drive")
-	}
-
-	drive.mu.Lock()
-	before := drive.starts
-	drive.mu.Unlock()
-	issued := time.Now()
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := storage.readSlot(ctx, id)
-		done <- err
-	}()
-	waitFor(t, "the unmarked read to start", func() bool {
-		drive.mu.Lock()
-		defer drive.mu.Unlock()
-		return drive.starts > before
-	})
-	drive.mu.Lock()
-	arrived := drive.lastStart
-	drive.mu.Unlock()
-	if d := arrived.Sub(issued); d > 50*time.Millisecond {
-		t.Fatalf("the unmarked read started after %v, want <= 50ms", d)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("unmarked readSlot: %v", err)
-	}
-	pending.Wait()
-}
-
-func TestSlotMediaSingleRequest(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	payload := make([]byte, 64*1024)
-	for i := range payload {
-		payload[i] = byte(i * 7)
-	}
-	id, err := storage.makeSlot(ctx, "streams/multipart/s0")
-	if err != nil {
-		t.Fatalf("makeSlot: %v", err)
-	}
-	if err := storage.writeSlot(ctx, id, 3, slotModeMedia, payload); err != nil {
-		t.Fatalf("writeSlot: %v", err)
-	}
-	frame, ok, err := storage.readSlot(ctx, id)
-	if err != nil || !ok {
-		t.Fatalf("readSlot: %v ok=%v", ok, err)
-	}
-	if frame.Seq != 3 || frame.Mode != slotModeMedia {
-		t.Fatalf("frame = %+v, want seq 3 mode media", frame)
-	}
-	got, err := storage.readSlotBody(ctx, id)
-	if err != nil {
-		t.Fatalf("readSlotBody: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatal("body mismatch")
-	}
-	drive.mu.Lock()
-	multi, media := drive.multipartUploads, drive.mediaUploads
-	drive.mu.Unlock()
-	if multi != 1 || media != 1 {
-		t.Fatalf("multipart = %d media = %d, want 1 and 1", multi, media)
-	}
-}
-
-func TestSlotMediaFallsBack(t *testing.T) {
-	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-
-	payload := []byte("fallback body")
-	id, err := storage.makeSlot(ctx, "streams/multipartfb/s0")
-	if err != nil {
-		t.Fatalf("makeSlot: %v", err)
-	}
-	drive.failOnceWith("upload", http.StatusBadRequest, "no multipart here")
-	if err := storage.writeSlot(ctx, id, 5, slotModeMedia, payload); err != nil {
-		t.Fatalf("writeSlot: %v", err)
-	}
-	got, err := storage.readSlotBody(ctx, id)
-	if err != nil {
-		t.Fatalf("readSlotBody: %v", err)
-	}
-	if string(got) != string(payload) {
-		t.Fatal("body mismatch after fallback")
-	}
-	frame, ok, err := storage.readSlot(ctx, id)
-	if err != nil || !ok || frame.Seq != 5 {
-		t.Fatalf("frame = %+v ok=%v err=%v, want seq 5", frame, ok, err)
-	}
-	drive.mu.Lock()
-	multi, media := drive.multipartUploads, drive.mediaUploads
-	drive.mu.Unlock()
-	if multi != 0 || media != 1 {
-		t.Fatalf("multipart = %d media = %d, want 0 and 1", multi, media)
 	}
 }

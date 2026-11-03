@@ -1,11 +1,15 @@
 package conf
 
 import (
+	"context"
+	"slices"
 	"strings"
 
+	utls "github.com/refraction-networking/utls"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 type TransportProtocol string
@@ -86,6 +90,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		config.ProtocolName = protocol
 	}
 
+	var xdriveH3 bool
 	switch strings.ToLower(c.Security) {
 	case "", "none":
 	case "tls":
@@ -100,6 +105,15 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		tm := serial.ToTypedMessage(ts)
 		config.SecuritySettings = append(config.SecuritySettings, tm)
 		config.SecurityType = tm.Type
+		xdriveH3 = config.ProtocolName == "xdrive" && tlsSettings.ALPN != nil && slices.Equal(*tlsSettings.ALPN, StringList{"h3"})
+		if config.ProtocolName == "xdrive" && tlsSettings.ALPN != nil && slices.Equal(*tlsSettings.ALPN, StringList{"http/1.1"}) && tlsSettings.ECHConfigList == "" {
+			// a fingerprint puts its own ALPN into the hello, except Go TLS and the
+			// randomized ones, which take it from the config or send none
+			if fp := tls.GetFingerprint(strings.ToLower(tlsSettings.Fingerprint)); fp != nil && fp.Client != utls.HelloGolang.Client &&
+				!strings.HasPrefix(fp.Client, utls.HelloRandomized.Client) {
+				errors.LogWarning(context.Background(), `XDRIVE: "alpn" ["http/1.1"] reaches the wire only inside ECH, without "echConfigList" the hello carries the ALPN of the fingerprint and the server may pick h2`)
+			}
+		}
 	case "reality":
 		if config.ProtocolName != "tcp" && config.ProtocolName != "splithttp" && config.ProtocolName != "grpc" {
 			return nil, errors.New("REALITY only supports RAW, XHTTP and gRPC for now.")
@@ -207,6 +221,7 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 		})
 	}
 	if c.XDRIVESettings != nil {
+		c.XDRIVESettings.h3 = xdriveH3
 		xs, err := c.XDRIVESettings.Build()
 		if err != nil {
 			return nil, errors.New("Failed to build XDRIVE config.").Base(err)
@@ -245,6 +260,21 @@ func (c *StreamConfig) Build() (*internet.StreamConfig, error) {
 				return nil, err
 			}
 			config.QuicParams = proto.(*internet.QuicParams)
+		}
+	}
+
+	if xdriveH3 && c.FinalMask != nil {
+		if c.XDRIVESettings != nil && c.XDRIVESettings.Service == "google-drive" {
+			// noise only sends datagrams of its own ahead of the QUIC ones, the
+			// other masks change those or need a peer that undoes them
+			for _, mask := range c.FinalMask.Udp {
+				if strings.ToLower(mask.Type) != "noise" {
+					return nil, errors.New(`XDRIVE: over h3 to Google Drive the only "udp" mask that works is "noise", not "`, mask.Type, `"`)
+				}
+			}
+		}
+		if config.QuicParams != nil && (config.QuicParams.Congestion == "brutal" || config.QuicParams.Congestion == "force-brutal") {
+			return nil, errors.New(`XDRIVE: brutal is for Hysteria servers, over h3 "congestion" is "bbr" or "reno", not "`, config.QuicParams.Congestion, `"`)
 		}
 	}
 
