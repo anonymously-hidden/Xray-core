@@ -542,3 +542,54 @@ func TestSlotReaderReachesPastWindow(t *testing.T) {
 		}
 	}
 }
+
+type countSlots struct {
+	*memSlots
+	cur  atomic.Int32
+	peak atomic.Int32
+}
+
+func (s *countSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if len(description) < len(slotMagic) || description[:len(slotMagic)] != slotMagic {
+		return s.memSlots.setSlot(ctx, id, description, body)
+	}
+	n := s.cur.Add(1)
+	for {
+		p := s.peak.Load()
+		if n <= p || s.peak.CompareAndSwap(p, n) {
+			break
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	s.cur.Add(-1)
+	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotWriteInflightCap(t *testing.T) {
+	store := &countSlots{memSlots: newMemSlots()}
+	client, server := slotPair(t, store, 48, 512<<10)
+	payload := randomPayload(60 * slotInlineLimit)
+	errs := make(chan error, 1)
+	go func() {
+		for off := 0; off < len(payload); off += slotInlineLimit {
+			if _, err := client.Write(payload[off : off+slotInlineLimit]); err != nil {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the payload came back changed")
+	}
+	if p := int(store.peak.Load()); p > slotWriteInflight {
+		t.Fatalf("%d segments were written at once, want at most %d", p, slotWriteInflight)
+	}
+}

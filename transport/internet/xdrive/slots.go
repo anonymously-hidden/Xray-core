@@ -55,6 +55,8 @@ var (
 	slotBodyHedge    = 2 * time.Second
 )
 
+var slotWriteInflight = 12
+
 // slotStore is a storage of objects that are written and read again by id,
 // each with a description and a body
 type slotStore interface {
@@ -217,7 +219,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		store:    store,
 		table:    table,
 		params:   p,
-		slots:    make(chan struct{}, len(table.Slots)),
+		slots:    make(chan struct{}, min(len(table.Slots), slotWriteInflight)),
 		size:     min(slotInlineLimit, p.segmentBytes),
 		acked:    -1,
 		progress: time.Now(),
