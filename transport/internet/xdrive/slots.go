@@ -611,7 +611,7 @@ func (r *slotReader) isHead(seq int64) bool {
 }
 
 // fetch asks for the slot of seq until it holds seq: the head often, a segment
-// behind it at the pace that segments come, as it would wait for the head anyway
+// behind it soon after it was asked for, then at the pace that segments come
 func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
 	defer func() {
 		f.readyAt = time.Now()
