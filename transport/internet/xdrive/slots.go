@@ -775,6 +775,7 @@ func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string
 	launch := func() {
 		outstanding++
 		go func() {
+			r.reads.Add(1)
 			description, err := r.store.readDescription(ctx, id)
 			results <- result{description, err}
 		}()
