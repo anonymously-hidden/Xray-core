@@ -295,7 +295,13 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		resp, err := s.client.Do(req)
 		<-pool
 		if err != nil {
+			timedOut := attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 			cancel()
+			if timedOut {
+				if t, ok := s.client.Transport.(*sessionTransport); ok {
+					t.stalled()
+				}
+			}
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
 			}
