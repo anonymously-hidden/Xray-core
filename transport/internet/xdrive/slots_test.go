@@ -474,3 +474,71 @@ func TestSlotDeepRingRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type pollSlots struct {
+	*memSlots
+	pmu    sync.Mutex
+	polled map[string]bool
+}
+
+func (s *pollSlots) readDescription(ctx context.Context, id string) (string, error) {
+	s.pmu.Lock()
+	s.polled[id] = true
+	s.pmu.Unlock()
+	return s.memSlots.readDescription(ctx, id)
+}
+
+func TestSlotReaderReachesPastWindow(t *testing.T) {
+	store := &pollSlots{memSlots: newMemSlots(), polled: make(map[string]bool)}
+	p := paramsFromConfig(&Config{FlushIntervalMs: 1, PollIntervalMs: 1, MaxPollIntervalMs: 20, EagerWindowMs: 50, Concurrency: 64})
+	ring, err := makeRing(context.Background(), store, "session", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	put := func(seq int64) {
+		slot := ring.Down.Slots[seq%int64(len(ring.Down.Slots))]
+		if err := store.setSlot(ctx, slot, newSlotFrame(seq, slotInline, []byte{byte(seq)}).encode(), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	reader := newSlotReader(ctx, store, ring.Down, p)
+	next := func() []byte {
+		select {
+		case chunk := <-reader.chunks():
+			return chunk
+		case <-time.After(10 * time.Second):
+			t.Fatal("no segment came")
+			return nil
+		}
+	}
+	put(0)
+	if got := next(); !bytes.Equal(got, []byte{0}) {
+		t.Fatalf("segment 0 came as %v", got)
+	}
+	for seq := int64(2); seq <= 40; seq++ {
+		put(seq)
+	}
+	last := ring.Down.Slots[40]
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		reader.Wake()
+		store.pmu.Lock()
+		polled := store.polled[last]
+		store.pmu.Unlock()
+		if polled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("segment 40 was never asked for while segment 1 was missing")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	put(1)
+	for seq := int64(1); seq <= 40; seq++ {
+		if got := next(); !bytes.Equal(got, []byte{byte(seq)}) {
+			t.Fatalf("segment %d came as %v", seq, got)
+		}
+	}
+}

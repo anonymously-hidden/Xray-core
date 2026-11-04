@@ -480,6 +480,7 @@ type slotReader struct {
 	ch   chan []byte
 	wake chan struct{}
 	acks chan struct{}
+	grow chan struct{}
 
 	mu      sync.Mutex
 	head    int64
@@ -491,6 +492,7 @@ type slotReader struct {
 	gap      time.Duration
 	activeAt time.Time
 	active   chan struct{}
+	frontier int64
 	err      error
 }
 
@@ -503,6 +505,7 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		ch:       make(chan []byte, p.concurrency),
 		wake:     make(chan struct{}, 1),
 		acks:     make(chan struct{}, 1),
+		grow:     make(chan struct{}, 1),
 		hitAt:    time.Now(),
 		activeAt: time.Now(),
 		active:   make(chan struct{}),
@@ -550,12 +553,12 @@ func (r *slotReader) run() {
 	fetches := make(map[int64]*slotFetch)
 	for {
 		r.mu.Lock()
-		head, started := r.head, r.started
+		head, started, frontier := r.head, r.started, r.frontier
 		r.mu.Unlock()
 
 		window := 1
 		if started {
-			window = min(slotFetchAhead, len(r.table.Slots))
+			window = min(max(int(frontier-head)+slotFetchAhead, slotFetchAhead), len(r.table.Slots))
 		}
 		for i := range window {
 			seq := head + int64(i)
@@ -568,6 +571,8 @@ func (r *slotReader) run() {
 		f := fetches[head]
 		select {
 		case <-f.ready:
+		case <-r.grow:
+			continue
 		case <-ctx.Done():
 			return
 		}
@@ -609,6 +614,21 @@ func (r *slotReader) isHead(seq int64) bool {
 	return r.head == seq
 }
 
+func (r *slotReader) reach(seq int64) {
+	r.mu.Lock()
+	grown := seq > r.frontier
+	if grown {
+		r.frontier = seq
+	}
+	r.mu.Unlock()
+	if grown {
+		select {
+		case r.grow <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // fetch asks for the slot of seq until it holds seq: the head often, a segment
 // behind it soon after it was asked for, then at the pace that segments come
 func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
@@ -641,6 +661,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			r.mu.Lock()
 			r.touch()
 			r.mu.Unlock()
+			r.reach(seq)
 			switch frame.mode {
 			case slotEnd:
 				f.end = true
