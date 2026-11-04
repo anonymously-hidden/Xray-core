@@ -430,3 +430,23 @@ func TestSlotBurstReadsTogether(t *testing.T) {
 		t.Fatalf("a burst of 8 segments took %v to read", took)
 	}
 }
+
+func TestSlotLargeBurstInline(t *testing.T) {
+	store := newMemSlots()
+	client, server := slotPair(t, store, 16, 512<<10)
+	payload := randomPayload(10 * slotInlineLimit)
+	go client.Write(payload)
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the burst came back changed")
+	}
+	store.mu.Lock()
+	bodies := len(store.bodies)
+	store.mu.Unlock()
+	if bodies != 0 {
+		t.Fatalf("a burst of 140 KiB went in %d bodies, want none", bodies)
+	}
+}

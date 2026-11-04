@@ -28,7 +28,7 @@ const (
 	// of its slot, which takes one request less than a body
 	slotInlineLimit = 14 << 10
 	slotDepthLimit  = 16
-	slotSplitLimit  = 8 * slotInlineLimit
+	slotSplitLimit  = 12 * slotInlineLimit
 	// inlineRampSegments segments of one size in a row double it, from
 	// slotInlineLimit up to segmentBytes
 	inlineRampSegments = 8
@@ -46,7 +46,7 @@ var (
 	slotHuntCeiling = 25 * time.Millisecond
 	slotTailMin     = 150 * time.Millisecond
 	slotTailMax     = 800 * time.Millisecond
-	slotFetchAhead  = 10
+	slotFetchAhead  = 12
 
 	slotAckRetry     = 30 * time.Millisecond
 	slotWatermarkTTL = 100 * time.Millisecond
