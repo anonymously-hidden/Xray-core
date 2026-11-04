@@ -550,7 +550,7 @@ type countSlots struct {
 }
 
 func (s *countSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
-	if len(description) < len(slotMagic) || description[:len(slotMagic)] != slotMagic {
+	if _, ok := decodeSlot(description); !ok {
 		return s.memSlots.setSlot(ctx, id, description, body)
 	}
 	n := s.cur.Add(1)
