@@ -24,7 +24,7 @@ const (
 	driveBoundary         = "xdrive-boundary"
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
-	driveMaxInflight      = 40
+	driveMaxInflight      = 64
 	driveReservedInflight = 8
 	driveInlineLimit      = 12000
 	// driveTimeout ends a request that makes no progress for that long
