@@ -450,3 +450,27 @@ func TestSlotLargeBurstInline(t *testing.T) {
 		t.Fatalf("a burst of 140 KiB went in %d bodies, want none", bodies)
 	}
 }
+
+func TestSlotDepthFollowsConcurrency(t *testing.T) {
+	for _, c := range []struct{ set, want int }{{100, 100}, {maxConcurrency, maxConcurrency}, {1 << 20, maxConcurrency}} {
+		p := paramsFromConfig(&Config{Concurrency: uint32(c.set)})
+		r, err := makeRing(context.Background(), newMemSlots(), "session", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(r.Up.Slots) != c.want || len(r.Down.Slots) != c.want {
+			t.Fatalf("concurrency %d made %d and %d slots, want %d", c.set, len(r.Up.Slots), len(r.Down.Slots), c.want)
+		}
+	}
+}
+
+func TestSlotDeepRingRoundTrip(t *testing.T) {
+	client, server := slotPair(t, newMemSlots(), 64, 64<<10)
+	payload := randomPayload(2 << 20)
+	errs := make(chan error, 1)
+	writeAll(client, payload, true, errs)
+	readAll(t, server, payload)
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+}

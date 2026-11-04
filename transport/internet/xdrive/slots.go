@@ -27,7 +27,6 @@ const (
 	// slotInlineLimit is how large a segment is at most to go in the description
 	// of its slot, which takes one request less than a body
 	slotInlineLimit = 14 << 10
-	slotDepthLimit  = 16
 	slotSplitLimit  = 12 * slotInlineLimit
 	// inlineRampSegments segments of one size in a row double it, from
 	// slotInlineLimit up to segmentBytes
@@ -145,7 +144,7 @@ func decodeRing(b []byte) (ring, bool) {
 
 // makeRing makes the slots and watermarks of a session, all at once
 func makeRing(ctx context.Context, store slotStore, session string, p params) (ring, error) {
-	depth := min(max(p.concurrency, 2), slotDepthLimit)
+	depth := max(p.concurrency, 2)
 	r := ring{
 		Up:   slotTable{Slots: make([]string, depth)},
 		Down: slotTable{Slots: make([]string, depth)},
@@ -302,7 +301,7 @@ func (w *slotWriter) flushLocked() error {
 		return w.err
 	}
 
-	if w.size < w.segmentBytes && len(w.buf) >= w.size && len(w.slots)*4 > cap(w.slots)*3 {
+	if w.size < w.segmentBytes && len(w.buf) >= w.size && (len(w.slots)*4 > cap(w.slots)*3 || len(w.slots) > 12) {
 		w.size = w.segmentBytes
 		w.full = 0
 	}
