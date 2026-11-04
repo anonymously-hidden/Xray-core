@@ -431,6 +431,52 @@ func TestSlotBurstReadsTogether(t *testing.T) {
 	}
 }
 
+type lagSlots struct{ *memSlots }
+
+func (s lagSlots) readDescription(ctx context.Context, id string) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-time.After(200 * time.Millisecond):
+	}
+	return s.memSlots.readDescription(ctx, id)
+}
+
+func (s lagSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if _, ok := decodeSlot(description); ok {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(600 * time.Millisecond):
+		}
+	}
+	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotReadAheadBurst(t *testing.T) {
+	oldMin, oldMax := slotTailMin, slotTailMax
+	slotTailMin, slotTailMax = 150*time.Millisecond, 800*time.Millisecond
+
+	client, server := slotPair(t, lagSlots{newMemSlots()}, 16, 512<<10)
+	payload := randomPayload(8 * slotInlineLimit)
+	go client.Write(payload)
+	start := time.Now()
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the burst came back changed")
+	}
+	if took := time.Since(start); took > 1700*time.Millisecond {
+		t.Fatalf("a burst of 8 segments took %v to read", took)
+	}
+	client.Close()
+	server.Close()
+	time.Sleep(100 * time.Millisecond)
+	slotTailMin, slotTailMax = oldMin, oldMax
+}
+
 func TestSlotLargeBurstInline(t *testing.T) {
 	store := newMemSlots()
 	client, server := slotPair(t, store, 16, 512<<10)

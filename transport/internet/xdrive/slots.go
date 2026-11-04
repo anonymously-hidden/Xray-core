@@ -10,6 +10,7 @@ import (
 	"io"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -54,8 +55,9 @@ var (
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
 
-	slotReadAhead     int64 = 4
-	slotReadAheadPoll       = 40 * time.Millisecond
+	slotReadAhead      int64 = 3
+	slotReadAheadPoll        = 40 * time.Millisecond
+	slotReadAheadBurst       = 500 * time.Millisecond
 )
 
 var slotWriteInflight = 12
@@ -499,6 +501,9 @@ type slotReader struct {
 	active   chan struct{}
 	frontier int64
 	err      error
+	reads    atomic.Int64
+	tailMin  time.Duration
+	tailMax  time.Duration
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params) *slotReader {
@@ -514,6 +519,8 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		hitAt:    time.Now(),
 		activeAt: time.Now(),
 		active:   make(chan struct{}),
+		tailMin:  slotTailMin,
+		tailMax:  slotTailMax,
 	}
 	go r.run()
 	go r.ackLoop()
@@ -608,7 +615,8 @@ func (r *slotReader) run() {
 		r.started = true
 		r.mu.Unlock()
 		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
-			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body))
+			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body),
+			" reads=", r.reads.Load())
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -634,6 +642,12 @@ func (r *slotReader) isHead(seq int64) bool {
 	return r.head == seq
 }
 
+func (r *slotReader) bursting() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return time.Since(r.hitAt) <= slotReadAheadBurst
+}
+
 func (r *slotReader) reach(seq int64) {
 	r.mu.Lock()
 	grown := seq > r.frontier
@@ -656,7 +670,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		f.readyAt = time.Now()
 		close(f.ready)
 	}()
-	if offset > 0 && !r.hold(ctx, slotTailMin, f.promoted, f.near) {
+	if offset > 0 && !r.hold(ctx, r.tailMin, f.promoted, f.near) {
 		return
 	}
 
@@ -672,6 +686,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		if hot && r.isHead(seq) {
 			description, err = r.readHead(ctx, id, seq)
 		} else {
+			r.reads.Add(1)
 			description, err = r.store.readDescription(ctx, id)
 		}
 		frame, ok := decodeSlot(description)
@@ -730,10 +745,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			// only the head is asked for until something comes
 			wait, a, b, backoff = 0, f.promoted, active, slotHuntFloor
 		default:
-			wait, a, b, backoff = min(max(r.pace(), slotTailMin), slotTailMax), f.promoted, f.near, slotHuntFloor
+			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, slotHuntFloor
 			select {
 			case <-f.near:
-				wait, b = slotReadAheadPoll, nil
+				b = nil
+				if r.bursting() {
+					wait = slotReadAheadPoll
+				}
 			default:
 			}
 		}
