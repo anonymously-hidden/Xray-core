@@ -53,6 +53,9 @@ var (
 	slotCloseGrace   = 10 * time.Second
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
+
+	slotReadAhead     int64 = 4
+	slotReadAheadPoll       = 40 * time.Millisecond
 )
 
 var slotWriteInflight = 12
@@ -540,11 +543,20 @@ type slotFetch struct {
 	ready chan struct{}
 	// promoted is closed when the segment becomes the head
 	promoted chan struct{}
+	near     chan struct{}
 	body     []byte
 	end      bool
 	err      error
 	born     time.Time
 	readyAt  time.Time
+}
+
+func (f *slotFetch) enter() {
+	select {
+	case <-f.near:
+	default:
+		close(f.near)
+	}
 }
 
 func (r *slotReader) run() {
@@ -565,7 +577,10 @@ func (r *slotReader) run() {
 		for i := range window {
 			seq := head + int64(i)
 			if fetches[seq] == nil {
-				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), born: time.Now()}
+				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), born: time.Now()}
+				if int64(i) <= slotReadAhead {
+					fetches[seq].enter()
+				}
 				go r.fetch(ctx, seq, i, fetches[seq])
 			}
 		}
@@ -596,6 +611,9 @@ func (r *slotReader) run() {
 			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body))
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
+			if nf := fetches[head+1+slotReadAhead]; nf != nil {
+				nf.enter()
+			}
 		}
 		select {
 		case r.acks <- struct{}{}:
@@ -638,7 +656,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		f.readyAt = time.Now()
 		close(f.ready)
 	}()
-	if offset > 0 && !r.hold(ctx, slotTailMin, f.promoted, nil) {
+	if offset > 0 && !r.hold(ctx, slotTailMin, f.promoted, f.near) {
 		return
 	}
 
@@ -712,7 +730,12 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			// only the head is asked for until something comes
 			wait, a, b, backoff = 0, f.promoted, active, slotHuntFloor
 		default:
-			wait, a, backoff = min(max(r.pace(), slotTailMin), slotTailMax), f.promoted, slotHuntFloor
+			wait, a, b, backoff = min(max(r.pace(), slotTailMin), slotTailMax), f.promoted, f.near, slotHuntFloor
+			select {
+			case <-f.near:
+				wait, b = slotReadAheadPoll, nil
+			default:
+			}
 		}
 		if !r.hold(ctx, wait, a, b) {
 			return
