@@ -28,7 +28,6 @@ const (
 	// slotInlineLimit is how large a segment is at most to go in the description
 	// of its slot, which takes one request less than a body
 	slotInlineLimit = 14 << 10
-	slotSplitLimit  = 12 * slotInlineLimit
 	// inlineRampSegments segments of one size in a row double it, from
 	// slotInlineLimit up to segmentBytes
 	inlineRampSegments = 8
@@ -318,7 +317,7 @@ func (w *slotWriter) flushLocked() error {
 		// a burst goes at the full size at once
 		n = min(len(w.buf), w.segmentBytes)
 	}
-	if n > slotInlineLimit && n <= slotSplitLimit && cap(w.slots)-len(w.slots) >= (n+slotInlineLimit-1)/slotInlineLimit {
+	if n > slotInlineLimit && len(w.buf) <= 2*cap(w.slots)*slotInlineLimit {
 		n = slotInlineLimit
 	}
 	if n == w.size && w.size < w.segmentBytes {

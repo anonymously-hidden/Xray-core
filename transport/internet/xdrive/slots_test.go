@@ -305,7 +305,13 @@ func TestSlotStaleBody(t *testing.T) {
 	client, server := slotPair(t, &staleSlots{memSlots: newMemSlots(), served: make(map[string]bool)}, 2, 64<<10)
 	payload := randomPayload(200 << 10)
 	errs := make(chan error, 1)
-	writeAll(client, payload, true, errs)
+	go func() {
+		_, err := client.Write(payload)
+		if err == nil {
+			err = client.Close()
+		}
+		errs <- err
+	}()
 	readAll(t, server, payload)
 }
 
@@ -346,7 +352,13 @@ func TestSlotBodyHedge(t *testing.T) {
 	client, server := slotPair(t, store, 2, 64<<10)
 	payload := randomPayload(200 << 10)
 	errs := make(chan error, 1)
-	writeAll(client, payload, true, errs)
+	go func() {
+		_, err := client.Write(payload)
+		if err == nil {
+			err = client.Close()
+		}
+		errs <- err
+	}()
 	readAll(t, server, payload)
 	if store.calls.Load() < 2 {
 		t.Fatalf("the stuck body read was not hedged, %d reads", store.calls.Load())
@@ -637,5 +649,30 @@ func TestSlotWriteInflightCap(t *testing.T) {
 	}
 	if p := int(store.peak.Load()); p > slotWriteInflight {
 		t.Fatalf("%d segments were written at once, want at most %d", p, slotWriteInflight)
+	}
+}
+
+func TestSlotBurstInlineWaves(t *testing.T) {
+	for _, c := range []struct {
+		pieces int
+		media  bool
+	}{{20, false}, {30, true}} {
+		store := newMemSlots()
+		client, server := slotPair(t, store, 16, 512<<10)
+		payload := randomPayload(c.pieces * slotInlineLimit)
+		go client.Write(payload)
+		got := make([]byte, len(payload))
+		if _, err := io.ReadFull(server, got); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatal("the burst came back changed")
+		}
+		store.mu.Lock()
+		bodies := len(store.bodies)
+		store.mu.Unlock()
+		if (bodies > 0) != c.media {
+			t.Fatalf("a burst of %d pieces went in %d bodies, media wanted %v", c.pieces, bodies, c.media)
+		}
 	}
 }
