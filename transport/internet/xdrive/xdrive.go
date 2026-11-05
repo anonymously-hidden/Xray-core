@@ -95,6 +95,7 @@ type spareBox struct {
 	ch   chan spareRing
 	busy atomic.Bool
 	last atomic.Int64
+	stop atomic.Bool
 }
 
 var spareBoxes sync.Map
@@ -153,7 +154,15 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 			}
 		}
 		for len(box.ch) < cap(box.ch) {
-			time.Sleep(2 * time.Second)
+			for range 40 {
+				if box.stop.Load() {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if box.stop.Load() {
+				return
+			}
 			storage, err := newStorage(streamSettings)
 			if err != nil {
 				return
@@ -184,7 +193,7 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 			}
 		}
 		time.AfterFunc(p.sessionTTL/4, func() {
-			if time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
+			if !box.stop.Load() && time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
 				fillSpares(streamSettings, config, p)
 			}
 		})
