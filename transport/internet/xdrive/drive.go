@@ -330,7 +330,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
 			lastErr = errors.New("Drive is rate limiting: ", string(payload))
 			errors.LogWarning(ctx, "rate limited by Drive, attempt ",
-				attempt+1, " of ", driveMaxAttempts)
+				attempt+1, " of ", driveMaxAttempts, ", ", method, " ", len(body),
+				" bytes, body read ", strings.Contains(target, "alt=media"),
+				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
 			continue
 		}
