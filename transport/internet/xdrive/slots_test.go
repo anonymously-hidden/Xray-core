@@ -468,6 +468,7 @@ func (s lagSlots) setSlot(ctx context.Context, id, description string, body []by
 func TestSlotReadAheadBurst(t *testing.T) {
 	oldMin, oldMax := slotTailMin, slotTailMax
 	slotTailMin, slotTailMax = 150*time.Millisecond, 800*time.Millisecond
+	t.Cleanup(func() { slotTailMin, slotTailMax = oldMin, oldMax })
 
 	client, server := slotPair(t, lagSlots{newMemSlots()}, 16, 512<<10)
 	payload := randomPayload(8 * slotInlineLimit)
@@ -485,8 +486,6 @@ func TestSlotReadAheadBurst(t *testing.T) {
 	}
 	client.Close()
 	server.Close()
-	time.Sleep(100 * time.Millisecond)
-	slotTailMin, slotTailMax = oldMin, oldMax
 }
 
 func TestSlotLargeBurstInline(t *testing.T) {

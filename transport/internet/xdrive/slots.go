@@ -307,7 +307,7 @@ func (w *slotWriter) flushLocked() error {
 		return w.err
 	}
 
-	if w.size < w.segmentBytes && len(w.buf) >= w.size && (len(w.slots)*4 > cap(w.slots)*3 || len(w.slots) > 12) {
+	if w.size < w.segmentBytes && len(w.buf) >= w.size && len(w.slots)*4 > cap(w.slots)*3 {
 		w.size = w.segmentBytes
 		w.full = 0
 	}
