@@ -292,6 +292,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			req.Header.Set("Content-Type", contentType)
 		}
 
+		began := time.Now()
 		resp, err := s.client.Do(req)
 		<-pool
 		if err != nil {
@@ -299,7 +300,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			cancel()
 			if timedOut {
 				if t, ok := s.client.Transport.(*sessionTransport); ok {
-					t.stalled()
+					t.stalled(began)
 				}
 			}
 			if ctx.Err() != nil {

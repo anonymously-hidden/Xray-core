@@ -442,6 +442,7 @@ type sessionTransport struct {
 	client            *splithttp.XmuxClient
 	closed            bool
 	slowAt, retiredAt time.Time
+	movedAt           time.Time
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -459,6 +460,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		t.client.LeftRequests.Add(-1)
 		if client != nil {
 			client.DoneRunning()
+			t.movedAt = time.Now()
 		}
 		client = t.client
 	}
@@ -472,9 +474,12 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return conn.roundTrip(r)
 }
 
-func (t *sessionTransport) stalled() {
+func (t *sessionTransport) stalled(began time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if began.Before(t.movedAt) {
+		return
+	}
 	now := time.Now()
 	slow := now.Sub(t.slowAt) < 3*time.Second
 	t.slowAt = now
