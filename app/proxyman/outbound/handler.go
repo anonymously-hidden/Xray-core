@@ -122,8 +122,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 			if config.Concurrency < 0 {
 				h.mux = &mux.ClientManager{Enabled: false}
 			}
-			if config.Concurrency == 0 {
-				config.Concurrency = 8 // same as before
+			if config.Concurrency >= 0 && config.Concurrency <= 128 {
+				config.Concurrency = 128
 			}
 			if config.Concurrency > 0 {
 				resume := mux.LookupResumePolicy(h.tag)
@@ -135,7 +135,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.Concurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 							Resume:      resume,
 							OutboundTag: h.tag,
@@ -158,7 +158,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 							Dialer: h,
 							Strategy: mux.ClientStrategy{
 								MaxConcurrency: uint32(config.XudpConcurrency),
-								MaxConnection:  128,
+								MaxConnection:  1024,
 							},
 							// UDP payloads are never retained or
 							// replayed: resume buys nothing here, so
