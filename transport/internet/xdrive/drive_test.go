@@ -1067,3 +1067,50 @@ func TestDriveBackgroundTokenRefresh(t *testing.T) {
 		}
 	})
 }
+
+func TestSlotPathDefaults(t *testing.T) {
+	p := paramsForStorage(&Config{}, &driveStorage{})
+	if p.concurrency != 64 || p.flushInterval != 10*time.Millisecond || p.maxPollInterval != 200*time.Millisecond {
+		t.Fatalf("slot defaults gave concurrency %d, flush %v, max poll %v", p.concurrency, p.flushInterval, p.maxPollInterval)
+	}
+	if wal, base := paramsForStorage(&Config{}, &localStorage{}), paramsFromConfig(&Config{}); wal != base {
+		t.Fatalf("wal defaults changed: %+v, want %+v", wal, base)
+	}
+	explicit := paramsForStorage(&Config{Concurrency: 4, FlushIntervalMs: 30, MaxPollIntervalMs: 100}, &driveStorage{})
+	if explicit.concurrency != 4 || explicit.flushInterval != 30*time.Millisecond || explicit.maxPollInterval != 100*time.Millisecond {
+		t.Fatalf("explicit values did not win: %+v", explicit)
+	}
+	if p := paramsForStorage(&Config{PollIntervalMs: 500}, &driveStorage{}); p.maxPollInterval < p.minPollInterval {
+		t.Fatalf("max poll %v is below min poll %v", p.maxPollInterval, p.minPollInterval)
+	}
+}
+
+func TestDialDefaultRingDepth(t *testing.T) {
+	newFakeDrive(t)
+	config := &Config{
+		RemoteFolder: "folder-id",
+		Service:      "google-drive",
+		Secrets:      []string{"client", "secret", "refresh"},
+	}
+	settings := &internet.MemoryStreamConfig{
+		ProtocolName:     protocolName,
+		ProtocolSettings: config,
+	}
+	conn, err := Dial(context.Background(), net.Destination{}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	writer, ok := conn.(*Conn).writer.(*slotWriter)
+	if !ok {
+		t.Fatalf("Dial with unset concurrency built %T, want a slot writer", conn.(*Conn).writer)
+	}
+	if len(writer.table.Slots) != 64 {
+		t.Fatalf("Dial with unset concurrency built %d slots, want 64", len(writer.table.Slots))
+	}
+	box := spareBoxFor(config)
+	box.stop.Store(true)
+	for box.busy.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+}

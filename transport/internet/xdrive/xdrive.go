@@ -224,6 +224,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 	}
 
+	p = paramsForStorage(config, storage)
+
 	var announce []byte
 	slots, ok := storage.(slotStore)
 	if ok {
@@ -287,7 +289,7 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 		cancel:         cancel,
 		storage:        storage,
 		addConn:        addConn,
-		params:         paramsFromConfig(config),
+		params:         paramsForStorage(config, storage),
 		active:         make(map[string]bool),
 		handled:        make(map[string]time.Time),
 		idleSince:      make(map[string]time.Time),
