@@ -305,7 +305,7 @@ func (l *Listener) acceptLoop(logCtx context.Context) {
 	active := time.Now()
 	for {
 		accepted, err := l.acceptPending(logCtx)
-		if err != nil {
+		if err != nil && !isAuthError(err) {
 			errors.LogWarningInner(logCtx, err, "failed to list sessions")
 		}
 

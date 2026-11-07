@@ -30,14 +30,16 @@ type fakeFile struct {
 type fakeDrive struct {
 	server *httptest.Server
 
-	mu         sync.Mutex
-	files      map[string]*fakeFile
-	nextID     int
-	failOnce   map[string]bool
-	failStatus map[string]int
-	failBody   map[string]string
-	tokens     int
-	hosts      map[string]bool
+	mu          sync.Mutex
+	files       map[string]*fakeFile
+	nextID      int
+	failOnce    map[string]bool
+	failStatus  map[string]int
+	failBody    map[string]string
+	tokens      int
+	tokenStatus int
+	tokenBody   string
+	hosts       map[string]bool
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -90,7 +92,13 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	d.tokens++
+	status, body := d.tokenStatus, d.tokenBody
 	d.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+		return
+	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"access_token": "fake-token",
 		"expires_in":   3600,
@@ -812,4 +820,45 @@ func TestDriveLargeAnnouncement(t *testing.T) {
 		t.Fatalf("empty announcement did not become a segment connection: %T", conn.reader)
 	}
 	conn.Close()
+}
+
+func TestDriveDeadCredentials(t *testing.T) {
+	drive := newFakeDrive(t)
+	drive.mu.Lock()
+	drive.tokenStatus = http.StatusBadRequest
+	drive.tokenBody = `{"error":"invalid_grant"}`
+	drive.mu.Unlock()
+	storage := newDriveBackend(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	_, _, err := storage.do(ctx, http.MethodGet, storage.filesURL, "", nil)
+	if !isAuthError(err) {
+		t.Fatalf("do returned %v, want the sticky OAuth error", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("do took %v, want it to fail at once", time.Since(start))
+	}
+	for range 3 {
+		if _, err := storage.readDescription(ctx, "id"); !isAuthError(err) {
+			t.Fatalf("readDescription returned %v, want the sticky OAuth error", err)
+		}
+	}
+	drive.mu.Lock()
+	tokens := drive.tokens
+	drive.mu.Unlock()
+	if tokens != 1 {
+		t.Fatalf("the fake saw %d token requests, want exactly one", tokens)
+	}
+
+	reader := newSlotReader(ctx, storage, slotTable{Slots: []string{"id"}, Watermark: "w"}, params{concurrency: 1})
+	select {
+	case <-reader.chunks():
+	case <-time.After(time.Second):
+		t.Fatal("the slot reader kept polling after the credentials were rejected")
+	}
+	if !isAuthError(reader.Err()) {
+		t.Fatalf("the slot reader ended with %v, want the sticky OAuth error", reader.Err())
+	}
 }

@@ -71,6 +71,7 @@ type driveShared struct {
 	tokenMu     sync.Mutex
 	token       string
 	tokenExpiry time.Time
+	authErr     error
 
 	idMu sync.Mutex
 	ids  map[string]string
@@ -137,10 +138,24 @@ func quoteDriveValue(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
 }
 
+type authError struct{ code string }
+
+func (e authError) Error() string {
+	return "Google rejected the OAuth credentials (" + e.code + "); create a new refresh token, see the XDRIVE setup guide"
+}
+
+func isAuthError(err error) bool {
+	_, ok := err.(authError)
+	return ok
+}
+
 func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()
 
+	if s.authErr != nil {
+		return "", s.authErr
+	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
 		return s.token, nil
 	}
@@ -168,6 +183,17 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		return "", errors.New("failed to read the token response").Base(err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		var rejected struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &rejected) == nil {
+			switch rejected.Error {
+			case "invalid_grant", "invalid_client", "unauthorized_client":
+				s.authErr = authError{rejected.Error}
+				errors.LogError(ctx, s.authErr)
+				return "", s.authErr
+			}
+		}
 		return "", errors.New("the token endpoint answered ", resp.StatusCode, ": ", string(body))
 	}
 
@@ -259,6 +285,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 
 		token, err := s.accessToken(ctx)
 		if err != nil {
+			if isAuthError(err) {
+				return 0, nil, err
+			}
 			lastErr = err
 			continue
 		}

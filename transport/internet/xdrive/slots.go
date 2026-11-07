@@ -722,6 +722,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				return
 			}
 		case err != nil:
+			if isAuthError(err) {
+				f.err = err
+				return
+			}
 			goneSince = time.Time{}
 			if ctx.Err() == nil && time.Since(warnedAt) > 10*time.Second {
 				warnedAt = time.Now()
