@@ -39,6 +39,7 @@ type fakeDrive struct {
 	tokens      int
 	tokenStatus int
 	tokenBody   string
+	uploadAt    []time.Time
 	hosts       map[string]bool
 }
 
@@ -106,6 +107,9 @@ func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	d.uploadAt = append(d.uploadAt, time.Now())
+	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -176,6 +180,9 @@ func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	d.uploadAt = append(d.uploadAt, time.Now())
+	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -752,6 +759,8 @@ func TestDriveFronting(t *testing.T) {
 }
 
 func TestDriveLargeAnnouncement(t *testing.T) {
+	listenerCtx, cancelListener := context.WithCancel(context.Background())
+	defer cancelListener()
 	newFakeDrive(t)
 	storage := newDriveBackend(t)
 	ctx := context.Background()
@@ -787,7 +796,7 @@ func TestDriveLargeAnnouncement(t *testing.T) {
 
 	conns := make(chan *Conn, 2)
 	l := &Listener{
-		ctx:            ctx,
+		ctx:            listenerCtx,
 		storage:        storage,
 		addConn:        func(c stat.Connection) { conns <- c.(*Conn) },
 		params:         p,
@@ -860,5 +869,41 @@ func TestDriveDeadCredentials(t *testing.T) {
 	}
 	if !isAuthError(reader.Err()) {
 		t.Fatalf("the slot reader ended with %v, want the sticky OAuth error", reader.Err())
+	}
+}
+
+func TestDriveRetryWaitsCooldown(t *testing.T) {
+	drive := newFakeDrive(t)
+	oldCooldown := driveCooldown
+	driveCooldown = 200 * time.Millisecond
+	t.Cleanup(func() { driveCooldown = oldCooldown })
+	storage := newDriveBackend(t)
+
+	drive.failOnceWith("upload", http.StatusForbidden,
+		`{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := storage.Put(ctx, "sessions/abc", nil); err != nil {
+		t.Fatalf("Put did not survive a 403: %v", err)
+	}
+	drive.mu.Lock()
+	times := append([]time.Time(nil), drive.uploadAt...)
+	drive.mu.Unlock()
+	if len(times) < 2 {
+		t.Fatalf("the fake saw %d writes, want a retry", len(times))
+	}
+	if gap := times[1].Sub(times[0]); gap < driveCooldown/2 {
+		t.Fatalf("the retry arrived after %v, less than the jitter floor %v", gap, driveCooldown/2)
+	}
+	storage.coolMu.Lock()
+	until := storage.coolUntil
+	storage.coolMu.Unlock()
+	if times[1].Before(until) {
+		t.Fatalf("the retry reached the fake at %v, before the cooldown ended at %v", times[1], until)
+	}
+	if took := time.Since(start); took < until.Sub(times[0]) {
+		t.Fatalf("the request took %v, less than the cooldown %v", took, until.Sub(times[0]))
 	}
 }

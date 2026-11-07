@@ -259,17 +259,6 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	backoff := s.backoff
 	var lastErr error
 
-	s.coolMu.Lock()
-	until := s.coolUntil
-	s.coolMu.Unlock()
-	if d := time.Until(until); d > 0 {
-		select {
-		case <-ctx.Done():
-			return 0, nil, ctx.Err()
-		case <-time.After(d):
-		}
-	}
-
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -281,6 +270,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			if backoff > driveMaxBackoff {
 				backoff = driveMaxBackoff
 			}
+		}
+		if err := s.waitCool(ctx); err != nil {
+			return 0, nil, err
 		}
 
 		token, err := s.accessToken(ctx)
@@ -378,6 +370,20 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	}
 
 	return 0, nil, lastErr
+}
+
+func (s *driveStorage) waitCool(ctx context.Context) error {
+	s.coolMu.Lock()
+	until := s.coolUntil
+	s.coolMu.Unlock()
+	if d := time.Until(until); d > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(d):
+		}
+	}
+	return nil
 }
 
 func (s *driveStorage) cool() {
