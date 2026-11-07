@@ -503,6 +503,7 @@ type slotReader struct {
 	reads    atomic.Int64
 	tailMin  time.Duration
 	tailMax  time.Duration
+	bodyRate float64
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params) *slotReader {
@@ -708,7 +709,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.hit()
 				return
 			case slotMedia:
-				if body, err := r.readBodyHedged(ctx, id); err == nil && frame.holds(body) {
+				if body, err := r.readBodyHedged(ctx, id, frame.size); err == nil && frame.holds(body) {
 					f.body = body
 					r.hit()
 					return
@@ -819,12 +820,22 @@ func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string
 	}
 }
 
-func (r *slotReader) readBodyHedged(ctx context.Context, id string) ([]byte, error) {
+func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([]byte, error) {
 	if slotBodyHedge <= 0 {
 		return r.store.readBody(ctx, id)
 	}
+	delay := slotBodyHedge
+	r.mu.Lock()
+	rate := r.bodyRate
+	r.mu.Unlock()
+	if rate > 0 && size > 0 {
+		if scaled := time.Duration(float64(2*size) / rate * float64(time.Second)); scaled > delay {
+			delay = scaled
+		}
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	start := time.Now()
 
 	type result struct {
 		body []byte
@@ -839,7 +850,7 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string) ([]byte, err
 	}
 	launch()
 	outstanding := 1
-	timer := time.NewTimer(slotBodyHedge)
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	var last result
 	for {
@@ -847,6 +858,16 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string) ([]byte, err
 		case res := <-results:
 			outstanding--
 			if res.err == nil {
+				if elapsed := time.Since(start); elapsed > 0 && len(res.body) > 0 {
+					instant := float64(len(res.body)) / elapsed.Seconds()
+					r.mu.Lock()
+					if r.bodyRate == 0 {
+						r.bodyRate = instant
+					} else {
+						r.bodyRate = (r.bodyRate + instant) / 2
+					}
+					r.mu.Unlock()
+				}
 				return res.body, nil
 			}
 			last = res

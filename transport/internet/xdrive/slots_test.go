@@ -365,6 +365,84 @@ func TestSlotBodyHedge(t *testing.T) {
 	}
 }
 
+type timedBodySlots struct {
+	*memSlots
+	calls atomic.Int32
+	delay time.Duration
+	stuck atomic.Bool
+}
+
+func (s *timedBodySlots) readBody(ctx context.Context, id string) ([]byte, error) {
+	n := s.calls.Add(1)
+	if s.stuck.Load() && n == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(s.delay):
+	}
+	return make([]byte, 1000), nil
+}
+
+func TestSlotBodyHedgeRate(t *testing.T) {
+	old := slotBodyHedge
+	slotBodyHedge = 20 * time.Millisecond
+	t.Cleanup(func() { slotBodyHedge = old })
+
+	store := &timedBodySlots{memSlots: newMemSlots(), delay: 60 * time.Millisecond}
+	r := &slotReader{store: store}
+	ctx := context.Background()
+	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
+		t.Fatal(err)
+	}
+	store.calls.Store(0)
+	start := time.Now()
+	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+		t.Fatalf("the progressing read returned in %v, before its body was ready", elapsed)
+	}
+	if n := store.calls.Load(); n != 1 {
+		t.Fatalf("a progressing read after a learned slow rate hedged, %d reads", n)
+	}
+
+	r.mu.Lock()
+	rate := r.bodyRate
+	r.mu.Unlock()
+	if rate <= 0 {
+		t.Fatal("no body read rate was learned")
+	}
+	expected := max(slotBodyHedge, time.Duration(float64(2*1000)/rate*float64(time.Second)))
+	store.stuck.Store(true)
+	store.calls.Store(0)
+	start = time.Now()
+	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(start)
+	if n := store.calls.Load(); n < 2 {
+		t.Fatalf("a stuck read after a learned rate was not hedged, %d reads", n)
+	}
+	if elapsed < expected/2 {
+		t.Fatalf("the stuck read hedged after %v, want about %v", elapsed, expected)
+	}
+
+	freshStore := &timedBodySlots{memSlots: newMemSlots()}
+	freshStore.stuck.Store(true)
+	fresh := &slotReader{store: freshStore}
+	store.calls.Store(0)
+	start = time.Now()
+	if _, err := fresh.readBodyHedged(ctx, "id", 1000); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < slotBodyHedge {
+		t.Fatalf("with no learned rate the hedge came after %v, want at least %v", elapsed, slotBodyHedge)
+	}
+}
+
 func TestTakeSpareSkipsStale(t *testing.T) {
 	cfg := &Config{}
 	p := params{sessionTTL: 5 * time.Minute}
