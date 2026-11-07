@@ -263,10 +263,11 @@ type Listener struct {
 	addConn internet.ConnHandler
 	params
 
-	mu        sync.Mutex
-	active    map[string]bool
-	handled   map[string]time.Time
-	idleSince map[string]time.Time
+	mu             sync.Mutex
+	active         map[string]bool
+	handled        map[string]time.Time
+	idleSince      map[string]time.Time
+	announceWarned map[string]bool
 }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -282,14 +283,15 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 
 	listenerCtx, cancel := context.WithCancel(context.Background())
 	listener := &Listener{
-		ctx:       listenerCtx,
-		cancel:    cancel,
-		storage:   storage,
-		addConn:   addConn,
-		params:    paramsFromConfig(config),
-		active:    make(map[string]bool),
-		handled:   make(map[string]time.Time),
-		idleSince: make(map[string]time.Time),
+		ctx:            listenerCtx,
+		cancel:         cancel,
+		storage:        storage,
+		addConn:        addConn,
+		params:         paramsFromConfig(config),
+		active:         make(map[string]bool),
+		handled:        make(map[string]time.Time),
+		idleSince:      make(map[string]time.Time),
+		announceWarned: make(map[string]bool),
 	}
 
 	go listener.acceptLoop(ctx)
@@ -353,9 +355,27 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		if !l.claim(session) {
 			continue
 		}
+		announce := listed.Inline
+		if len(announce) == 0 {
+			if _, ok := sessionStorage(l.storage).(slotStore); ok {
+				announce, err = l.storage.Get(l.ctx, full)
+				if err != nil {
+					l.mu.Lock()
+					delete(l.active, session)
+					delete(l.handled, session)
+					warn := !l.announceWarned[session]
+					l.announceWarned[session] = true
+					l.mu.Unlock()
+					if warn {
+						errors.LogWarningInner(logCtx, err, "failed to read the announcement of session ", session)
+					}
+					continue
+				}
+			}
+		}
 		go l.drop(full)
 		accepted = true
-		l.addConn(l.newSessionConn(logCtx, session, listed.Inline))
+		l.addConn(l.newSessionConn(logCtx, session, announce))
 	}
 	return accepted, nil
 }

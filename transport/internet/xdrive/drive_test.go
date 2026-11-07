@@ -17,6 +17,7 @@ import (
 
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type fakeFile struct {
@@ -740,4 +741,75 @@ func TestDriveFronting(t *testing.T) {
 			t.Fatalf("inner host was %q, want www.googleapis.com regardless of address", host)
 		}
 	}
+}
+
+func TestDriveLargeAnnouncement(t *testing.T) {
+	newFakeDrive(t)
+	storage := newDriveBackend(t)
+	ctx := context.Background()
+	p := paramsFromConfig(driveSettings().ProtocolSettings.(*Config))
+
+	session := "large-announcement"
+	r := ring{
+		Up:   slotTable{Watermark: "up-watermark"},
+		Down: slotTable{Watermark: "down-watermark"},
+	}
+	for i := range 200 {
+		id := fmt.Sprintf("%s-%03d", strings.Repeat("s", 40), i)
+		r.Up.Slots = append(r.Up.Slots, id)
+		r.Down.Slots = append(r.Down.Slots, id)
+	}
+	announce, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(announce) <= driveInlineLimit {
+		t.Fatalf("announcement is %d bytes, want more than %d", len(announce), driveInlineLimit)
+	}
+	if err := storage.Put(ctx, announceName(session, time.Now()), announce); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := storage.List(ctx, sessionsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Inline != nil {
+		t.Fatalf("large announcement was inlined: %v", entries)
+	}
+
+	conns := make(chan *Conn, 2)
+	l := &Listener{
+		ctx:            ctx,
+		storage:        storage,
+		addConn:        func(c stat.Connection) { conns <- c.(*Conn) },
+		params:         p,
+		active:         make(map[string]bool),
+		handled:        make(map[string]time.Time),
+		idleSince:      make(map[string]time.Time),
+		announceWarned: make(map[string]bool),
+	}
+	accepted, err := l.acceptPending(ctx)
+	if err != nil || !accepted {
+		t.Fatalf("acceptPending: %v, accepted %v", err, accepted)
+	}
+	conn := <-conns
+	reader, ok := conn.reader.(*slotReader)
+	if !ok || len(reader.table.Slots) != 200 {
+		t.Fatalf("large announcement did not become a 200-slot connection: %T", conn.reader)
+	}
+	conn.Close()
+
+	empty := "empty-announcement"
+	if err := storage.Put(ctx, announceName(empty, time.Now()), nil); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err = l.acceptPending(ctx)
+	if err != nil || !accepted {
+		t.Fatalf("acceptPending empty: %v, accepted %v", err, accepted)
+	}
+	conn = <-conns
+	if _, ok := conn.reader.(*walReader); !ok {
+		t.Fatalf("empty announcement did not become a segment connection: %T", conn.reader)
+	}
+	conn.Close()
 }
