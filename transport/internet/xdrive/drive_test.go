@@ -907,3 +907,163 @@ func TestDriveRetryWaitsCooldown(t *testing.T) {
 		t.Fatalf("the request took %v, less than the cooldown %v", took, until.Sub(times[0]))
 	}
 }
+
+func TestDriveBackgroundTokenRefresh(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	mode := "ok"
+	delay := 100 * time.Millisecond
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		n := calls
+		current := mode
+		pause := delay
+		mu.Unlock()
+		time.Sleep(pause)
+		switch current {
+		case "transient":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"temporarily_unavailable"}`))
+		case "auth":
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"invalid_grant"}`))
+		default:
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": fmt.Sprintf("token-%d", n),
+				"expires_in":   100,
+			})
+		}
+	}))
+	defer server.Close()
+
+	newStorage := func() *driveStorage {
+		return &driveStorage{driveShared: &driveShared{
+			tokenClient: server.Client(),
+			tokenURL:    server.URL,
+		}}
+	}
+	seed := func(s *driveStorage) {
+		s.tokenMu.Lock()
+		s.token = "old"
+		s.tokenLifetime = 100 * time.Second
+		s.tokenExpiry = time.Now().Add(10 * time.Second)
+		s.tokenMu.Unlock()
+	}
+	setMode := func(m string) {
+		mu.Lock()
+		mode = m
+		mu.Unlock()
+	}
+	callCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
+
+	t.Run("returns at once inside the window", func(t *testing.T) {
+		s := newStorage()
+		seed(s)
+		start := time.Now()
+		token, err := s.accessToken(context.Background())
+		if err != nil || token != "old" {
+			t.Fatalf("accessToken gave %q, %v", token, err)
+		}
+		if time.Since(start) > 50*time.Millisecond {
+			t.Fatalf("accessToken waited %v for the background refresh", time.Since(start))
+		}
+		waitFor(t, "the background refresh", func() bool {
+			s.tokenMu.Lock()
+			defer s.tokenMu.Unlock()
+			return s.token != "old" && !s.refreshing
+		})
+	})
+
+	t.Run("concurrent calls start one refresh", func(t *testing.T) {
+		mu.Lock()
+		calls = 0
+		mu.Unlock()
+		s := newStorage()
+		seed(s)
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if token, err := s.accessToken(context.Background()); err != nil || token != "old" {
+					t.Errorf("accessToken gave %q, %v", token, err)
+				}
+			}()
+		}
+		wg.Wait()
+		waitFor(t, "one background refresh", func() bool {
+			s.tokenMu.Lock()
+			defer s.tokenMu.Unlock()
+			return !s.refreshing && s.token != "old"
+		})
+		if n := callCount(); n != 1 {
+			t.Fatalf("concurrent calls started %d refreshes, want one", n)
+		}
+	})
+
+	t.Run("transient failure keeps the old token", func(t *testing.T) {
+		mu.Lock()
+		calls = 0
+		mu.Unlock()
+		setMode("transient")
+		defer setMode("ok")
+		s := newStorage()
+		seed(s)
+		if token, err := s.accessToken(context.Background()); err != nil || token != "old" {
+			t.Fatalf("accessToken gave %q, %v", token, err)
+		}
+		waitFor(t, "the failed refresh to clear", func() bool {
+			s.tokenMu.Lock()
+			defer s.tokenMu.Unlock()
+			return !s.refreshing
+		})
+		s.tokenMu.Lock()
+		token := s.token
+		s.tokenMu.Unlock()
+		if token != "old" {
+			t.Fatalf("a transient failure replaced the token with %q", token)
+		}
+		setMode("ok")
+		if _, err := s.accessToken(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "the later refresh", func() bool {
+			s.tokenMu.Lock()
+			defer s.tokenMu.Unlock()
+			return s.token != "old" && !s.refreshing
+		})
+		if n := callCount(); n != 2 {
+			t.Fatalf("the retry made %d token requests, want two", n)
+		}
+	})
+
+	t.Run("auth failure turns sticky", func(t *testing.T) {
+		mu.Lock()
+		calls = 0
+		mu.Unlock()
+		setMode("auth")
+		defer setMode("ok")
+		s := newStorage()
+		seed(s)
+		if _, err := s.accessToken(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "the sticky auth error", func() bool {
+			s.tokenMu.Lock()
+			defer s.tokenMu.Unlock()
+			return s.authErr != nil && !s.refreshing
+		})
+		before := callCount()
+		if _, err := s.accessToken(context.Background()); !isAuthError(err) {
+			t.Fatalf("accessToken gave %v, want the sticky auth error", err)
+		}
+		if n := callCount(); n != before {
+			t.Fatalf("the sticky error made %d more token requests", n-before)
+		}
+	})
+}

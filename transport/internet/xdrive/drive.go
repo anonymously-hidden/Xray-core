@@ -68,10 +68,12 @@ type driveShared struct {
 	uploadURL    string
 	backoff      time.Duration
 
-	tokenMu     sync.Mutex
-	token       string
-	tokenExpiry time.Time
-	authErr     error
+	tokenMu       sync.Mutex
+	token         string
+	tokenExpiry   time.Time
+	tokenLifetime time.Duration
+	refreshing    bool
+	authErr       error
 
 	idMu sync.Mutex
 	ids  map[string]string
@@ -157,9 +159,56 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		return "", s.authErr
 	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
+		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && !s.refreshing {
+			s.refreshing = true
+			go s.refreshTokenBackground()
+		}
 		return s.token, nil
 	}
 
+	token, lifetime, err := s.fetchToken(ctx)
+	if err != nil {
+		if isAuthError(err) {
+			s.authErr = err
+			errors.LogError(ctx, err)
+		}
+		return "", err
+	}
+	s.storeToken(token, lifetime)
+	return s.token, nil
+}
+
+func (s *driveStorage) storeToken(token string, lifetime time.Duration) {
+	s.token = token
+	s.tokenLifetime = lifetime
+	expiry := lifetime
+	if expiry > time.Minute {
+		expiry -= time.Minute
+	}
+	s.tokenExpiry = time.Now().Add(expiry)
+}
+
+func (s *driveStorage) refreshTokenBackground() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	token, lifetime, err := s.fetchToken(ctx)
+
+	s.tokenMu.Lock()
+	defer s.tokenMu.Unlock()
+	s.refreshing = false
+	if err != nil {
+		if isAuthError(err) && s.authErr == nil {
+			s.authErr = err
+			errors.LogError(ctx, err)
+		}
+		return
+	}
+	if s.authErr == nil {
+		s.storeToken(token, lifetime)
+	}
+}
+
+func (s *driveStorage) fetchToken(ctx context.Context) (string, time.Duration, error) {
 	form := url.Values{
 		"client_id":     {s.clientID},
 		"client_secret": {s.clientSecret},
@@ -168,19 +217,19 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", errors.New("failed to build the token request").Base(err)
+		return "", 0, errors.New("failed to build the token request").Base(err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := s.tokenClient.Do(req)
 	if err != nil {
-		return "", errors.New("failed to refresh the access token").Base(err)
+		return "", 0, errors.New("failed to refresh the access token").Base(err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", errors.New("failed to read the token response").Base(err)
+		return "", 0, errors.New("failed to read the token response").Base(err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		var rejected struct {
@@ -189,12 +238,10 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		if json.Unmarshal(body, &rejected) == nil {
 			switch rejected.Error {
 			case "invalid_grant", "invalid_client", "unauthorized_client":
-				s.authErr = authError{rejected.Error}
-				errors.LogError(ctx, s.authErr)
-				return "", s.authErr
+				return "", 0, authError{rejected.Error}
 			}
 		}
-		return "", errors.New("the token endpoint answered ", resp.StatusCode, ": ", string(body))
+		return "", 0, errors.New("the token endpoint answered ", resp.StatusCode, ": ", string(body))
 	}
 
 	var parsed struct {
@@ -202,19 +249,12 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		ExpiresIn   int64  `json:"expires_in"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", errors.New("failed to parse the token response").Base(err)
+		return "", 0, errors.New("failed to parse the token response").Base(err)
 	}
 	if parsed.AccessToken == "" {
-		return "", errors.New("the token endpoint returned no access token")
+		return "", 0, errors.New("the token endpoint returned no access token")
 	}
-
-	lifetime := parsed.ExpiresIn
-	if lifetime > 60 {
-		lifetime -= 60
-	}
-	s.token = parsed.AccessToken
-	s.tokenExpiry = time.Now().Add(time.Duration(lifetime) * time.Second)
-	return s.token, nil
+	return parsed.AccessToken, time.Duration(parsed.ExpiresIn) * time.Second, nil
 }
 
 func jitter(backoff time.Duration) time.Duration {
