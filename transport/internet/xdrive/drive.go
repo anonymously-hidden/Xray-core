@@ -11,12 +11,16 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
 )
+
+// testDriveIO is a nil-by-default test hook observing every Drive request
+var testDriveIO func(method, target string, body []byte)
 
 const (
 	flatSeparator = "~"
@@ -80,6 +84,7 @@ type driveShared struct {
 
 	coolMu    sync.Mutex
 	coolUntil time.Time
+	throttle  atomic.Int64
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -314,6 +319,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if err := s.waitCool(ctx); err != nil {
 			return 0, nil, err
 		}
+		if testDriveIO != nil {
+			testDriveIO(method, target, body)
+		}
 
 		token, err := s.accessToken(ctx)
 		if err != nil {
@@ -360,6 +368,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			timedOut := attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 			cancel()
 			if timedOut {
+				s.throttle.Add(1)
 				if t, ok := s.client.Transport.(*sessionTransport); ok {
 					t.stalled(began)
 				}
@@ -427,9 +436,14 @@ func (s *driveStorage) waitCool(ctx context.Context) error {
 }
 
 func (s *driveStorage) cool() {
+	s.throttle.Add(1)
 	s.coolMu.Lock()
 	s.coolUntil = time.Now().Add(jitter(driveCooldown))
 	s.coolMu.Unlock()
+}
+
+func (s *driveStorage) throttled() int64 {
+	return s.throttle.Load()
 }
 
 func (s *driveStorage) invalidateToken() {

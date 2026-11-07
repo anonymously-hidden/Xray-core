@@ -71,6 +71,12 @@ type slotStore interface {
 	readBody(ctx context.Context, id string) ([]byte, error)
 }
 
+// throttleStore is the optional part of a slotStore that reports how often
+// Drive throttled or timed out its requests; only driveStorage implements it
+type throttleStore interface {
+	throttled() int64
+}
+
 // slotFrame is what the description of a slot says: which segment it holds,
 // and either the segment itself or the size and checksum of the body that does
 type slotFrame struct {

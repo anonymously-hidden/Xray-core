@@ -149,11 +149,23 @@ func TestLiveDriveLatencyUnderLoad(t *testing.T) {
 		}
 
 		markers := make(chan time.Duration, 5)
+		bulkTime := make(chan time.Duration, 1)
 		go func() {
+			var bulkRecv int
+			var bulkStart time.Time
 			for {
 				kind, payload, err := readFrame()
 				if err != nil {
 					return
+				}
+				if kind == 1 {
+					if bulkRecv == 0 {
+						bulkStart = time.Now()
+					}
+					bulkRecv += len(payload)
+					if bulkRecv == 8<<20 {
+						bulkTime <- time.Since(bulkStart)
+					}
 				}
 				if kind == 2 && len(payload) == 16 {
 					sent := int64(binary.BigEndian.Uint64(payload[:8]))
@@ -196,6 +208,14 @@ func TestLiveDriveLatencyUnderLoad(t *testing.T) {
 				out = append(out, d)
 			case <-time.After(30 * time.Second):
 				t.Fatal("marker did not arrive")
+			}
+		}
+		if withBulk {
+			select {
+			case d := <-bulkTime:
+				t.Logf("bulk throughput: %.2f MiB/s", 8/d.Seconds())
+			case <-time.After(60 * time.Second):
+				t.Log("bulk throughput: bulk did not complete")
 			}
 		}
 		return out
