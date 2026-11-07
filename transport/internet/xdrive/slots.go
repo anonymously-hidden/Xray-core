@@ -135,8 +135,9 @@ type slotTable struct {
 // ring is what a client announces a session with, the tables are named from
 // its side
 type ring struct {
-	Up   slotTable `json:"u"`
-	Down slotTable `json:"d"`
+	Up    slotTable `json:"u"`
+	Down  slotTable `json:"d"`
+	First []byte    `json:"first,omitempty"`
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -209,6 +210,7 @@ type slotWriter struct {
 	held     int
 	closed   bool
 	err      error
+	first    chan []byte
 
 	// ackMu is held while the watermark is read, which other uploads wait for
 	ackMu    sync.Mutex
@@ -331,6 +333,12 @@ func (w *slotWriter) flushLocked() error {
 	w.buf = append(w.buf[:0], w.buf[n:]...)
 	seq := w.seq
 	w.seq++
+	if seq == 0 && w.first != nil {
+		select {
+		case w.first <- chunk:
+		default:
+		}
+	}
 	w.lastSize = len(w.buf)
 	w.held = 0
 
@@ -506,13 +514,19 @@ type slotReader struct {
 	bodyRate float64
 }
 
-func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params) *slotReader {
+func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
+	head := int64(0)
+	if len(first) > 0 {
+		head = 1
+	}
 	r := &slotReader{
 		ctx:      ctx,
 		store:    store,
 		table:    table,
 		params:   p,
-		ch:       make(chan []byte, p.concurrency),
+		head:     head,
+		started:  len(first) > 0,
+		ch:       make(chan []byte, max(p.concurrency, 1)),
 		wake:     make(chan struct{}, 1),
 		acks:     make(chan struct{}, 1),
 		grow:     make(chan struct{}, 1),
@@ -521,6 +535,13 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		active:   make(chan struct{}),
 		tailMin:  slotTailMin,
 		tailMax:  slotTailMax,
+	}
+	if len(first) > 0 {
+		r.ch <- first
+		select {
+		case r.acks <- struct{}{}:
+		default:
+		}
 	}
 	go r.run()
 	go r.ackLoop()

@@ -861,7 +861,7 @@ func TestDriveDeadCredentials(t *testing.T) {
 		t.Fatalf("the fake saw %d token requests, want exactly one", tokens)
 	}
 
-	reader := newSlotReader(ctx, storage, slotTable{Slots: []string{"id"}, Watermark: "w"}, params{concurrency: 1})
+	reader := newSlotReader(ctx, storage, slotTable{Slots: []string{"id"}, Watermark: "w"}, params{concurrency: 1}, nil)
 	select {
 	case <-reader.chunks():
 	case <-time.After(time.Second):

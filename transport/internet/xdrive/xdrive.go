@@ -226,30 +226,49 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	p = paramsForStorage(config, storage)
 
-	var announce []byte
 	slots, ok := storage.(slotStore)
-	if ok {
-		if warm {
-			announce, _ = json.Marshal(r)
-		} else if r, err = makeRing(ctx, slots, session, p); err == nil {
-			announce, _ = json.Marshal(r)
-		} else {
+	if ok && !warm {
+		if r, err = makeRing(ctx, slots, session, p); err != nil {
 			ok = false
 			errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
 		}
 	}
 
-	if err := storage.Put(ctx, announceName(session, time.Now()), announce); err != nil {
-		storage.Close()
-		return nil, errors.New("failed to announce session ", session).Base(err)
-	}
-
 	if ok {
 		warmSpares(streamSettings, config, p)
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
-		return newSlotConn(context.Background(), slots, r.Up, r.Down, p, func() {
+		conn := newSlotConn(context.Background(), slots, r.Up, r.Down, p, nil, func() {
 			storage.Close()
-		}), nil
+		})
+		writer := conn.writer.(*slotWriter)
+		writer.first = make(chan []byte, 1)
+		go func() {
+			var first []byte
+			select {
+			case first = <-writer.first:
+			case <-time.After(25 * time.Millisecond):
+			}
+			announce, _ := json.Marshal(r)
+			if len(first) > 0 && len(first) <= slotInlineLimit {
+				withFirst := r
+				withFirst.First = first
+				if encoded, err := json.Marshal(withFirst); err == nil && len(encoded) <= driveInlineLimit {
+					announce = encoded
+				}
+			}
+			// An announce failure surfaces as a connection error on the next Write/Read.
+			if err := storage.Put(context.Background(), announceName(session, time.Now()), announce); err != nil {
+				err = errors.New("failed to announce session ", session).Base(err)
+				writer.fail(err)
+				conn.reader.(*slotReader).setErr(err)
+			}
+		}()
+		return conn, nil
+	}
+
+	if err := storage.Put(ctx, announceName(session, time.Now()), nil); err != nil {
+		storage.Close()
+		return nil, errors.New("failed to announce session ", session).Base(err)
 	}
 	errors.LogInfo(ctx, "opened session ", session)
 	return newConn(context.Background(), storage,
@@ -410,7 +429,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 	if slots, ok := storage.(slotStore); ok {
 		if r, ok := decodeRing(announce); ok {
 			errors.LogInfo(logCtx, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
-			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, onClose)
+			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, onClose)
 		}
 	}
 	errors.LogInfo(logCtx, "accepted session ", session)
