@@ -514,6 +514,7 @@ type slotReader struct {
 	active   chan struct{}
 	frontier int64
 	err      error
+	stop     context.CancelFunc
 	reads    atomic.Int64
 	tailMin  time.Duration
 	tailMax  time.Duration
@@ -525,8 +526,10 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 	if len(first) > 0 {
 		head = 1
 	}
+	runCtx, stop := context.WithCancel(ctx)
 	r := &slotReader{
-		ctx:      ctx,
+		ctx:      runCtx,
+		stop:     stop,
 		store:    store,
 		table:    table,
 		params:   p,
@@ -992,9 +995,14 @@ func (r *slotReader) ackLoop() {
 
 func (r *slotReader) setErr(err error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.err == nil {
 		r.err = err
+	}
+	r.mu.Unlock()
+	// A stored error means the connection is dead: stop the run loop so the
+	// chunk channel closes and Read returns the error instead of blocking.
+	if r.stop != nil {
+		r.stop()
 	}
 }
 
