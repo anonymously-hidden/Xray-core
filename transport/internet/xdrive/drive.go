@@ -44,7 +44,18 @@ var (
 	driveCooldown       = 2 * time.Second
 	driveSlotRead       = 3 * time.Second
 	driveSlotWrite      = 5 * time.Second
+	tokenRefreshBackoff = 30 * time.Second
+	maxTokenBackoff     = 5 * time.Minute
 )
+
+// tokenFlight is one shared foreground token fetch; waiters read its result
+// after done closes instead of starting their own fetch.
+type tokenFlight struct {
+	done     chan struct{}
+	token    string
+	lifetime time.Duration
+	err      error
+}
 
 type laneKey struct{}
 
@@ -78,6 +89,10 @@ type driveShared struct {
 	tokenLifetime time.Duration
 	refreshing    bool
 	authErr       error
+	flight        *tokenFlight
+	tokenRetryAt  time.Time
+	tokenBackoff  time.Duration
+	lastTokenErr  error
 
 	idMu sync.Mutex
 	ids  map[string]string
@@ -158,29 +173,79 @@ func isAuthError(err error) bool {
 
 func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	s.tokenMu.Lock()
-	defer s.tokenMu.Unlock()
-
 	if s.authErr != nil {
-		return "", s.authErr
+		err := s.authErr
+		s.tokenMu.Unlock()
+		return "", err
 	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
-		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && !s.refreshing {
+		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && !s.refreshing && time.Now().After(s.tokenRetryAt) {
 			s.refreshing = true
 			go s.refreshTokenBackground()
 		}
-		return s.token, nil
+		token := s.token
+		s.tokenMu.Unlock()
+		return token, nil
 	}
+	if f := s.flight; f != nil {
+		s.tokenMu.Unlock()
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+		if f.err != nil {
+			return "", f.err
+		}
+		return f.token, nil
+	}
+	if time.Now().Before(s.tokenRetryAt) && s.lastTokenErr != nil {
+		err := s.lastTokenErr
+		s.tokenMu.Unlock()
+		return "", err
+	}
+	f := &tokenFlight{done: make(chan struct{})}
+	s.flight = f
+	s.tokenMu.Unlock()
 
-	token, lifetime, err := s.fetchToken(ctx)
+	// The shared fetch must outlive any single waiter's cancellation.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	token, lifetime, err := s.fetchToken(fetchCtx)
+	cancel()
+
+	s.tokenMu.Lock()
+	s.flight = nil
+	f.token, f.lifetime, f.err = token, lifetime, err
 	if err != nil {
+		s.lastTokenErr = err
 		if isAuthError(err) {
 			s.authErr = err
 			errors.LogError(ctx, err)
 		}
+		s.noteTokenFailure()
+	} else {
+		s.storeToken(token, lifetime)
+		s.tokenBackoff = 0
+		s.tokenRetryAt = time.Time{}
+		s.lastTokenErr = nil
+	}
+	close(f.done)
+	s.tokenMu.Unlock()
+	if err != nil {
 		return "", err
 	}
-	s.storeToken(token, lifetime)
-	return s.token, nil
+	return token, nil
+}
+
+// noteTokenFailure backs off further token fetches so a failing endpoint is
+// not hit once per API call; called with tokenMu held.
+func (s *driveStorage) noteTokenFailure() {
+	if s.tokenBackoff == 0 {
+		s.tokenBackoff = tokenRefreshBackoff
+	} else {
+		s.tokenBackoff = min(2*s.tokenBackoff, maxTokenBackoff)
+	}
+	s.tokenRetryAt = time.Now().Add(s.tokenBackoff)
 }
 
 func (s *driveStorage) storeToken(token string, lifetime time.Duration) {
@@ -206,10 +271,15 @@ func (s *driveStorage) refreshTokenBackground() {
 			s.authErr = err
 			errors.LogError(ctx, err)
 		}
+		s.lastTokenErr = err
+		s.noteTokenFailure()
 		return
 	}
 	if s.authErr == nil {
 		s.storeToken(token, lifetime)
+		s.tokenBackoff = 0
+		s.tokenRetryAt = time.Time{}
+		s.lastTokenErr = nil
 	}
 }
 
@@ -393,7 +463,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized {
-			s.invalidateToken()
+			s.invalidateToken(token)
 			lastErr = errors.New("Drive rejected the access token")
 			continue
 		}
@@ -446,9 +516,11 @@ func (s *driveStorage) throttled() int64 {
 	return s.throttle.Load()
 }
 
-func (s *driveStorage) invalidateToken() {
+func (s *driveStorage) invalidateToken(used string) {
 	s.tokenMu.Lock()
-	s.token = ""
+	if s.token == used {
+		s.token = ""
+	}
 	s.tokenMu.Unlock()
 }
 

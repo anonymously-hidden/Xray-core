@@ -1028,6 +1028,11 @@ func TestDriveBackgroundTokenRefresh(t *testing.T) {
 		if token != "old" {
 			t.Fatalf("a transient failure replaced the token with %q", token)
 		}
+		// Simulate the backoff having elapsed so the next call may retry.
+		s.tokenMu.Lock()
+		s.tokenRetryAt = time.Time{}
+		s.tokenBackoff = 0
+		s.tokenMu.Unlock()
 		setMode("ok")
 		if _, err := s.accessToken(context.Background()); err != nil {
 			t.Fatal(err)
