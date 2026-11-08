@@ -524,17 +524,18 @@ type slotReader struct {
 	// hitAt is when a segment last came and gap the time between them, activeAt
 	// when a segment came, was seen coming or Wake. Nothing for the eager window
 	// is idle, and active is closed when that ends
-	hitAt    time.Time
-	gap      time.Duration
-	activeAt time.Time
-	active   chan struct{}
-	frontier int64
-	err      error
-	stop     context.CancelFunc
-	reads    atomic.Int64
-	tailMin  time.Duration
-	tailMax  time.Duration
-	bodyRate float64
+	hitAt        time.Time
+	gap          time.Duration
+	activeAt     time.Time
+	active       chan struct{}
+	frontier     int64
+	err          error
+	stop         context.CancelFunc
+	reads        atomic.Int64
+	tailMin      time.Duration
+	tailMax      time.Duration
+	stallTimeout time.Duration
+	bodyRate     float64
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
@@ -544,22 +545,23 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 	}
 	runCtx, stop := context.WithCancel(ctx)
 	r := &slotReader{
-		ctx:      runCtx,
-		stop:     stop,
-		store:    store,
-		table:    table,
-		params:   p,
-		head:     head,
-		started:  len(first) > 0,
-		ch:       make(chan []byte, max(p.concurrency, 1)),
-		wake:     make(chan struct{}, 1),
-		acks:     make(chan struct{}, 1),
-		grow:     make(chan struct{}, 1),
-		hitAt:    time.Now(),
-		activeAt: time.Now(),
-		active:   make(chan struct{}),
-		tailMin:  slotTailMin,
-		tailMax:  slotTailMax,
+		ctx:          runCtx,
+		stop:         stop,
+		store:        store,
+		table:        table,
+		params:       p,
+		head:         head,
+		started:      len(first) > 0,
+		ch:           make(chan []byte, max(p.concurrency, 1)),
+		wake:         make(chan struct{}, 1),
+		acks:         make(chan struct{}, 1),
+		grow:         make(chan struct{}, 1),
+		hitAt:        time.Now(),
+		activeAt:     time.Now(),
+		active:       make(chan struct{}),
+		tailMin:      slotTailMin,
+		tailMax:      slotTailMax,
+		stallTimeout: slotStallTimeout,
 	}
 	if len(first) > 0 {
 		r.ch <- first
@@ -722,7 +724,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 
 	id := r.slotID(seq)
 	backoff := slotHuntFloor
-	var goneSince, warnedAt time.Time
+	var goneSince, warnedAt, visibleSince time.Time
 	for {
 		var description string
 		var err error
@@ -736,6 +738,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			description, err = r.store.readDescription(ctx, id)
 		}
 		frame, ok := decodeSlot(description)
+		if err == errNotFound || (err == nil && description == "") {
+			// An absent or empty slot is idle, not a failure.
+			visibleSince = time.Time{}
+		}
 		switch {
 		case err == nil && ok && frame.seq == seq:
 			// what follows it is asked for while its body comes
@@ -755,11 +761,37 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.hit()
 				return
 			case slotMedia:
-				if body, err := r.readBodyHedged(ctx, id, frame.size); err == nil && frame.holds(body) {
+				body, bodyErr := r.readBodyHedged(ctx, id, frame.size)
+				if bodyErr == nil && frame.holds(body) {
 					f.body = body
 					r.hit()
 					return
 				}
+				if ctx.Err() == nil && time.Since(warnedAt) > 10*time.Second {
+					warnedAt = time.Now()
+					if bodyErr != nil {
+						errors.LogWarningInner(ctx, bodyErr, "failed to read body of slot ", id)
+					} else {
+						errors.LogWarning(ctx, "body of slot ", id, " does not match segment ", seq)
+					}
+				}
+				if visibleSince.IsZero() {
+					visibleSince = time.Now()
+				}
+				if time.Since(visibleSince) > r.stallTimeout {
+					f.err = errors.New("segment ", seq, " has no usable body after ", r.stallTimeout).Base(bodyErr)
+					return
+				}
+			}
+		case err == nil && !ok && description != "":
+			// A present but undecodable description for this slot is not idle;
+			// fail once it has persisted beyond the stall timeout.
+			if visibleSince.IsZero() {
+				visibleSince = time.Now()
+			}
+			if time.Since(visibleSince) > r.stallTimeout {
+				f.err = errors.New("slot ", id, " of segment ", seq, " holds an invalid frame")
+				return
 			}
 		case err == errNotFound:
 			if goneSince.IsZero() {
