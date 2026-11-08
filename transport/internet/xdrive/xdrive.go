@@ -289,6 +289,7 @@ type Listener struct {
 	handled        map[string]time.Time
 	idleSince      map[string]time.Time
 	announceWarned map[string]bool
+	firstSeen      map[string]time.Time
 }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -313,6 +314,7 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 		handled:        make(map[string]time.Time),
 		idleSince:      make(map[string]time.Time),
 		announceWarned: make(map[string]bool),
+		firstSeen:      make(map[string]time.Time),
 	}
 
 	go listener.acceptLoop(ctx)
@@ -358,19 +360,46 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 	}
 
 	accepted := false
+	l.mu.Lock()
+	if l.firstSeen == nil {
+		l.firstSeen = make(map[string]time.Time)
+	}
+	now := time.Now()
+	listedEntries := make(map[string]bool, len(sessions))
+	for _, listed := range sessions {
+		listedEntries[listed.Name] = true
+		if _, seen := l.firstSeen[listed.Name]; !seen {
+			l.firstSeen[listed.Name] = now
+		}
+	}
+	for entry := range l.firstSeen {
+		if !listedEntries[entry] {
+			delete(l.firstSeen, entry)
+		}
+	}
+	l.mu.Unlock()
+
 	for _, listed := range sessions {
 		entry := listed.Name
 		full := sessionsDir + "/" + entry
 
-		session, at, ok := parseAnnounce(entry)
+		session, _, ok := parseAnnounce(entry)
 		if !ok {
 			go l.drop(full)
 			continue
 		}
-		if time.Since(at) > l.sessionTTL {
+		l.mu.Lock()
+		age := now.Sub(l.firstSeen[entry])
+		l.mu.Unlock()
+		if age > l.sessionTTL {
 			errors.LogInfo(logCtx, "dropping the stale announcement of session ", session)
 			go l.drop(full)
-			go l.drop(sessionPrefix(session))
+			l.mu.Lock()
+			protected := l.active[session] || !l.handled[session].IsZero()
+			l.mu.Unlock()
+			if !protected {
+				go l.drop(sessionPrefix(session))
+			}
 			continue
 		}
 		if !l.claim(session) {
