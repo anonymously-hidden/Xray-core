@@ -46,7 +46,12 @@ var (
 	driveSlotWrite      = 5 * time.Second
 	tokenRefreshBackoff = 30 * time.Second
 	maxTokenBackoff     = 5 * time.Minute
+	driveMaxResponse    = 32 << 20
+	driveMaxAnnounce    = 1 << 20
 )
+
+// maxBodyKey lets a caller tighten the response-body cap (announcements).
+type maxBodyKey struct{}
 
 // tokenFlight is one shared foreground token fetch; waiters read its result
 // after done closes instead of starting their own fetch.
@@ -451,7 +456,11 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				attempt+1, " of ", driveMaxAttempts)
 			continue
 		}
-		payload, err := io.ReadAll(resp.Body)
+		limit := int64(driveMaxResponse)
+		if v, ok := ctx.Value(maxBodyKey{}).(int64); ok && v > 0 {
+			limit = v
+		}
+		payload, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		resp.Body.Close()
 		cancel()
 		if err != nil {
@@ -460,6 +469,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			}
 			lastErr = errors.New("failed to read the Drive response").Base(err)
 			continue
+		}
+		if int64(len(payload)) > limit {
+			return 0, nil, errors.New("Drive response exceeds the ", limit, " byte cap")
 		}
 
 		if resp.StatusCode == http.StatusUnauthorized {

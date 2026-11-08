@@ -408,7 +408,7 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		announce := listed.Inline
 		if len(announce) == 0 {
 			if _, ok := sessionStorage(l.storage).(slotStore); ok {
-				announce, err = l.storage.Get(l.ctx, full)
+				announce, err = l.storage.Get(context.WithValue(l.ctx, maxBodyKey{}, int64(driveMaxAnnounce)), full)
 				if err != nil {
 					l.mu.Lock()
 					delete(l.active, session)

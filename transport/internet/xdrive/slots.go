@@ -36,6 +36,9 @@ const (
 	slotMedia  = 2
 	slotEnd    = 3
 	slotErr    = 4
+
+	// maxSlotIDLen bounds any slot or watermark id accepted from a peer.
+	maxSlotIDLen = 128
 )
 
 var (
@@ -151,6 +154,19 @@ func decodeRing(b []byte) (ring, bool) {
 	if json.Unmarshal(b, &r) != nil || len(r.Up.Slots) == 0 || len(r.Down.Slots) == 0 ||
 		r.Up.Watermark == "" || r.Down.Watermark == "" {
 		return ring{}, false
+	}
+	if len(r.Up.Slots) > maxConcurrency || len(r.Down.Slots) > maxConcurrency {
+		return ring{}, false
+	}
+	for _, t := range []slotTable{r.Up, r.Down} {
+		if len(t.Watermark) > maxSlotIDLen {
+			return ring{}, false
+		}
+		for _, id := range t.Slots {
+			if len(id) == 0 || len(id) > maxSlotIDLen {
+				return ring{}, false
+			}
+		}
 	}
 	return r, true
 }
