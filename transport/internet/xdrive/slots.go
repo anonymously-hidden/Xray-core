@@ -226,9 +226,11 @@ func lazyRing(session string, depth int, ids []string) ring {
 	return r
 }
 
-func readWatermark(ctx context.Context, store slotStore, id string) (int64, error) {
+func readWatermark(ctx context.Context, store slotStore, id string, lazy bool) (int64, error) {
 	d, err := store.readDescription(context.WithValue(ctx, laneKey{}, true), id)
-	if err == errNotFound {
+	if err == errNotFound && lazy {
+		// A lazy ring creates its watermark on the first ack; absent means no
+		// progress yet, not a cleaned-up session.
 		return -1, nil
 	}
 	if err != nil || d == "" {
@@ -466,7 +468,7 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 	if time.Since(w.ackedAt) < slotWatermarkTTL {
 		return false, nil
 	}
-	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark)
+	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark, w.table.lazy)
 	if err != nil {
 		return false, err
 	}
@@ -486,6 +488,11 @@ func (w *slotWriter) await(seq int64) error {
 		ok, err := w.drained(seq)
 		if ok {
 			return nil
+		}
+		if err == errNotFound {
+			// An eager ring whose watermark is gone was cleaned up; fail at
+			// once instead of waiting out the stall timeout.
+			return errors.New("the session watermark of slot ", w.slotID(seq), " is gone").Base(err)
 		}
 		w.mu.Lock()
 		closed := w.closed
