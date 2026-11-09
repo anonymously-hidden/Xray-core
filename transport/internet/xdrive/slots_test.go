@@ -17,11 +17,14 @@ import (
 )
 
 type memSlots struct {
-	mu     sync.Mutex
-	next   int
-	descs  map[string]string
-	bodies map[string][]byte
-	reads  int
+	mu        sync.Mutex
+	next      int
+	descs     map[string]string
+	bodies    map[string][]byte
+	reads     int
+	creates   int
+	updates   int
+	rejectDup bool
 }
 
 func newMemSlots() *memSlots {
@@ -37,12 +40,45 @@ func (m *memSlots) makeSlot(ctx context.Context, name string) (string, error) {
 	return id, nil
 }
 
+func (m *memSlots) generateIDs(ctx context.Context, n int) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		m.next++
+		ids = append(ids, "gen-"+strconv.Itoa(m.next))
+	}
+	return ids, nil
+}
+
+func (m *memSlots) takeIDs(ctx context.Context, n, ringWorth int) ([]string, error) {
+	return m.generateIDs(ctx, n)
+}
+
+func (m *memSlots) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.descs[id]; ok {
+		if m.rejectDup {
+			return errDuplicateID
+		}
+	} else {
+		m.creates++
+	}
+	m.descs[id] = description
+	if body != nil {
+		m.bodies[id] = bytes.Clone(body)
+	}
+	return nil
+}
+
 func (m *memSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.descs[id]; !ok {
 		return errNotFound
 	}
+	m.updates++
 	m.descs[id] = description
 	if body != nil {
 		m.bodies[id] = bytes.Clone(body)

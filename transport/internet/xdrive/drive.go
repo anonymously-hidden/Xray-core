@@ -108,6 +108,7 @@ type driveShared struct {
 	coolUntil time.Time
 	throttle  atomic.Int64
 	timing    *timingAggregator
+	idPoolState
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {

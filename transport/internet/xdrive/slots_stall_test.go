@@ -12,6 +12,9 @@ import (
 type badBodySlots struct{}
 
 func (badBodySlots) makeSlot(ctx context.Context, name string) (string, error) { return name, nil }
+func (badBodySlots) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	return nil
+}
 func (badBodySlots) setSlot(ctx context.Context, id, description string, body []byte) error {
 	return nil
 }
@@ -26,6 +29,9 @@ func (badBodySlots) readBody(ctx context.Context, id string) ([]byte, error) {
 type emptySlots struct{}
 
 func (emptySlots) makeSlot(ctx context.Context, name string) (string, error) { return name, nil }
+func (emptySlots) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	return nil
+}
 func (emptySlots) setSlot(ctx context.Context, id, description string, body []byte) error {
 	return nil
 }

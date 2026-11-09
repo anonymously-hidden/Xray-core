@@ -227,15 +227,30 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	p = paramsForStorage(config, storage)
 
 	slots, ok := storage.(slotStore)
+	lazy := false
 	if ok && !warm {
-		if r, err = makeRing(ctx, slots, session, p); err != nil {
-			ok = false
-			errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
+		if ls, lok := storage.(interface {
+			takeIDs(context.Context, int, int) ([]string, error)
+		}); lok {
+			depth := max(p.concurrency, 2)
+			worth := depth + 1
+			if ids, e := ls.takeIDs(ctx, 2*worth, worth); e == nil && len(ids) >= 2*worth {
+				r = lazyRing(session, depth, ids)
+				lazy = true
+			}
+		}
+		if !lazy {
+			if r, err = makeRing(ctx, slots, session, p); err != nil {
+				ok = false
+				errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
+			}
 		}
 	}
 
 	if ok {
-		warmSpares(streamSettings, config, p)
+		if !lazy {
+			warmSpares(streamSettings, config, p)
+		}
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
 		conn := newSlotConn(context.Background(), slots, r.Up, r.Down, p, nil, func() {
 			storage.Close()
@@ -457,6 +472,8 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 	}
 	if slots, ok := storage.(slotStore); ok {
 		if r, ok := decodeRing(announce); ok {
+			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
+			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
 			errors.LogInfo(logCtx, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
 			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, onClose)
 		}

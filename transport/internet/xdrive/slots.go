@@ -68,6 +68,9 @@ var slotWriteInflight = 12
 // each with a description and a body
 type slotStore interface {
 	makeSlot(ctx context.Context, name string) (string, error)
+	// createSlot creates a slot with a pre-generated id; on a duplicate-id 4xx
+	// it may fall back to updating the existing object.
+	createSlot(ctx context.Context, id, name, description string, body []byte) error
 	// setSlot sets the description of a slot and, unless body is nil, its body
 	setSlot(ctx context.Context, id, description string, body []byte) error
 	readDescription(ctx context.Context, id string) (string, error)
@@ -135,18 +138,21 @@ func (f slotFrame) holds(body []byte) bool {
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
-// watermark of its reader
+// watermark of its reader. name and lazy are local carriers, not serialized.
 type slotTable struct {
 	Slots     []string `json:"s"`
 	Watermark string   `json:"w"`
+	name      string
+	lazy      bool
 }
 
 // ring is what a client announces a session with, the tables are named from
-// its side
+// its side. Lazy rings create their slots on first write instead of up front.
 type ring struct {
 	Up    slotTable `json:"u"`
 	Down  slotTable `json:"d"`
 	First []byte    `json:"first,omitempty"`
+	Lazy  bool      `json:"lazy,omitempty"`
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -197,6 +203,7 @@ func makeRing(ctx context.Context, store slotStore, session string, p params) (r
 		table  *slotTable
 		prefix string
 	}{{&r.Up, uplinkPrefix(session)}, {&r.Down, downlinkPrefix(session)}} {
+		t.table.name = t.prefix
 		for i := range t.table.Slots {
 			create(&t.table.Slots[i], t.prefix+"/s"+strconv.Itoa(i))
 		}
@@ -206,8 +213,23 @@ func makeRing(ctx context.Context, store slotStore, session string, p params) (r
 	return r, err
 }
 
+// lazyRing assembles a ring from pre-generated ids without any create call.
+// ids must hold 2*(depth+1) entries: up slots, up watermark, down slots, down
+// watermark.
+func lazyRing(session string, depth int, ids []string) ring {
+	r := ring{
+		Lazy: true,
+		Up:   slotTable{Slots: append([]string(nil), ids[:depth]...), Watermark: ids[depth], name: uplinkPrefix(session), lazy: true},
+		Down: slotTable{Slots: append([]string(nil), ids[depth+1:2*depth+1]...), Watermark: ids[2*depth+1], name: downlinkPrefix(session), lazy: true},
+	}
+	return r
+}
+
 func readWatermark(ctx context.Context, store slotStore, id string) (int64, error) {
 	d, err := store.readDescription(context.WithValue(ctx, laneKey{}, true), id)
+	if err == errNotFound {
+		return -1, nil
+	}
 	if err != nil || d == "" {
 		return -1, err
 	}
@@ -233,6 +255,8 @@ type slotWriter struct {
 	closed   bool
 	err      error
 	first    chan []byte
+	lazy     bool
+	created  []bool
 
 	// ackMu is held while the watermark is read, which other uploads wait for
 	ackMu    sync.Mutex
@@ -251,6 +275,10 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		size:     min(slotInlineLimit, p.segmentBytes),
 		acked:    -1,
 		progress: time.Now(),
+		lazy:     table.lazy,
+	}
+	if w.lazy {
+		w.created = make([]bool, len(table.Slots))
 	}
 	go w.flushLoop()
 	return w
@@ -404,7 +432,23 @@ func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
 	if mode == slotMedia {
 		body = data
 	}
-	return w.store.setSlot(w.ctx, w.slotID(seq), f.encode(), body)
+	id := w.slotID(seq)
+	if w.lazy {
+		idx := int(seq % int64(len(w.table.Slots)))
+		w.mu.Lock()
+		created := w.created[idx]
+		w.mu.Unlock()
+		if !created {
+			if err := w.store.createSlot(w.ctx, id, w.table.name+"/s"+strconv.Itoa(idx), f.encode(), body); err != nil {
+				return err
+			}
+			w.mu.Lock()
+			w.created[idx] = true
+			w.mu.Unlock()
+			return nil
+		}
+	}
+	return w.store.setSlot(w.ctx, id, f.encode(), body)
 }
 
 // drained reports whether the reader took what the slot of seq held a lap
@@ -536,6 +580,9 @@ type slotReader struct {
 	tailMax      time.Duration
 	stallTimeout time.Duration
 	bodyRate     float64
+	lazy         bool
+	seen         []bool
+	wmCreated    bool
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
@@ -562,6 +609,10 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		tailMin:      slotTailMin,
 		tailMax:      slotTailMax,
 		stallTimeout: slotStallTimeout,
+		lazy:         table.lazy,
+	}
+	if r.lazy {
+		r.seen = make([]bool, len(table.Slots))
 	}
 	if len(first) > 0 {
 		r.ch <- first
@@ -747,6 +798,9 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			// what follows it is asked for while its body comes
 			r.mu.Lock()
 			r.touch()
+			if r.lazy {
+				r.seen[int(seq%int64(len(r.table.Slots)))] = true
+			}
 			r.mu.Unlock()
 			r.reach(seq)
 			switch frame.mode {
@@ -794,7 +848,16 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				return
 			}
 		case err == errNotFound:
-			if goneSince.IsZero() {
+			notWritten := false
+			if r.lazy {
+				r.mu.Lock()
+				notWritten = !r.seen[int(seq%int64(len(r.table.Slots)))]
+				r.mu.Unlock()
+			}
+			if notWritten {
+				// A lazy slot that has never held a frame is not written yet.
+				goneSince = time.Time{}
+			} else if goneSince.IsZero() {
 				goneSince = time.Now()
 			} else if time.Since(goneSince) > slotGoneTimeout && r.isHead(seq) {
 				f.err = errors.New("slot ", id, " of segment ", seq, " is gone").Base(err)
@@ -1027,7 +1090,25 @@ func (r *slotReader) ackLoop() {
 			if want <= acked {
 				break
 			}
-			if err := r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil); err == nil {
+			var err error
+			if r.lazy {
+				r.mu.Lock()
+				created := r.wmCreated
+				r.mu.Unlock()
+				if !created {
+					err = r.store.createSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, r.table.name+"/w", strconv.FormatInt(want, 10), nil)
+					if err == nil {
+						r.mu.Lock()
+						r.wmCreated = true
+						r.mu.Unlock()
+					}
+				} else {
+					err = r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil)
+				}
+			} else {
+				err = r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil)
+			}
+			if err == nil {
 				acked, wait = want, slotAckRetry
 				continue
 			}

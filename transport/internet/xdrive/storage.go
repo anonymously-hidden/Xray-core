@@ -14,6 +14,9 @@ import (
 
 var errNotFound = errors.New("object not found")
 
+// errDuplicateID is returned by test stores that reject a repeated create.
+var errDuplicateID = errors.New("duplicate id")
+
 type Entry struct {
 	Name   string
 	Inline []byte
