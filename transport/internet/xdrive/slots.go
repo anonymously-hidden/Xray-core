@@ -52,6 +52,7 @@ var (
 
 	slotAckRetry     = 30 * time.Millisecond
 	slotWatermarkTTL = 100 * time.Millisecond
+	ackDelay         = 1500 * time.Millisecond
 	slotStallTimeout = 60 * time.Second
 	slotCloseGrace   = 10 * time.Second
 	slotGoneTimeout  = 60 * time.Second
@@ -579,6 +580,7 @@ type slotReader struct {
 	tailMin      time.Duration
 	tailMax      time.Duration
 	stallTimeout time.Duration
+	ackDelay     time.Duration
 	bodyRate     float64
 	lazy         bool
 	seen         []bool
@@ -609,6 +611,7 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		tailMin:      slotTailMin,
 		tailMax:      slotTailMax,
 		stallTimeout: slotStallTimeout,
+		ackDelay:     ackDelay,
 		lazy:         table.lazy,
 	}
 	if r.lazy {
@@ -1076,49 +1079,77 @@ func (r *slotReader) hold(ctx context.Context, d time.Duration, a, b <-chan stru
 // moved more than once meanwhile
 func (r *slotReader) ackLoop() {
 	acked := int64(-1)
+	var oldest time.Time
+	depth := int64(len(r.table.Slots))
+	batch := int64(1)
+	if depth >= 16 {
+		batch = depth / 4
+	}
 	wait := slotAckRetry
-	for {
-		select {
-		case <-r.ctx.Done():
-			return
-		case <-r.acks:
-		}
-		for {
+	timer := time.NewTimer(r.ackDelay)
+	defer timer.Stop()
+	writeWM := func(want int64) bool {
+		var err error
+		ctx := context.WithValue(r.ctx, laneKey{}, true)
+		if r.lazy {
 			r.mu.Lock()
-			want := r.head - 1
+			created := r.wmCreated
 			r.mu.Unlock()
-			if want <= acked {
-				break
-			}
-			var err error
-			if r.lazy {
-				r.mu.Lock()
-				created := r.wmCreated
-				r.mu.Unlock()
-				if !created {
-					err = r.store.createSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, r.table.name+"/w", strconv.FormatInt(want, 10), nil)
-					if err == nil {
-						r.mu.Lock()
-						r.wmCreated = true
-						r.mu.Unlock()
-					}
-				} else {
-					err = r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil)
+			if !created {
+				err = r.store.createSlot(ctx, r.table.Watermark, r.table.name+"/w", strconv.FormatInt(want, 10), nil)
+				if err == nil {
+					r.mu.Lock()
+					r.wmCreated = true
+					r.mu.Unlock()
 				}
 			} else {
-				err = r.store.setSlot(context.WithValue(r.ctx, laneKey{}, true), r.table.Watermark, strconv.FormatInt(want, 10), nil)
+				err = r.store.setSlot(ctx, r.table.Watermark, strconv.FormatInt(want, 10), nil)
 			}
-			if err == nil {
-				acked, wait = want, slotAckRetry
+		} else {
+			err = r.store.setSlot(ctx, r.table.Watermark, strconv.FormatInt(want, 10), nil)
+		}
+		return err == nil
+	}
+	for {
+		r.mu.Lock()
+		want := r.head - 1
+		idle := time.Since(r.activeAt) > r.eagerWindow
+		r.mu.Unlock()
+		if want > acked && oldest.IsZero() {
+			oldest = time.Now()
+		}
+		if want <= acked {
+			oldest = time.Time{}
+		}
+		if want > acked && (want-acked >= batch || (!oldest.IsZero() && time.Since(oldest) >= r.ackDelay) || idle) {
+			if writeWM(want) {
+				acked, wait, oldest = want, slotAckRetry, time.Time{}
+			} else {
+				wait = min(2*wait, 5*time.Second)
+				select {
+				case <-r.ctx.Done():
+					return
+				case <-time.After(wait):
+				}
 				continue
 			}
-			wait = min(2*wait, 5*time.Second)
+		}
+		select {
+		case <-r.ctx.Done():
+			if want > acked {
+				writeWM(want)
+			}
+			return
+		case <-r.acks:
+		case <-timer.C:
+		}
+		if !timer.Stop() {
 			select {
-			case <-r.ctx.Done():
-				return
-			case <-time.After(wait):
+			case <-timer.C:
+			default:
 			}
 		}
+		timer.Reset(r.ackDelay)
 	}
 }
 
