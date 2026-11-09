@@ -44,8 +44,8 @@ var (
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
 	driveCooldown       = 2 * time.Second
-	driveSlotRead       = 3 * time.Second
-	driveSlotWrite      = 5 * time.Second
+	driveSlotRead       = 8 * time.Second
+	driveSlotWrite      = 10 * time.Second
 	tokenRefreshBackoff = 30 * time.Second
 	maxTokenBackoff     = 5 * time.Minute
 	driveMaxResponse    = 32 << 20
