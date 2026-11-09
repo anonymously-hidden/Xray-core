@@ -3,11 +3,13 @@ package xdrive
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -105,6 +107,7 @@ type driveShared struct {
 	coolMu    sync.Mutex
 	coolUntil time.Time
 	throttle  atomic.Int64
+	timing    *timingAggregator
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -137,6 +140,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			uploadURL:    driveUploadURL,
 			backoff:      driveInitialBackoff,
 			ids:          make(map[string]string),
+			timing:       newTimingAggregator(),
 		},
 		client:   client,
 		inflight: make(chan struct{}, driveMaxInflight),
@@ -289,6 +293,12 @@ func (s *driveStorage) refreshTokenBackground() {
 }
 
 func (s *driveStorage) fetchToken(ctx context.Context) (string, time.Duration, error) {
+	start := time.Now()
+	defer func() {
+		if s.timing != nil {
+			s.timing.record(kindToken, timingSample{total: time.Since(start)})
+		}
+	}()
 	form := url.Values{
 		"client_id":     {s.clientID},
 		"client_secret": {s.clientSecret},
@@ -391,14 +401,18 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				backoff = driveMaxBackoff
 			}
 		}
+		coolStart := time.Now()
 		if err := s.waitCool(ctx); err != nil {
 			return 0, nil, err
 		}
+		waitCoolDur := time.Since(coolStart)
 		if testDriveIO != nil {
 			testDriveIO(method, target, body)
 		}
 
+		tokenStart := time.Now()
 		token, err := s.accessToken(ctx)
+		waitTokenDur := time.Since(tokenStart)
 		if err != nil {
 			if isAuthError(err) {
 				return 0, nil, err
@@ -411,11 +425,13 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if ctx.Value(laneKey{}) != nil {
 			pool = s.reserved
 		}
+		poolStart := time.Now()
 		select {
 		case pool <- struct{}{}:
 		case <-ctx.Done():
 			return 0, nil, ctx.Err()
 		}
+		waitPoolDur := time.Since(poolStart)
 
 		var reader io.Reader
 		if body != nil {
@@ -436,9 +452,49 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			req.Header.Set("Content-Type", contentType)
 		}
 
+		var tr struct {
+			mu                                                 sync.Mutex
+			connAt, connStart, connDone, tlsDone, wrote, first time.Time
+			reused, gotConn                                    bool
+		}
+		trace := &httptrace.ClientTrace{
+			GotConn: func(i httptrace.GotConnInfo) {
+				tr.mu.Lock()
+				tr.connAt, tr.reused, tr.gotConn = time.Now(), i.Reused, true
+				tr.mu.Unlock()
+			},
+			ConnectStart: func(_, _ string) {
+				tr.mu.Lock()
+				tr.connStart = time.Now()
+				tr.mu.Unlock()
+			},
+			ConnectDone: func(_, _ string, _ error) {
+				tr.mu.Lock()
+				tr.connDone = time.Now()
+				tr.mu.Unlock()
+			},
+			TLSHandshakeDone: func(_ tls.ConnectionState, _ error) {
+				tr.mu.Lock()
+				tr.tlsDone = time.Now()
+				tr.mu.Unlock()
+			},
+			WroteRequest: func(httptrace.WroteRequestInfo) {
+				tr.mu.Lock()
+				tr.wrote = time.Now()
+				tr.mu.Unlock()
+			},
+			GotFirstResponseByte: func() {
+				tr.mu.Lock()
+				tr.first = time.Now()
+				tr.mu.Unlock()
+			},
+		}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
+
 		began := time.Now()
 		resp, err := s.client.Do(req)
 		<-pool
+		respAt := time.Now()
 		if err != nil {
 			timedOut := attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 			cancel()
@@ -463,6 +519,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		payload, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		resp.Body.Close()
 		cancel()
+		bodyEnd := time.Now()
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
@@ -473,6 +530,24 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if int64(len(payload)) > limit {
 			return 0, nil, errors.New("Drive response exceeds the ", limit, " byte cap")
 		}
+		tr.mu.Lock()
+		sample := timingSample{
+			total:     bodyEnd.Sub(poolStart) + waitCoolDur + waitTokenDur,
+			waitCool:  waitCoolDur,
+			waitPool:  waitPoolDur,
+			waitToken: waitTokenDur,
+			waitConn:  tr.connAt.Sub(began),
+			dialTLS:   dialEnd(tr.tlsDone, tr.connDone).Sub(tr.connStart),
+			server:    tr.first.Sub(tr.wrote),
+			body:      bodyEnd.Sub(maxTime(tr.first, respAt)),
+			reused:    tr.reused,
+			newConn:   tr.gotConn && !tr.reused,
+			hasConn:   tr.gotConn,
+			hasDial:   !tr.connStart.IsZero(),
+			hasServer: !tr.wrote.IsZero() && !tr.first.IsZero(),
+		}
+		tr.mu.Unlock()
+		s.recordTiming(ctx, method, target, contentType, body, sample)
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
@@ -833,6 +908,8 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 func (s *driveStorage) Close() error {
 	if s.release != nil {
 		s.release()
+	} else if s.timing != nil {
+		s.timing.stop()
 	}
 	return nil
 }
