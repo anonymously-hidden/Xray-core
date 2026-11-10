@@ -66,20 +66,26 @@ type tokenFlight struct {
 
 type laneKey struct{}
 
+// bodyKey marks media-body requests so they ride the bulk connection, keeping
+// small reads/acks off the connection saturated by large transfers.
+type bodyKey struct{}
+
 type attemptKey struct{}
 
 type driveStorage struct {
 	*driveShared
 	// a session has a client and inflight of its own, see session
-	client   *http.Client
-	inflight chan struct{}
-	reserved chan struct{}
-	release  func()
+	client     *http.Client
+	bulkClient *http.Client
+	inflight   chan struct{}
+	reserved   chan struct{}
+	release    func()
 }
 
 // driveShared is what the sessions of a storage have in common
 type driveShared struct {
 	conns        *connPool
+	bulkConns    *connPool
 	folder       string
 	clientID     string
 	clientSecret string
@@ -131,6 +137,9 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 			}),
+			bulkConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
+			}),
 			folder:       config.RemoteFolder,
 			clientID:     config.Secrets[0],
 			clientSecret: config.Secrets[1],
@@ -153,12 +162,17 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 // until Close, with the token and ids of s
 func (s *driveStorage) session() Storage {
 	transport := &sessionTransport{pool: s.conns}
+	bulkTransport := &sessionTransport{pool: s.bulkConns}
 	return &driveStorage{
 		driveShared: s.driveShared,
 		client:      &http.Client{Transport: transport},
+		bulkClient:  &http.Client{Transport: bulkTransport},
 		inflight:    make(chan struct{}, driveMaxInflight),
 		reserved:    make(chan struct{}, driveReservedInflight),
-		release:     transport.Close,
+		release: func() {
+			transport.Close()
+			bulkTransport.Close()
+		},
 	}
 }
 
@@ -492,8 +506,12 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
+		httpc := s.client
+		if ctx.Value(bodyKey{}) != nil && s.bulkClient != nil {
+			httpc = s.bulkClient
+		}
 		began := time.Now()
-		resp, err := s.client.Do(req)
+		resp, err := httpc.Do(req)
 		<-pool
 		respAt := time.Now()
 		if err != nil {
@@ -757,6 +775,7 @@ func multipartBody(metadata, data []byte) []byte {
 }
 
 func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) error {
+	ctx = context.WithValue(ctx, bodyKey{}, true)
 	flat := flatten(name)
 
 	metadata, err := json.Marshal(map[string]interface{}{
@@ -928,6 +947,8 @@ func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error
 func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
 	if body == nil {
 		ctx = context.WithValue(ctx, attemptKey{}, driveSlotWrite)
+	} else {
+		ctx = context.WithValue(ctx, bodyKey{}, true)
 	}
 	metadata, err := json.Marshal(map[string]string{"description": description})
 	if err != nil {
@@ -979,6 +1000,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 
 // readBody implements slotStore
 func (s *driveStorage) readBody(ctx context.Context, id string) ([]byte, error) {
+	ctx = context.WithValue(ctx, bodyKey{}, true)
 	status, payload, err := s.do(ctx, http.MethodGet,
 		s.filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil)
 	switch {
