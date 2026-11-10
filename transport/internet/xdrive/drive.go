@@ -124,6 +124,19 @@ type driveShared struct {
 	throttle      atomic.Int64
 	timing        *timingAggregator
 	idPoolState
+
+	// keep-warm keeper; intervals are instance fields so tests never mutate
+	// package-level values other goroutines read.
+	owner          *driveStorage
+	keepWarmEvery  time.Duration
+	keepWarmWindow time.Duration
+	trafficMu      sync.Mutex
+	lastTraffic    time.Time
+	lastRequest    time.Time
+	keeperOnce     sync.Once
+	keeperStopOnce sync.Once
+	keeperStop     chan struct{}
+	keeperDone     chan struct{}
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -141,7 +154,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 
 	h1Hosts := new(sync.Map)
 	client := newServiceClient(context.Background(), h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
-	return &driveStorage{
+	st := &driveStorage{
 		driveShared: &driveShared{
 			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
@@ -166,12 +179,18 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		reserved:        make(chan struct{}, driveReservedInflight),
 		readHedge:       slotReadHedge,
 		readHedgeTokens: 3,
-	}, nil
+	}
+	st.driveShared.owner = st
+	st.driveShared.keepWarmEvery = 4 * time.Minute
+	st.driveShared.keepWarmWindow = 3 * time.Hour
+	st.startKeeper()
+	return st, nil
 }
 
 // session returns a storage for one session, over the connections of XMUX
 // until Close, with the token and ids of s
 func (s *driveStorage) session() Storage {
+	s.startKeeper()
 	transport := &sessionTransport{pool: s.conns}
 	bulkTransport := &sessionTransport{pool: s.bulkConns}
 	return &driveStorage{
@@ -414,6 +433,7 @@ func retryableStatus(status int) bool {
 }
 
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	defer s.noteTraffic()
 	backoff := s.backoff
 	var lastErr error
 
@@ -966,8 +986,11 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 func (s *driveStorage) Close() error {
 	if s.release != nil {
 		s.release()
-	} else if s.timing != nil {
-		s.timing.stop()
+	} else {
+		s.stopKeeper()
+		if s.timing != nil {
+			s.timing.stop()
+		}
 	}
 	return nil
 }
