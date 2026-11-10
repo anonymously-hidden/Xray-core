@@ -46,7 +46,7 @@ func TestBulkBodiesUseSeparateConnection(t *testing.T) {
 	}
 	normal, bulk := mkClient(), mkClient()
 	s := &driveStorage{
-		driveShared: &driveShared{token: "t", tokenExpiry: time.Now().Add(time.Hour), filesURL: srv.URL, uploadURL: srv.URL + "/upload"},
+		driveShared: &driveShared{token: "t", tokenExpiry: time.Now().Add(time.Hour), filesURL: srv.URL, uploadURL: srv.URL + "/upload", ids: make(map[string]string)},
 		client:      normal,
 		bulkClient:  bulk,
 		inflight:    make(chan struct{}, 8),
@@ -130,6 +130,65 @@ func TestSessionBulkLazyAndClose(t *testing.T) {
 	sess.Close()
 	if !sess.client.Transport.(*sessionTransport).closed || !sess.bulkClient.Transport.(*sessionTransport).closed {
 		t.Fatal("session close did not close both transports")
+	}
+}
+
+func TestLazyCreateMediaUsesBulk(t *testing.T) {
+	var mu sync.Mutex
+	addrs := map[string]string{}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		switch {
+		case strings.Contains(r.Header.Get("Content-Type"), "multipart"):
+			addrs["media"] = r.RemoteAddr
+		case strings.Contains(r.URL.RawQuery, "alt=media"):
+			addrs["body"] = r.RemoteAddr
+		case strings.Contains(r.URL.RawQuery, "fields=description"):
+			addrs["desc"] = r.RemoteAddr
+		default:
+			addrs["inline"] = r.RemoteAddr
+		}
+		mu.Unlock()
+		if strings.Contains(r.URL.RawQuery, "alt=media") {
+			w.Write([]byte("body"))
+			return
+		}
+		w.Write([]byte(`{"id":"x","description":""}`))
+	}))
+	defer srv.Close()
+	mk := func() *http.Client {
+		return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	}
+	s := &driveStorage{
+		driveShared: &driveShared{token: "t", tokenExpiry: time.Now().Add(time.Hour), filesURL: srv.URL, uploadURL: srv.URL + "/upload", ids: make(map[string]string)},
+		client:      mk(),
+		bulkClient:  mk(),
+		inflight:    make(chan struct{}, 8),
+		reserved:    make(chan struct{}, 8),
+	}
+	ctx := context.Background()
+	if err := s.createSlot(ctx, "id", "name", "desc", []byte("media")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.createSlot(ctx, "id2", "name2", "desc", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.readBody(ctx, "id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.readDescription(ctx, "id2"); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if addrs["media"] == "" || addrs["inline"] == "" || addrs["media"] == addrs["inline"] {
+		t.Fatalf("lazy media create and inline create shared a connection: %v", addrs)
+	}
+	if addrs["media"] != addrs["body"] {
+		t.Fatal("lazy media create did not use the bulk connection")
+	}
+	if addrs["inline"] != addrs["desc"] {
+		t.Fatal("lazy inline create did not use the lane connection")
 	}
 }
 

@@ -106,6 +106,7 @@ func (s *driveStorage) createWithID(ctx context.Context, metadata map[string]int
 	contentType := "application/json; charset=UTF-8"
 	payload := md
 	if body != nil {
+		ctx = context.WithValue(ctx, bodyKey{}, true)
 		target = s.uploadURL
 		contentType = "multipart/related; boundary=" + driveBoundary
 		payload = multipartBody(md, body)
