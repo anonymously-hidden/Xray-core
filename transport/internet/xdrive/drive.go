@@ -44,8 +44,9 @@ var (
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
 	driveCooldown       = 2 * time.Second
-	driveSlotRead       = 8 * time.Second
+	driveSlotRead       = 1500 * time.Millisecond
 	driveSlotWrite      = 10 * time.Second
+	slotReadHedge       = 900 * time.Millisecond
 	tokenRefreshBackoff = 30 * time.Second
 	maxTokenBackoff     = 5 * time.Minute
 	driveMaxResponse    = 32 << 20
@@ -70,6 +71,9 @@ type laneKey struct{}
 // small reads/acks off the connection saturated by large transfers.
 type bodyKey struct{}
 
+// singleAttemptKey limits do() to one attempt, for hedged reads.
+type singleAttemptKey struct{}
+
 type attemptKey struct{}
 
 type driveStorage struct {
@@ -80,6 +84,11 @@ type driveStorage struct {
 	inflight   chan struct{}
 	reserved   chan struct{}
 	release    func()
+	// readHedge/budget are copied per instance so tests never mutate globals
+	// that other goroutines read.
+	readHedge      time.Duration
+	readHedgeMu    sync.Mutex
+	readSinceHedge int
 }
 
 // driveShared is what the sessions of a storage have in common
@@ -110,10 +119,11 @@ type driveShared struct {
 	idMu sync.Mutex
 	ids  map[string]string
 
-	coolMu    sync.Mutex
-	coolUntil time.Time
-	throttle  atomic.Int64
-	timing    *timingAggregator
+	coolMu       sync.Mutex
+	coolUntil    time.Time
+	lastThrottle time.Time
+	throttle     atomic.Int64
+	timing       *timingAggregator
 	idPoolState
 }
 
@@ -152,9 +162,10 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			ids:          make(map[string]string),
 			timing:       newTimingAggregator(),
 		},
-		client:   client,
-		inflight: make(chan struct{}, driveMaxInflight),
-		reserved: make(chan struct{}, driveReservedInflight),
+		client:    client,
+		inflight:  make(chan struct{}, driveMaxInflight),
+		reserved:  make(chan struct{}, driveReservedInflight),
+		readHedge: slotReadHedge,
 	}, nil
 }
 
@@ -169,6 +180,7 @@ func (s *driveStorage) session() Storage {
 		bulkClient:  &http.Client{Transport: bulkTransport},
 		inflight:    make(chan struct{}, driveMaxInflight),
 		reserved:    make(chan struct{}, driveReservedInflight),
+		readHedge:   s.readHedge,
 		release: func() {
 			transport.Close()
 			bulkTransport.Close()
@@ -403,8 +415,12 @@ func retryableStatus(status int) bool {
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
 	backoff := s.backoff
 	var lastErr error
+	maxAttempts := driveMaxAttempts
+	if ctx.Value(singleAttemptKey{}) != nil {
+		maxAttempts = 1
+	}
 
-	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -519,6 +535,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			cancel()
 			if timedOut {
 				s.throttle.Add(1)
+				s.coolMu.Lock()
+				s.lastThrottle = time.Now()
+				s.coolMu.Unlock()
 				if t, ok := s.client.Transport.(*sessionTransport); ok {
 					t.stalled(began)
 				}
@@ -615,7 +634,20 @@ func (s *driveStorage) cool() {
 	s.throttle.Add(1)
 	s.coolMu.Lock()
 	s.coolUntil = time.Now().Add(jitter(driveCooldown))
+	s.lastThrottle = time.Now()
 	s.coolMu.Unlock()
+}
+
+func (s *driveStorage) cooling() bool {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	return time.Now().Before(s.coolUntil)
+}
+
+func (s *driveStorage) lastThrottleAt() time.Time {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	return s.lastThrottle
 }
 
 func (s *driveStorage) throttled() int64 {
@@ -975,11 +1007,79 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	return nil
 }
 
+// readHedgeBudget allows at most one hedge per twenty description reads.
+func (s *driveStorage) readHedgeBudget() bool {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	s.readSinceHedge++
+	if s.readSinceHedge >= 20 {
+		s.readSinceHedge = 0
+		return true
+	}
+	return false
+}
+
+// readDescHedged issues one description GET; if it is still pending after
+// readHedge, one identical GET goes over the bulk connection. Reads are
+// idempotent, so a duplicate GET carries no stale-write hazard. The first
+// definitive answer (200 or 404) wins and the loser's context is cancelled.
+func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, []byte, error) {
+	single := context.WithValue(ctx, singleAttemptKey{}, true)
+	if s.readHedge <= 0 || s.bulkClient == nil || !s.readHedgeBudget() ||
+		s.cooling() || time.Since(s.lastThrottleAt()) <= 5*time.Second {
+		return s.do(single, http.MethodGet, target, "", nil)
+	}
+	type res struct {
+		status  int
+		payload []byte
+		err     error
+		hedge   bool
+	}
+	ch := make(chan res, 2)
+	ctx1, cancel1 := context.WithCancel(single)
+	defer cancel1()
+	go func() {
+		st, pl, e := s.do(ctx1, http.MethodGet, target, "", nil)
+		ch <- res{st, pl, e, false}
+	}()
+	timer := time.NewTimer(s.readHedge)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.status, r.payload, r.err
+	case <-timer.C:
+	}
+	kind := kindOtherRead
+	if ctx.Value(laneKey{}) != nil {
+		kind = kindHeadRead
+	}
+	ctx2, cancel2 := context.WithCancel(single)
+	defer cancel2()
+	go func() {
+		st, pl, e := s.do(ctx2, http.MethodGet, target, "", nil)
+		ch <- res{st, pl, e, true}
+	}()
+	var last res
+	won := false
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err == nil && (r.status == http.StatusOK || r.status == http.StatusNotFound) {
+			won = r.hedge
+			last = r
+			break
+		}
+		last = r
+	}
+	if s.timing != nil {
+		s.timing.noteHedge(kind, won)
+	}
+	return last.status, last.payload, last.err
+}
+
 // readDescription implements slotStore
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
 	ctx = context.WithValue(ctx, attemptKey{}, driveSlotRead)
-	status, payload, err := s.do(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil)
+	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true")
 	switch {
 	case err != nil:
 		return "", err

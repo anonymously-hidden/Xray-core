@@ -99,6 +99,16 @@ func (a *timingAggregator) stop() {
 	a.stopOnce.Do(func() { close(a.done) })
 }
 
+// noteHedge counts a started hedge (and a win) without adding a traffic sample.
+func (a *timingAggregator) noteHedge(kind int, won bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.hedges[kind]++
+	if won {
+		a.won[kind]++
+	}
+}
+
 func (a *timingAggregator) loop() {
 	t := time.NewTicker(timingWindow)
 	defer t.Stop()
