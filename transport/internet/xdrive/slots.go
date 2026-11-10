@@ -261,11 +261,13 @@ type slotWriter struct {
 	lazy     bool
 	created  []bool
 
-	// ackMu is held while the watermark is read, which other uploads wait for
+	// ackMu guards acked/ackedAt/progress/reading only; the watermark GET runs
+	// without the lock, single-flight, so other uploads never block on it.
 	ackMu    sync.Mutex
 	acked    int64
 	ackedAt  time.Time
 	progress time.Time
+	reading  bool
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
@@ -412,6 +414,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte) {
 	if len(chunk) <= slotInlineLimit {
 		mode = slotInline
 	}
+	w.prefetchWatermark(seq)
 	began := time.Now()
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
@@ -455,28 +458,65 @@ func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
 }
 
 // drained reports whether the reader took what the slot of seq held a lap
-// before. The watermark is read again only after slotWatermarkTTL, as one
-// that is old costs a wait but never what is in a slot
+// before. The watermark GET runs without ackMu and single-flight: only the
+// upload that triggers a read waits for it; the others use the cached value and
+// return false, and await() re-checks every slotAckRetry.
 func (w *slotWriter) drained(seq int64) (bool, error) {
-	w.ackMu.Lock()
-	defer w.ackMu.Unlock()
-
 	before := seq - int64(len(w.table.Slots))
+	w.ackMu.Lock()
 	if w.acked >= before {
+		w.ackMu.Unlock()
 		return true, nil
 	}
-	if time.Since(w.ackedAt) < slotWatermarkTTL {
+	if time.Since(w.ackedAt) < slotWatermarkTTL || w.reading {
+		w.ackMu.Unlock()
 		return false, nil
 	}
-	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark, w.table.lazy)
-	if err != nil {
+	w.reading = true
+	w.ackMu.Unlock()
+
+	if _, err := w.fetchWatermark(); err != nil {
 		return false, err
 	}
-	w.ackedAt = time.Now()
-	if acked > w.acked {
-		w.acked, w.progress = acked, w.ackedAt
+	w.ackMu.Lock()
+	ok := w.acked >= before
+	w.ackMu.Unlock()
+	return ok, nil
+}
+
+// fetchWatermark reads the watermark without holding ackMu and publishes the
+// result. The caller sets reading=true first; it is cleared here.
+func (w *slotWriter) fetchWatermark() (int64, error) {
+	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark, w.table.lazy)
+	w.ackMu.Lock()
+	w.reading = false
+	if err == nil {
+		w.ackedAt = time.Now()
+		if acked > w.acked {
+			w.acked, w.progress = acked, w.ackedAt
+		}
 	}
-	return w.acked >= before, nil
+	w.ackMu.Unlock()
+	return acked, err
+}
+
+// prefetchWatermark starts one background watermark refresh before an upload
+// truly needs the ack, so the value is cached by the time await() checks it.
+// At most one watermark GET at a time and never more than one per
+// slotWatermarkTTL (the stale check).
+func (w *slotWriter) prefetchWatermark(seq int64) {
+	depth := int64(len(w.table.Slots))
+	margin := min(depth, max(depth/4, int64(slotWriteInflight)))
+	w.ackMu.Lock()
+	start := seq-depth+margin > w.acked && time.Since(w.ackedAt) >= slotWatermarkTTL && !w.reading
+	if start {
+		w.reading = true
+	}
+	w.ackMu.Unlock()
+	if !start {
+		return
+	}
+	go w.fetchWatermark()
 }
 
 // await waits for drained, for slotStallTimeout at most, or slotCloseGrace
