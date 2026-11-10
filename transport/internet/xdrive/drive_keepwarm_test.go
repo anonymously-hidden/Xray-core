@@ -55,7 +55,15 @@ func TestKeeperKeepsPoolFresh(t *testing.T) {
 	st.startKeeper()
 	defer st.Close()
 	deadline := time.Now().Add(2 * time.Second)
-	for ids.Load() == 0 && time.Now().Before(deadline) {
+	poolFresh := false
+	for time.Now().Before(deadline) {
+		st.poolMu.Lock()
+		n := len(st.idPool)
+		poolFresh = n > 0 && time.Since(st.idPool[0].at) < idPoolTTL
+		st.poolMu.Unlock()
+		if poolFresh {
+			break
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if ids.Load() == 0 {
@@ -64,12 +72,8 @@ func TestKeeperKeepsPoolFresh(t *testing.T) {
 	if tokens.Load() != 0 {
 		t.Fatalf("keeper fetched the token %d times despite a fresh cached token", tokens.Load())
 	}
-	st.poolMu.Lock()
-	n := len(st.idPool)
-	fresh := n > 0 && time.Since(st.idPool[0].at) < idPoolTTL
-	st.poolMu.Unlock()
-	if !fresh {
-		t.Fatalf("pool not kept fresh: %d ids", n)
+	if !poolFresh {
+		t.Fatal("pool not kept fresh")
 	}
 }
 
