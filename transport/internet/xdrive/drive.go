@@ -71,9 +71,6 @@ type laneKey struct{}
 // small reads/acks off the connection saturated by large transfers.
 type bodyKey struct{}
 
-// singleAttemptKey limits do() to one attempt, for hedged reads.
-type singleAttemptKey struct{}
-
 type attemptKey struct{}
 
 type driveStorage struct {
@@ -86,9 +83,10 @@ type driveStorage struct {
 	release    func()
 	// readHedge/budget are copied per instance so tests never mutate globals
 	// that other goroutines read.
-	readHedge      time.Duration
-	readHedgeMu    sync.Mutex
-	readSinceHedge int
+	readHedge       time.Duration
+	readHedgeMu     sync.Mutex
+	readHedgeTokens int
+	readHedgeCount  int
 }
 
 // driveShared is what the sessions of a storage have in common
@@ -119,11 +117,12 @@ type driveShared struct {
 	idMu sync.Mutex
 	ids  map[string]string
 
-	coolMu       sync.Mutex
-	coolUntil    time.Time
-	lastThrottle time.Time
-	throttle     atomic.Int64
-	timing       *timingAggregator
+	coolMu        sync.Mutex
+	coolUntil     time.Time
+	lastThrottle  time.Time
+	lastRateLimit time.Time
+	throttle      atomic.Int64
+	timing        *timingAggregator
 	idPoolState
 }
 
@@ -162,10 +161,11 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			ids:          make(map[string]string),
 			timing:       newTimingAggregator(),
 		},
-		client:    client,
-		inflight:  make(chan struct{}, driveMaxInflight),
-		reserved:  make(chan struct{}, driveReservedInflight),
-		readHedge: slotReadHedge,
+		client:          client,
+		inflight:        make(chan struct{}, driveMaxInflight),
+		reserved:        make(chan struct{}, driveReservedInflight),
+		readHedge:       slotReadHedge,
+		readHedgeTokens: 3,
 	}, nil
 }
 
@@ -175,12 +175,13 @@ func (s *driveStorage) session() Storage {
 	transport := &sessionTransport{pool: s.conns}
 	bulkTransport := &sessionTransport{pool: s.bulkConns}
 	return &driveStorage{
-		driveShared: s.driveShared,
-		client:      &http.Client{Transport: transport},
-		bulkClient:  &http.Client{Transport: bulkTransport},
-		inflight:    make(chan struct{}, driveMaxInflight),
-		reserved:    make(chan struct{}, driveReservedInflight),
-		readHedge:   s.readHedge,
+		driveShared:     s.driveShared,
+		client:          &http.Client{Transport: transport},
+		bulkClient:      &http.Client{Transport: bulkTransport},
+		inflight:        make(chan struct{}, driveMaxInflight),
+		reserved:        make(chan struct{}, driveReservedInflight),
+		readHedge:       s.readHedge,
+		readHedgeTokens: 3,
 		release: func() {
 			transport.Close()
 			bulkTransport.Close()
@@ -415,12 +416,8 @@ func retryableStatus(status int) bool {
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
 	backoff := s.backoff
 	var lastErr error
-	maxAttempts := driveMaxAttempts
-	if ctx.Value(singleAttemptKey{}) != nil {
-		maxAttempts = 1
-	}
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -635,6 +632,7 @@ func (s *driveStorage) cool() {
 	s.coolMu.Lock()
 	s.coolUntil = time.Now().Add(jitter(driveCooldown))
 	s.lastThrottle = time.Now()
+	s.lastRateLimit = time.Now()
 	s.coolMu.Unlock()
 }
 
@@ -648,6 +646,14 @@ func (s *driveStorage) lastThrottleAt() time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
 	return s.lastThrottle
+}
+
+// lastRateLimitAt is set only by cool() (403 rate limit / 429), not by attempt
+// timeouts, so a stall does not disable the read hedge.
+func (s *driveStorage) lastRateLimitAt() time.Time {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	return s.lastRateLimit
 }
 
 func (s *driveStorage) throttled() int64 {
@@ -1007,27 +1013,44 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	return nil
 }
 
-// readHedgeBudget allows at most one hedge per twenty description reads.
-func (s *driveStorage) readHedgeBudget() bool {
+// noteDescriptionRead accrues one hedge token per twenty description reads,
+// capped at six. Tokens are spent when a hedge timer fires, not when a read
+// starts, so a stalled read among fast ones can still be hedged.
+func (s *driveStorage) noteDescriptionRead() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
-	s.readSinceHedge++
-	if s.readSinceHedge >= 20 {
-		s.readSinceHedge = 0
+	s.readHedgeCount++
+	if s.readHedgeCount >= 20 {
+		s.readHedgeCount = 0
+		if s.readHedgeTokens < 6 {
+			s.readHedgeTokens++
+		}
+	}
+}
+
+// takeHedgeToken spends one token when the hedge timer fires.
+func (s *driveStorage) takeHedgeToken() bool {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	if s.readHedgeTokens > 0 {
+		s.readHedgeTokens--
 		return true
 	}
 	return false
 }
 
-// readDescHedged issues one description GET; if it is still pending after
-// readHedge, one identical GET goes over the bulk connection. Reads are
-// idempotent, so a duplicate GET carries no stale-write hazard. The first
-// definitive answer (200 or 404) wins and the loser's context is cancelled.
+// readDescHedged issues a description GET; if it is still pending after
+// readHedge and a budget token is available, one identical GET goes over the
+// bulk connection. Reads are idempotent, so a duplicate GET carries no
+// stale-write hazard. The first definitive answer (200 or 404) wins and the
+// loser's context is cancelled; if both fail the last error is returned. A
+// primary that finishes (error included) before the timer fires is returned as
+// is with no hedge.
 func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, []byte, error) {
-	single := context.WithValue(ctx, singleAttemptKey{}, true)
-	if s.readHedge <= 0 || s.bulkClient == nil || !s.readHedgeBudget() ||
-		s.cooling() || time.Since(s.lastThrottleAt()) <= 5*time.Second {
-		return s.do(single, http.MethodGet, target, "", nil)
+	s.noteDescriptionRead()
+	if s.readHedge <= 0 || s.bulkClient == nil ||
+		s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+		return s.do(ctx, http.MethodGet, target, "", nil)
 	}
 	type res struct {
 		status  int
@@ -1036,7 +1059,7 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 		hedge   bool
 	}
 	ch := make(chan res, 2)
-	ctx1, cancel1 := context.WithCancel(single)
+	ctx1, cancel1 := context.WithCancel(ctx)
 	defer cancel1()
 	go func() {
 		st, pl, e := s.do(ctx1, http.MethodGet, target, "", nil)
@@ -1049,11 +1072,15 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 		return r.status, r.payload, r.err
 	case <-timer.C:
 	}
+	if !s.takeHedgeToken() {
+		r := <-ch
+		return r.status, r.payload, r.err
+	}
 	kind := kindOtherRead
 	if ctx.Value(laneKey{}) != nil {
 		kind = kindHeadRead
 	}
-	ctx2, cancel2 := context.WithCancel(single)
+	ctx2, cancel2 := context.WithCancel(context.WithValue(ctx, bodyKey{}, true))
 	defer cancel2()
 	go func() {
 		st, pl, e := s.do(ctx2, http.MethodGet, target, "", nil)
