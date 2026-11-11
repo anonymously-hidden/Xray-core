@@ -78,6 +78,10 @@ type attemptKey struct{}
 // traffic.
 type cleanupKey struct{}
 
+// namesOnlyKey asks query() for ids and names without descriptions, for the
+// listings that never read Entry.Inline (resolveID, Delete children, collect).
+type namesOnlyKey struct{}
+
 // Cleanup is deliberately gentler than live traffic: few parallel deletes, a
 // low sustained rate, and retries that never cool the live path. The values are
 // copied into the storage at construction so tests tune their own instance.
@@ -765,11 +769,15 @@ type driveFile struct {
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
 	found := make(map[string]driveFile)
 	pageToken := ""
+	fields := "nextPageToken,files(id,name,description)"
+	if ctx.Value(namesOnlyKey{}) != nil {
+		fields = "nextPageToken,files(id,name)"
+	}
 
 	for {
 		params := url.Values{
 			"q":                         {"'" + quoteDriveValue(s.folder) + "' in parents and trashed = false and " + condition},
-			"fields":                    {"nextPageToken,files(id,name,description)"},
+			"fields":                    {fields},
 			"pageSize":                  {fmt.Sprint(drivePageSize)},
 			"supportsAllDrives":         {"true"},
 			"includeItemsFromAllDrives": {"true"},
@@ -814,7 +822,7 @@ func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, erro
 	if id, ok := s.cachedID(flat); ok {
 		return id, nil
 	}
-	found, err := s.query(ctx, "name = '"+quoteDriveValue(flat)+"'")
+	found, err := s.query(context.WithValue(ctx, namesOnlyKey{}, true), "name = '"+quoteDriveValue(flat)+"'")
 	if err != nil {
 		return "", err
 	}
@@ -1039,6 +1047,7 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	}
 
 	cleanupCtx := context.WithValue(ctx, cleanupKey{}, true)
+	cleanupCtx = context.WithValue(cleanupCtx, namesOnlyKey{}, true)
 	children, err := s.query(cleanupCtx, "name contains '"+quoteDriveValue(flat+flatSeparator)+"'")
 	if err != nil {
 		return err

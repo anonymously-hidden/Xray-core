@@ -507,6 +507,7 @@ func (l *Listener) collect() error {
 		return nil
 	}
 	ctx := context.WithValue(l.ctx, cleanupKey{}, true)
+	ctx = context.WithValue(ctx, namesOnlyKey{}, true)
 	sessions, err := l.storage.List(ctx, streamsDir)
 	if err != nil {
 		return err
