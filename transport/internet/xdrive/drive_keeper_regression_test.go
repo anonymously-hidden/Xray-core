@@ -56,6 +56,8 @@ func TestKeeperRegressionConfiguredPoolBound(t *testing.T) {
 				s.tokenMu.Lock()
 				s.trafficMu.Lock()
 				s.client, s.bulkClient, s.tokenClient = client, client, client
+				s.conns = newConnPool(nil, func(context.Context) *http.Client { return client })
+				s.bulkConns = s.conns
 				s.token, s.tokenExpiry = "fake-token", time.Now().Add(24*time.Hour)
 				s.filesURL = "https://memory.invalid/files"
 				s.lastTraffic, s.lastRequest = time.Now(), time.Now().Add(-3*time.Minute)

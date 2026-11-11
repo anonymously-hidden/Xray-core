@@ -13,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
@@ -1157,4 +1159,68 @@ func TestDialDefaultRingDepth(t *testing.T) {
 	for box.busy.Load() {
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func driveClock(t *testing.T, test func(*testing.T)) {
+	t.Helper()
+	log.Record(&log.GeneralMessage{Severity: log.Severity_Debug, Content: "xdrive local fake clock"})
+	synctest.Test(t, test)
+}
+
+func memoryResponse(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func memoryDrive(rt http.RoundTripper) *driveStorage {
+	client := &http.Client{Transport: rt}
+	return &driveStorage{
+		driveShared: &driveShared{
+			token: "fake", tokenExpiry: time.Now().Add(time.Hour),
+			tokenURL: "http://drive.invalid/token", tokenClient: client,
+			filesURL: "http://drive.invalid/files", uploadURL: "http://drive.invalid/upload",
+			folder: "fake-folder", backoff: time.Millisecond, ids: make(map[string]string),
+		},
+		client: client, inflight: make(chan struct{}, 64), reserved: make(chan struct{}, 8),
+	}
+}
+
+func TestKeeperWarmsSessionPools(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var made, requests [3]int
+		client := func(lane int) *http.Client {
+			made[lane]++
+			return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+				requests[lane]++
+				return memoryResponse(http.StatusOK, `{"id":"folder"}`), nil
+			})}
+		}
+		s := memoryDrive(client(0).Transport)
+		s.owner = s
+		s.conns = newConnPool(nil, func(context.Context) *http.Client { return client(1) })
+		s.bulkConns = newConnPool(nil, func(context.Context) *http.Client { return client(2) })
+		s.poolRing = 6
+		for i := range 18 {
+			s.idPool = append(s.idPool, idPoolEntry{id: fmt.Sprint(i), at: time.Now()})
+		}
+		start := time.Now()
+		s.lastTraffic, s.lastRequest = start, start
+		s.startKeeper()
+		defer s.Close()
+		synctest.Wait()
+		<-time.NewTimer(s.keepWarmEvery).C
+		synctest.Wait()
+		if requests != [3]int{0, 1, 1} || !s.lastTraffic.Equal(start) {
+			t.Fatalf("keeper requests=%v; maintenance counted as traffic=%v", requests, !s.lastTraffic.Equal(start))
+		}
+		session := s.session().(*driveStorage)
+		defer session.Close()
+		for _, ctx := range []context.Context{context.Background(), context.WithValue(context.Background(), bodyKey{}, true)} {
+			if _, _, err := session.do(ctx, http.MethodGet, s.filesURL, "", nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if made != [3]int{1, 1, 1} || requests != [3]int{0, 2, 2} {
+			t.Fatalf("session did not reuse both warmed pools: connections=%v requests=%v", made, requests)
+		}
+	})
 }

@@ -2,6 +2,8 @@ package xdrive
 
 import (
 	"context"
+	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -67,9 +69,43 @@ func (s *driveShared) stopKeeper() {
 	}
 }
 
+// Hold pooled transports across ticks so sessions can reuse the warmed sockets,
+// rather than warming only the owner's separate maintenance connection.
+func (s *driveShared) keeperStorage() *driveStorage {
+	warm := &driveStorage{
+		driveShared: s,
+		client:      s.owner.client,
+		inflight:    s.owner.inflight,
+		reserved:    s.owner.reserved,
+	}
+	var transports []*sessionTransport
+	if s.conns != nil {
+		t := &sessionTransport{pool: s.conns}
+		warm.client = &http.Client{Transport: t}
+		transports = append(transports, t)
+	}
+	if s.bulkConns != nil {
+		t := &sessionTransport{pool: s.bulkConns}
+		warm.bulkClient = &http.Client{Transport: t}
+		transports = append(transports, t)
+	}
+	warm.release = func() {
+		for _, t := range transports {
+			t.Close()
+		}
+	}
+	return warm
+}
+
 func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
 	t := time.NewTicker(s.keepWarmEvery)
 	defer t.Stop()
+	var warm *driveStorage
+	defer func() {
+		if warm != nil {
+			warm.Close()
+		}
+	}()
 	for {
 		select {
 		case <-runCtx.Done():
@@ -117,10 +153,26 @@ func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
 			}
 		}
 		s.poolMu.Unlock()
+		idle := err == nil && time.Since(lastRequest) > 2*time.Minute
+		if (idle || flight != nil) && warm == nil {
+			warm = s.keeperStorage()
+		}
 		if flight != nil {
-			o.refillIDs(ctx, flight, want)
+			warm.refillIDs(ctx, flight, want)
 			if flight.err != nil {
 				errors.LogDebug(ctx, "xdrive keep-warm ids: ", flight.err)
+			}
+		}
+		if idle && ctx.Err() == nil && (flight == nil || flight.err == nil) {
+			target := s.filesURL + "/" + url.PathEscape(s.folder) + "?fields=id&supportsAllDrives=true"
+			if s.conns != nil && flight == nil {
+				_, _, err = warm.do(ctx, http.MethodGet, target, "", nil)
+			}
+			if s.bulkConns != nil && ctx.Err() == nil {
+				_, _, err = warm.do(context.WithValue(ctx, bodyKey{}, true), http.MethodGet, target, "", nil)
+			}
+			if err != nil {
+				errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
 			}
 		}
 		cancel()
