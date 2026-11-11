@@ -73,6 +73,35 @@ type bodyKey struct{}
 
 type attemptKey struct{}
 
+// cleanupKey marks session-cleanup requests (the child deletions of Delete and
+// the Listener's drop/collect) so a rate limit they hit does not cool live
+// traffic.
+type cleanupKey struct{}
+
+// Cleanup is deliberately gentler than live traffic: few parallel deletes, a
+// low sustained rate, and retries that never cool the live path. The values are
+// copied into the storage at construction so tests tune their own instance.
+const (
+	cleanupParallel     = 2
+	cleanupRatePerSec   = 5.0
+	cleanupRetryDelay   = 2 * time.Second
+	cleanupMaxRetries   = 5
+	cleanupSessionPause = 1 * time.Second
+)
+
+// cleanupRateLimited is returned by do() when a cleanup request is rate limited.
+// The cleanup caller retries it later; live traffic is not cooled.
+type cleanupRateLimited struct{ detail string }
+
+func (e cleanupRateLimited) Error() string {
+	return "Drive rate limited a cleanup request: " + e.detail
+}
+
+func isCleanupRateLimited(err error) bool {
+	_, ok := err.(cleanupRateLimited)
+	return ok
+}
+
 type driveStorage struct {
 	*driveShared
 	// a session has a client and inflight of its own, see session
@@ -125,6 +154,16 @@ type driveShared struct {
 	timing        *timingAggregator
 	idPoolState
 
+	// cleanup token bucket and retry tuning, shared by the sessions of a
+	// storage; instance fields so tests never mutate package-level values.
+	cleanupMu         sync.Mutex
+	cleanupTokens     float64
+	cleanupAt         time.Time
+	cleanupRate       float64
+	cleanupParallel   int
+	cleanupRetryDelay time.Duration
+	cleanupMaxRetries int
+
 	// keep-warm keeper; intervals are instance fields so tests never mutate
 	// package-level values other goroutines read.
 	owner          *driveStorage
@@ -173,6 +212,11 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			backoff:      driveInitialBackoff,
 			ids:          make(map[string]string),
 			timing:       newTimingAggregator(),
+
+			cleanupRate:       cleanupRatePerSec,
+			cleanupParallel:   cleanupParallel,
+			cleanupRetryDelay: cleanupRetryDelay,
+			cleanupMaxRetries: cleanupMaxRetries,
 		},
 		client:          client,
 		inflight:        make(chan struct{}, driveMaxInflight),
@@ -610,6 +654,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			continue
 		}
 		if resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
+			if ctx.Value(cleanupKey{}) != nil {
+				return 0, nil, cleanupRateLimited{detail: string(payload)}
+			}
 			lastErr = errors.New("Drive is rate limiting: ", string(payload))
 			errors.LogWarning(ctx, "rate limited by Drive, attempt ",
 				attempt+1, " of ", driveMaxAttempts, ", ", method, " ", len(body),
@@ -619,6 +666,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
+			if resp.StatusCode == http.StatusTooManyRequests && ctx.Value(cleanupKey{}) != nil {
+				return 0, nil, cleanupRateLimited{detail: string(payload)}
+			}
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
@@ -909,6 +959,74 @@ func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
 	}
 }
 
+// waitCleanupSlot is a token bucket capping cleanup deletes at cleanupRate per
+// second per storage. It holds at most one token, so deletes are spaced rather
+// than bursty, and it honours ctx cancellation while waiting.
+func (s *driveStorage) waitCleanupSlot(ctx context.Context) error {
+	rate := s.cleanupRate
+	if rate <= 0 {
+		rate = cleanupRatePerSec
+	}
+	for {
+		s.cleanupMu.Lock()
+		now := time.Now()
+		if s.cleanupAt.IsZero() {
+			s.cleanupAt = now
+			s.cleanupTokens = 1
+		}
+		s.cleanupTokens = min(1, s.cleanupTokens+now.Sub(s.cleanupAt).Seconds()*rate)
+		s.cleanupAt = now
+		if s.cleanupTokens >= 1 {
+			s.cleanupTokens--
+			s.cleanupMu.Unlock()
+			return nil
+		}
+		wait := time.Duration((1 - s.cleanupTokens) / rate * float64(time.Second))
+		s.cleanupMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// deleteChild removes one child of a deleted prefix. A rate-limited attempt is
+// retried after a jittered delay, up to cleanupMaxRetries tries in total, then
+// reported as an ordinary error. Non-rate-limit errors are returned at once.
+func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
+	delay := s.cleanupRetryDelay
+	if delay <= 0 {
+		delay = cleanupRetryDelay
+	}
+	tries := s.cleanupMaxRetries
+	if tries <= 0 {
+		tries = cleanupMaxRetries
+	}
+	var last error
+	for attempt := 0; attempt < tries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(jitter(delay)):
+			}
+		}
+		if err := s.waitCleanupSlot(ctx); err != nil {
+			return err
+		}
+		err := s.deleteID(ctx, name, id)
+		if err == nil {
+			return nil
+		}
+		if !isCleanupRateLimited(err) {
+			return err
+		}
+		last = err
+	}
+	return errors.New("Drive cleanup deletion of ", name, " failed after ", tries, " tries").Base(last)
+}
+
 func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	flat := flatten(name)
 
@@ -920,11 +1038,16 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		return err
 	}
 
-	children, err := s.query(ctx, "name contains '"+quoteDriveValue(flat+flatSeparator)+"'")
+	cleanupCtx := context.WithValue(ctx, cleanupKey{}, true)
+	children, err := s.query(cleanupCtx, "name contains '"+quoteDriveValue(flat+flatSeparator)+"'")
 	if err != nil {
 		return err
 	}
-	sem := make(chan struct{}, 8)
+	parallel := s.cleanupParallel
+	if parallel <= 0 {
+		parallel = cleanupParallel
+	}
+	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var first error
@@ -934,7 +1057,7 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		go func(name, id string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := s.deleteID(ctx, name, id); err != nil {
+			if err := s.deleteChild(cleanupCtx, name, id); err != nil {
 				mu.Lock()
 				if first == nil {
 					first = err

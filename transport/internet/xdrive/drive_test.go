@@ -41,6 +41,16 @@ type fakeDrive struct {
 	tokenBody   string
 	uploadAt    []time.Time
 	hosts       map[string]bool
+
+	// cleanup-test instrumentation; inert unless a test sets deleteLimit or
+	// deleteDelay or reads the recorded slices.
+	deleteAt       []time.Time
+	deleteInflight int
+	deleteMax      int
+	deleteLimit    int
+	deleteLimited  int
+	deleteDelay    time.Duration
+	listFields     []string
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -212,6 +222,9 @@ func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
+	d.mu.Lock()
+	d.listFields = append(d.listFields, r.URL.Query().Get("fields"))
+	d.mu.Unlock()
 	if d.shouldFail("list") {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -252,10 +265,36 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/files/")
 
+	if r.Method == http.MethodDelete {
+		d.mu.Lock()
+		d.deleteInflight++
+		if d.deleteInflight > d.deleteMax {
+			d.deleteMax = d.deleteInflight
+		}
+		d.deleteAt = append(d.deleteAt, time.Now())
+		delay := d.deleteDelay
+		d.mu.Unlock()
+		defer func() {
+			d.mu.Lock()
+			d.deleteInflight--
+			d.mu.Unlock()
+		}()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+	}
+
 	d.mu.Lock()
 	file, ok := d.files[id]
+	rateLimit := false
 	if ok && r.Method == http.MethodDelete {
-		delete(d.files, id)
+		if d.deleteLimit > 0 {
+			d.deleteLimit--
+			d.deleteLimited++
+			rateLimit = true
+		} else {
+			delete(d.files, id)
+		}
 	}
 	var snapshot fakeFile
 	if ok {
@@ -269,6 +308,11 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodDelete {
+		if rateLimit {
+			w.WriteHeader(http.StatusForbidden)
+			w.Write([]byte(`{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`))
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

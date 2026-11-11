@@ -305,6 +305,10 @@ type Listener struct {
 	idleSince      map[string]time.Time
 	announceWarned map[string]bool
 	firstSeen      map[string]time.Time
+
+	// collectPause spaces the deletion of two collected sessions; set in Serve,
+	// zero for listeners built directly by tests.
+	collectPause time.Duration
 }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
@@ -330,6 +334,7 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 		idleSince:      make(map[string]time.Time),
 		announceWarned: make(map[string]bool),
 		firstSeen:      make(map[string]time.Time),
+		collectPause:   cleanupSessionPause,
 	}
 
 	go listener.acceptLoop(ctx)
@@ -446,7 +451,7 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 }
 
 func (l *Listener) drop(name string) {
-	l.storage.Delete(l.ctx, name)
+	l.storage.Delete(context.WithValue(l.ctx, cleanupKey{}, true), name)
 }
 
 func (l *Listener) claim(session string) bool {
@@ -497,7 +502,12 @@ func (l *Listener) collectLoop(logCtx context.Context) {
 }
 
 func (l *Listener) collect() error {
-	sessions, err := l.storage.List(l.ctx, streamsDir)
+	// Cleanup yields while live traffic is cooling, so it never piles on.
+	if c, ok := l.storage.(interface{ cooling() bool }); ok && c.cooling() {
+		return nil
+	}
+	ctx := context.WithValue(l.ctx, cleanupKey{}, true)
+	sessions, err := l.storage.List(ctx, streamsDir)
 	if err != nil {
 		return err
 	}
@@ -537,8 +547,15 @@ func (l *Listener) collect() error {
 	l.mu.Unlock()
 
 	var first error
-	for _, session := range expired {
-		if err := l.storage.Delete(l.ctx, sessionPrefix(session)); err != nil && first == nil {
+	for i, session := range expired {
+		if i > 0 && l.collectPause > 0 {
+			select {
+			case <-l.ctx.Done():
+				return l.ctx.Err()
+			case <-time.After(l.collectPause):
+			}
+		}
+		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil && first == nil {
 			first = err
 		}
 	}
