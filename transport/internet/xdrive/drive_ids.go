@@ -62,7 +62,9 @@ func (s *driveStorage) takeIDs(ctx context.Context, n, ringWorth int) ([]string,
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				case <-f.done:
-					if f.err != nil {
+					// A cold allocation belongs to its caller. Its cancellation
+					// must not cancel other sessions waiting for IDs.
+					if f.err != nil && f.err != context.Canceled && f.err != context.DeadlineExceeded {
 						return nil, f.err
 					}
 				}
@@ -173,7 +175,10 @@ func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
 func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
 	f.err = err
 	s.poolErr = err
-	if err != nil {
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		s.poolErr = nil
+		s.poolRetryAt = time.Time{}
+	} else if err != nil {
 		s.coolMu.Lock()
 		s.poolRetryAt = s.coolUntil
 		s.coolMu.Unlock()

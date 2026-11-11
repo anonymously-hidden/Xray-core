@@ -20,6 +20,7 @@ type Conn struct {
 	reader  chunkReader
 	onClose func()
 
+	readMu  sync.Mutex
 	readBuf []byte
 
 	readDeadline  *pipeDeadline
@@ -73,6 +74,9 @@ func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p 
 }
 
 func (c *Conn) Read(b []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
 	select {
 	case <-c.closing:
 		return 0, io.ErrClosedPipe

@@ -619,10 +619,8 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		resp, err := httpc.Do(req)
 		<-pool
 		respAt := time.Now()
-		if err != nil {
-			timedOut := attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
-			cancel()
-			if timedOut {
+		noteTimeout := func() {
+			if attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
 				s.throttle.Add(1)
 				s.coolMu.Lock()
 				s.lastThrottle = time.Now()
@@ -631,6 +629,10 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 					t.stalled(began)
 				}
 			}
+		}
+		if err != nil {
+			noteTimeout()
+			cancel()
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
 			}
@@ -644,6 +646,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			limit = v
 		}
 		payload, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		if err != nil {
+			noteTimeout()
+		}
 		resp.Body.Close()
 		cancel()
 		bodyEnd := time.Now()
