@@ -92,10 +92,10 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 	driveInitialBackoff = 5 * time.Millisecond
 
 	t.Cleanup(func() {
+		resetSharedStorage() // cancel/join workers before restoring their endpoints
 		driveTokenURL, driveFilesURL, driveUploadURL = previous[0], previous[1], previous[2]
 		driveInitialBackoff = previousBackoff
 		drive.server.Close()
-		resetSharedStorage()
 	})
 	return drive
 }
@@ -244,13 +244,7 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 
 	d.mu.Lock()
 	for _, file := range d.files {
-		match := false
-		switch {
-		case exact != "":
-			match = file.name == exact
-		case prefix != "":
-			match = strings.HasPrefix(file.name, prefix)
-		}
+		match := (exact != "" && file.name == exact) || (prefix != "" && strings.HasPrefix(file.name, prefix))
 		if match {
 			result.Files = append(result.Files, entry{
 				ID: file.id, Name: file.name, Description: file.description,
@@ -388,12 +382,12 @@ func (d *fakeDrive) count() int {
 
 func parseFakeQuery(query string) (exact, prefix string) {
 	if value, ok := cutQuoted(query, "name = '"); ok {
-		return value, ""
+		exact = value
 	}
 	if value, ok := cutQuoted(query, "name contains '"); ok {
-		return "", value
+		prefix = value
 	}
-	return "", ""
+	return exact, prefix
 }
 
 func cutQuoted(query, marker string) (string, bool) {
@@ -431,6 +425,7 @@ func newDriveBackend(t *testing.T) *driveStorage {
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	t.Cleanup(func() { storage.Close() })
 	return storage
 }
 

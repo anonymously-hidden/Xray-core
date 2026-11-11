@@ -81,12 +81,8 @@ func sniForSettings(t *testing.T, serverName string) string {
 		SecuritySettings: &tls.Config{ServerName: serverName},
 	}
 
-	prev := driveFilesURL
-	driveFilesURL = "https://www.googleapis.com/drive/v3/files"
-	defer func() { driveFilesURL = prev }()
-
 	client := newServiceClient(context.Background(), new(sync.Map), settings, 5*time.Second, 8)
-	req, err := http.NewRequest(http.MethodGet, driveFilesURL, nil)
+	req, err := http.NewRequest(http.MethodGet, "https://www.googleapis.com/drive/v3/files", nil)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -937,9 +933,11 @@ func TestDriveOverH3(t *testing.T) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 	// one for the listener to www.googleapis.com, one for the token to
-	// oauth2.googleapis.com and one of XMUX for each end of the session
-	if len(rec.conns) != 4 {
-		t.Errorf("%d connections went through the mask, want 4", len(rec.conns))
+	// oauth2.googleapis.com and one of XMUX for each end of the session; the
+	// 300 KB burst needs more than the free tokens of inline frames, so it goes
+	// as one media frame and may add a bulk-lane connection at each end
+	if n := len(rec.conns); n < 4 || n > 6 {
+		t.Errorf("%d connections went through the mask, want 4 to 6", n)
 	}
 	for i, conn := range rec.conns {
 		conn.mu.Lock()

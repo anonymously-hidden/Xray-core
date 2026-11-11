@@ -72,18 +72,17 @@ func paramsFromConfig(c *Config) params {
 // is a slotStore and only to fields the config leaves at 0; wal-based backends
 // keep the defaults above because their concurrency and flush mean other things
 func paramsForStorage(c *Config, storage Storage) params {
+	p := paramsFromConfig(c)
 	if _, ok := storage.(slotStore); ok {
-		cc := *c
-		if cc.Concurrency == 0 {
-			cc.Concurrency = 64
+		if c.Concurrency == 0 {
+			p.concurrency = 64
 		}
-		if cc.FlushIntervalMs == 0 {
-			cc.FlushIntervalMs = 10
+		if c.FlushIntervalMs == 0 {
+			p.flushInterval = 10 * time.Millisecond
 		}
-		if cc.MaxPollIntervalMs == 0 {
-			cc.MaxPollIntervalMs = 200
+		if c.MaxPollIntervalMs == 0 {
+			p.maxPollInterval = max(200*time.Millisecond, p.minPollInterval)
 		}
-		c = &cc
 	}
-	return paramsFromConfig(c)
+	return p
 }

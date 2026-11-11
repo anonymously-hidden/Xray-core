@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -147,8 +148,9 @@ type driveShared struct {
 	tokenBackoff  time.Duration
 	lastTokenErr  error
 
-	idMu sync.Mutex
-	ids  map[string]string
+	idMu   sync.Mutex
+	ids    map[string]string
+	dupIDs map[string][]string
 
 	coolMu        sync.Mutex
 	coolUntil     time.Time
@@ -176,10 +178,17 @@ type driveShared struct {
 	trafficMu      sync.Mutex
 	lastTraffic    time.Time
 	lastRequest    time.Time
-	keeperOnce     sync.Once
-	keeperStopOnce sync.Once
-	keeperStop     chan struct{}
+	keeperMu       sync.Mutex
+	keeperRunning  bool
+	keeperClosed   bool
+	keeperCancel   context.CancelFunc
 	keeperDone     chan struct{}
+
+	workMu     sync.Mutex
+	workCtx    context.Context
+	workCancel context.CancelFunc
+	workWG     sync.WaitGroup
+	workClosed bool
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -231,7 +240,8 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	st.driveShared.owner = st
 	st.driveShared.keepWarmEvery = 4 * time.Minute
 	st.driveShared.keepWarmWindow = 3 * time.Hour
-	st.startKeeper()
+	st.driveShared.poolRing = 2 * (max(paramsForStorage(config, st).concurrency, 2) + 1)
+	st.noteTraffic()
 	return st, nil
 }
 
@@ -276,7 +286,14 @@ func isAuthError(err error) bool {
 }
 
 func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	s.tokenMu.Lock()
+	if s.isWorkClosed() {
+		s.tokenMu.Unlock()
+		return "", context.Canceled
+	}
 	if s.authErr != nil {
 		err := s.authErr
 		s.tokenMu.Unlock()
@@ -284,8 +301,10 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
 		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && !s.refreshing && time.Now().After(s.tokenRetryAt) {
-			s.refreshing = true
-			go s.refreshTokenBackground()
+			if refreshCtx, finish, ok := s.beginWork(30 * time.Second); ok {
+				s.refreshing = true
+				go func() { defer finish(); s.refreshTokenBackground(refreshCtx) }()
+			}
 		}
 		token := s.token
 		s.tokenMu.Unlock()
@@ -309,36 +328,43 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	f := &tokenFlight{done: make(chan struct{})}
+	fetchCtx, finish, ok := s.beginWork(30 * time.Second)
+	if !ok {
+		s.tokenMu.Unlock()
+		return "", context.Canceled
+	}
 	s.flight = f
 	s.tokenMu.Unlock()
 
-	// The shared fetch must outlive any single waiter's cancellation.
-	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-	token, lifetime, err := s.fetchToken(fetchCtx)
-	cancel()
+	go func() {
+		defer finish()
+		token, lifetime, err := s.fetchToken(fetchCtx)
 
-	s.tokenMu.Lock()
-	s.flight = nil
-	f.token, f.lifetime, f.err = token, lifetime, err
-	if err != nil {
-		s.lastTokenErr = err
-		if isAuthError(err) {
-			s.authErr = err
-			errors.LogError(ctx, err)
+		s.tokenMu.Lock()
+		s.flight = nil
+		f.token, f.lifetime, f.err = token, lifetime, err
+		if err != nil {
+			s.lastTokenErr = err
+			if isAuthError(err) {
+				s.authErr = err
+				errors.LogError(ctx, err)
+			}
+			s.noteTokenFailure()
+		} else {
+			s.storeToken(token, lifetime)
+			s.tokenBackoff = 0
+			s.tokenRetryAt = time.Time{}
+			s.lastTokenErr = nil
 		}
-		s.noteTokenFailure()
-	} else {
-		s.storeToken(token, lifetime)
-		s.tokenBackoff = 0
-		s.tokenRetryAt = time.Time{}
-		s.lastTokenErr = nil
+		close(f.done)
+		s.tokenMu.Unlock()
+	}()
+	select {
+	case <-f.done:
+		return f.token, f.err
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	close(f.done)
-	s.tokenMu.Unlock()
-	if err != nil {
-		return "", err
-	}
-	return token, nil
 }
 
 // noteTokenFailure backs off further token fetches so a failing endpoint is
@@ -362,9 +388,7 @@ func (s *driveStorage) storeToken(token string, lifetime time.Duration) {
 	s.tokenExpiry = time.Now().Add(expiry)
 }
 
-func (s *driveStorage) refreshTokenBackground() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+func (s *driveStorage) refreshTokenBackground(ctx context.Context) {
 	token, lifetime, err := s.fetchToken(ctx)
 
 	s.tokenMu.Lock()
@@ -481,7 +505,7 @@ func retryableStatus(status int) bool {
 }
 
 func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
-	defer s.noteTraffic()
+	defer s.noteRequest(ctx)
 	backoff := s.backoff
 	var lastErr error
 
@@ -603,7 +627,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				s.coolMu.Lock()
 				s.lastThrottle = time.Now()
 				s.coolMu.Unlock()
-				if t, ok := s.client.Transport.(*sessionTransport); ok {
+				if t, ok := httpc.Transport.(*sessionTransport); ok {
 					t.stalled(began)
 				}
 			}
@@ -742,15 +766,37 @@ func (s *driveStorage) invalidateToken(used string) {
 	s.tokenMu.Unlock()
 }
 
-func (s *driveStorage) rememberID(name, id string) {
+const idCacheMax = 4096
+
+// rememberID caches the id of name, and those of any further objects that
+// share it, so that Delete can remove them all
+func (s *driveStorage) rememberID(name, id string, extra []string) {
 	s.idMu.Lock()
+	if _, ok := s.ids[name]; !ok && len(s.ids) >= idCacheMax {
+		for victim := range s.ids {
+			delete(s.ids, victim)
+			delete(s.dupIDs, victim)
+			if len(s.ids) < idCacheMax {
+				break
+			}
+		}
+	}
 	s.ids[name] = id
+	if len(extra) > 0 {
+		if s.dupIDs == nil {
+			s.dupIDs = make(map[string][]string)
+		}
+		s.dupIDs[name] = extra
+	} else {
+		delete(s.dupIDs, name)
+	}
 	s.idMu.Unlock()
 }
 
 func (s *driveStorage) forgetID(name string) {
 	s.idMu.Lock()
 	delete(s.ids, name)
+	delete(s.dupIDs, name)
 	s.idMu.Unlock()
 }
 
@@ -764,6 +810,7 @@ func (s *driveStorage) cachedID(name string) (string, bool) {
 type driveFile struct {
 	id          string
 	description string
+	extra       []string // ids of other objects under the same name
 }
 
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
@@ -807,15 +854,34 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 		}
 
 		for _, file := range parsed.Files {
+			if prev, ok := found[file.Name]; ok {
+				prev.extra = append(prev.extra, file.ID)
+				found[file.Name] = prev
+				continue
+			}
 			found[file.Name] = driveFile{id: file.ID, description: file.Description}
-			s.rememberID(file.Name, file.ID)
 		}
 
 		pageToken = parsed.NextPageToken
 		if pageToken == "" {
+			for name, file := range found {
+				s.rememberID(name, file.id, file.extra)
+			}
 			return found, nil
 		}
 	}
+}
+
+// resolveIDs is every id under the exact name
+func (s *driveStorage) resolveIDs(ctx context.Context, flat string) ([]string, error) {
+	found, err := s.query(context.WithValue(ctx, namesOnlyKey{}, true), "name = '"+quoteDriveValue(flat)+"'")
+	if err != nil {
+		return nil, err
+	}
+	if file, ok := found[flat]; ok {
+		return append([]string{file.id}, file.extra...), nil
+	}
+	return nil, errNotFound
 }
 
 func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, error) {
@@ -873,9 +939,6 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return "", errors.New("failed to parse the Drive upload response").Base(err)
 	}
-	if parsed.ID != "" {
-		s.rememberID(flat, parsed.ID)
-	}
 	return parsed.ID, nil
 }
 
@@ -916,9 +979,6 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return errors.New("failed to parse the Drive upload response").Base(err)
-	}
-	if parsed.ID != "" {
-		s.rememberID(flat, parsed.ID)
 	}
 	return nil
 }
@@ -1017,7 +1077,7 @@ func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(jitter(delay)):
+			case <-time.After(delay + jitter(delay)):
 			}
 		}
 		if err := s.waitCleanupSlot(ctx); err != nil {
@@ -1037,20 +1097,38 @@ func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
 
 func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	flat := flatten(name)
-
-	if id, err := s.resolveID(ctx, flat); err == nil {
-		if err := s.deleteID(ctx, flat, id); err != nil {
-			return err
-		}
-	} else if err != errNotFound {
-		return err
+	remove := s.deleteID
+	if ctx.Value(cleanupKey{}) != nil {
+		remove = s.deleteChild
 	}
 
 	cleanupCtx := context.WithValue(ctx, cleanupKey{}, true)
 	cleanupCtx = context.WithValue(cleanupCtx, namesOnlyKey{}, true)
-	children, err := s.query(cleanupCtx, "name contains '"+quoteDriveValue(flat+flatSeparator)+"'")
+	// A cached name is not an exhaustive listing: retries can create duplicates
+	// after it was cached. Discover exact and descendant IDs in one paginated
+	// listing, retaining cached IDs as well for objects not yet list-visible.
+	s.idMu.Lock()
+	var exact []string
+	if id, ok := s.ids[flat]; ok {
+		exact = append([]string{id}, s.dupIDs[flat]...)
+	}
+	s.idMu.Unlock()
+	children, err := s.query(cleanupCtx, "(name = '"+quoteDriveValue(flat)+"' or name contains '"+quoteDriveValue(flat+flatSeparator)+"')")
 	if err != nil {
 		return err
+	}
+	if file, ok := children[flat]; ok {
+		for _, id := range append([]string{file.id}, file.extra...) {
+			if !slices.Contains(exact, id) {
+				exact = append(exact, id)
+			}
+		}
+		delete(children, flat)
+	}
+	for _, id := range exact {
+		if err := remove(ctx, flat, id); err != nil {
+			return err
+		}
 	}
 	parallel := s.cleanupParallel
 	if parallel <= 0 {
@@ -1063,17 +1141,19 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	for childName, file := range children {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(name, id string) {
+		go func(name string, ids []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := s.deleteChild(cleanupCtx, name, id); err != nil {
-				mu.Lock()
-				if first == nil {
-					first = err
+			for _, id := range ids {
+				if err := s.deleteChild(cleanupCtx, name, id); err != nil {
+					mu.Lock()
+					if first == nil {
+						first = err
+					}
+					mu.Unlock()
 				}
-				mu.Unlock()
 			}
-		}(childName, file.id)
+		}(childName, append([]string{file.id}, file.extra...))
 	}
 	wg.Wait()
 	return first
@@ -1119,6 +1199,7 @@ func (s *driveStorage) Close() error {
 	if s.release != nil {
 		s.release()
 	} else {
+		s.closeWork()
 		s.stopKeeper()
 		if s.timing != nil {
 			s.timing.stop()

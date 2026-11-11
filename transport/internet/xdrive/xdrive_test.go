@@ -70,11 +70,7 @@ func pairWith(t *testing.T, streamSettings *internet.MemoryStreamConfig) (client
 
 	return client, server, func() {
 		if config, err := streamConfig(streamSettings); err == nil {
-			box := spareBoxFor(config)
-			box.stop.Store(true)
-			for box.busy.Load() {
-				time.Sleep(10 * time.Millisecond)
-			}
+			stopSpares(config)
 		}
 		client.Close()
 		server.Close()
@@ -602,6 +598,7 @@ func TestInlinePayload(t *testing.T) {
 // both ways over each and closes them
 func runSessions(t *testing.T, streamSettings *internet.MemoryStreamConfig, n int) {
 	t.Helper()
+	defer stopSpares(streamSettings.ProtocolSettings.(*Config))
 
 	accepted := make(chan stat.Connection, 1)
 	listener, err := Serve(context.Background(), net.LocalHostIP, net.Port(0), streamSettings, func(conn stat.Connection) {

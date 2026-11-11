@@ -19,8 +19,9 @@ func keepWarmStorage(t *testing.T, every, window time.Duration) (*driveStorage, 
 			w.Write([]byte(`{"access_token":"t","expires_in":3600}`))
 		default:
 			ids.Add(1)
+			count, _ := strconv.Atoi(r.URL.Query().Get("count"))
 			out := `{"ids":[`
-			for i := 0; i < 130; i++ {
+			for i := 0; i < count; i++ {
 				if i > 0 {
 					out += ","
 				}

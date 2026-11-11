@@ -26,6 +26,9 @@ import (
 
 var errStalled = errors.New("the request made no progress")
 
+// Nil in production; tests reject external targets before resolution or dialing.
+var testServiceDial func(net.Destination) error
+
 type serviceTransport struct {
 	plain  http.RoundTripper
 	secure http.RoundTripper
@@ -164,10 +167,15 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 				target.Port = fronting.Port
 			}
 		}
+		if testServiceDial != nil {
+			if err := testServiceDial(target); err != nil {
+				return nil, host, err
+			}
+		}
 
 		var conn net.Conn
 		switch {
-		case streamSettings.FinalMask == nil:
+		case streamSettings == nil || streamSettings.FinalMask == nil:
 			conn, err = internet.DialSystem(ctx, target, sockopt)
 		case target.Network == net.Network_UDP:
 			conn, err = streamSettings.FinalMask.DialUDP(ctx, target)
@@ -365,11 +373,17 @@ type connPool struct {
 }
 
 func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Context) *http.Client) *connPool {
-	var xmuxConfig splithttp.XmuxConfig
-	if config != nil {
-		xmuxConfig = *config
+	if config == nil {
+		config = &splithttp.XmuxConfig{}
 	}
-	return &connPool{xmux: splithttp.NewXmuxManager(xmuxConfig, func() splithttp.XmuxConn {
+	return &connPool{xmux: splithttp.NewXmuxManager(splithttp.XmuxConfig{
+		MaxConcurrency:   config.MaxConcurrency,
+		MaxConnections:   config.MaxConnections,
+		CMaxReuseTimes:   config.CMaxReuseTimes,
+		HMaxRequestTimes: config.HMaxRequestTimes,
+		HMaxReusableSecs: config.HMaxReusableSecs,
+		HKeepAlivePeriod: config.HKeepAlivePeriod,
+	}, func() splithttp.XmuxConn {
 		ctx, cancel := context.WithCancel(context.Background())
 		return &poolConn{next: newClient(ctx).Transport, cancel: cancel}
 	})}

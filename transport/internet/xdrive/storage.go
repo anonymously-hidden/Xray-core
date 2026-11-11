@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
+	"github.com/xtls/xray-core/transport/internet/tls"
 )
 
 var errNotFound = errors.New("object not found")
@@ -84,30 +87,49 @@ var (
 )
 
 func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) string {
-	parts := []string{config.Service, config.RemoteFolder}
+	// Encode only configuration, not protobuf runtime state or transport caches.
+	// JSON provides field/element boundaries (unlike NUL-joined strings), with
+	// deterministic map ordering. These concrete config types contain no funcs.
+	profile := struct {
+		Service, Folder, Template, SecurityType, Destination string
+		Secrets                                              []string
+		S3                                                   *S3Config
+		TLS                                                  *tls.Config
+		Socket                                               *internet.SocketConfig
+		QUIC                                                 *internet.QuicParams
+		XMUX                                                 *splithttp.XmuxConfig
+		HasFinalMask                                         bool
+	}{Service: config.Service, Folder: config.RemoteFolder, Secrets: config.Secrets,
+		Template: config.Template, XMUX: config.Xmux}
 	if config.S3 != nil {
-		parts = append(parts, config.S3.Endpoint, s3Region(config.S3.Region), config.S3.Bucket)
-		if config.S3.PathStyle {
-			parts = append(parts, "path-style")
-		} else {
-			parts = append(parts, "virtual-hosted-style")
-		}
+		profile.S3 = &S3Config{Endpoint: config.S3.Endpoint, Region: s3Region(config.S3.Region),
+			Bucket: config.S3.Bucket, PathStyle: config.S3.PathStyle}
 	}
-	parts = append(parts, config.Secrets...)
 	if streamSettings != nil {
-		parts = append(parts, streamSettings.SecurityType)
+		profile.SecurityType = streamSettings.SecurityType
+		profile.TLS = tls.ConfigFromStreamSettings(streamSettings)
+		profile.Socket, profile.QUIC = streamSettings.SocketSettings, streamSettings.QuicParams
+		// Different non-nil masks remain unresolved: FinalMask exposes neither
+		// stable configuration nor its wrappers. Never hash runtime pointers.
+		profile.HasFinalMask = streamSettings.FinalMask != nil
 		if streamSettings.Destination != nil {
-			parts = append(parts, streamSettings.Destination.NetAddr())
+			profile.Destination = streamSettings.Destination.String()
 		}
 	}
-	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
-	return hex.EncodeToString(sum[:])
+	h := sha256.New()
+	common.Must(json.NewEncoder(h).Encode(profile))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func resetSharedStorage() {
+	stopAllSpares()
 	sharedMu.Lock()
+	old := shared
 	shared = make(map[string]Storage)
 	sharedMu.Unlock()
+	for _, storage := range old {
+		storage.Close()
+	}
 }
 
 func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, build func() (Storage, error)) (Storage, error) {

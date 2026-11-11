@@ -71,6 +71,12 @@ func newWALWriter(ctx context.Context, storage Storage, prefix string, p params)
 }
 
 func (w *walWriter) Write(p []byte) (int, error) {
+	return w.writeUntil(p, nil, nil)
+}
+
+// writeUntil is Write that gives up with errWriteStopped, having returned the
+// bytes it took into buf, once either channel is closed
+func (w *walWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -81,13 +87,25 @@ func (w *walWriter) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	w.buf = append(w.buf, p...)
-	for len(w.buf) >= w.segmentBytes {
-		if err := w.flushLocked(); err != nil {
-			return 0, err
+	accepted := 0
+	for len(p) > 0 {
+		if w.err != nil {
+			return accepted, w.err
+		}
+		if w.closed {
+			return accepted, io.ErrClosedPipe
+		}
+		n := min(len(p), w.segmentBytes-len(w.buf))
+		w.buf = append(w.buf, p[:n]...)
+		accepted += n
+		p = p[n:]
+		for len(w.buf) >= w.segmentBytes {
+			if err := w.flushLocked(deadline, closing); err != nil {
+				return accepted, err
+			}
 		}
 	}
-	return len(p), nil
+	return accepted, nil
 }
 
 func (w *walWriter) flushLoop() {
@@ -101,7 +119,7 @@ func (w *walWriter) flushLoop() {
 		case <-ticker.C:
 			w.mu.Lock()
 			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
-				w.flushLocked()
+				w.flushLocked(nil, nil)
 			}
 			done := w.closed || w.err != nil
 			w.mu.Unlock()
@@ -124,11 +142,40 @@ func (w *walWriter) readyToFlush() bool {
 	return true
 }
 
-func (w *walWriter) flushLocked() error {
+// flushLocked takes an upload permit before it cuts a segment, waiting without
+// w.mu, so a store that falls behind holds Write back instead of piling up
+// goroutines and chunks. Either stop channel, when closed, ends the wait with
+// errWriteStopped
+func (w *walWriter) flushLocked(deadline, closing <-chan struct{}) error {
 	if len(w.buf) == 0 {
 		return nil
 	}
 	if w.err != nil {
+		return w.err
+	}
+	select {
+	case <-deadline:
+		return errWriteStopped
+	case <-closing:
+		return errWriteStopped
+	default:
+	}
+	w.mu.Unlock()
+	select {
+	case w.sem <- struct{}{}:
+	case <-w.ctx.Done():
+		w.mu.Lock()
+		return w.ctx.Err()
+	case <-deadline:
+		w.mu.Lock()
+		return errWriteStopped
+	case <-closing:
+		w.mu.Lock()
+		return errWriteStopped
+	}
+	w.mu.Lock()
+	if w.err != nil || len(w.buf) == 0 {
+		<-w.sem
 		return w.err
 	}
 
@@ -157,12 +204,6 @@ func (w *walWriter) flushLocked() error {
 
 func (w *walWriter) upload(seq int64, chunk []byte) {
 	defer w.wg.Done()
-
-	select {
-	case w.sem <- struct{}{}:
-	case <-w.ctx.Done():
-		return
-	}
 	defer func() { <-w.sem }()
 
 	if err := w.storage.Put(w.ctx, objectName(w.prefix, seq, segSuffix), chunk); err != nil {
@@ -183,7 +224,9 @@ func (w *walWriter) Close() error {
 	}
 	w.closed = true
 	for len(w.buf) > 0 && w.err == nil {
-		w.flushLocked()
+		if err := w.flushLocked(nil, nil); err != nil {
+			break
+		}
 	}
 	w.mu.Unlock()
 

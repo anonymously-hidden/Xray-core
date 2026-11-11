@@ -492,6 +492,7 @@ func TestTakeSpareSkipsStale(t *testing.T) {
 		t.Fatal(err)
 	}
 	box := spareBoxFor(cfg)
+	t.Cleanup(func() { stopSpares(cfg) })
 	box.ch <- spareRing{storage: st1, session: "old", at: time.Now().Add(-time.Hour)}
 	box.ch <- spareRing{storage: st2, session: "new", at: time.Now()}
 	got, ok := takeSpare(cfg, p)
@@ -512,7 +513,7 @@ func TestDropSpareDeletesSession(t *testing.T) {
 	if err := st.Put(context.Background(), name, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	dropSpare(spareRing{storage: st, session: "gone"})
+	dropSpare(context.Background(), spareRing{storage: st, session: "gone"})
 	if got, _ := st.List(context.Background(), sessionPrefix("gone")); len(got) != 0 {
 		t.Fatalf("%d entries left of a dropped spare", len(got))
 	}
@@ -770,7 +771,7 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 	for _, c := range []struct {
 		pieces int
 		media  bool
-	}{{20, false}, {30, true}} {
+	}{{12, false}, {13, true}} {
 		store := newMemSlots()
 		client, server := slotPair(t, store, 16, 512<<10)
 		payload := randomPayload(c.pieces * slotInlineLimit)

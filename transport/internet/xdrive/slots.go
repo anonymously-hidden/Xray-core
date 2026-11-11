@@ -239,6 +239,8 @@ func readWatermark(ctx context.Context, store slotStore, id string, lazy bool) (
 	return strconv.ParseInt(d, 10, 64)
 }
 
+var errWriteStopped = errors.New("write stopped")
+
 type slotWriter struct {
 	ctx   context.Context
 	store slotStore
@@ -255,11 +257,16 @@ type slotWriter struct {
 	full     int
 	lastSize int
 	held     int
+	flushing bool // a flush is waiting for a token with mu released
 	closed   bool
 	err      error
 	first    chan []byte
 	lazy     bool
 	created  []bool
+	gates    []chan struct{} // completion of the last assigned write to each physical slot
+
+	ackRetry     time.Duration
+	watermarkTTL time.Duration
 
 	// ackMu guards acked/ackedAt/progress/reading only; the watermark GET runs
 	// without the lock, single-flight, so other uploads never block on it.
@@ -281,6 +288,10 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		acked:    -1,
 		progress: time.Now(),
 		lazy:     table.lazy,
+		gates:    make([]chan struct{}, len(table.Slots)),
+
+		ackRetry:     slotAckRetry,
+		watermarkTTL: slotWatermarkTTL,
 	}
 	if w.lazy {
 		w.created = make([]bool, len(table.Slots))
@@ -289,9 +300,26 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 	return w
 }
 
+func (w *slotWriter) applyGrowLocked() {
+	for w.full >= inlineRampSegments && w.size < w.segmentBytes {
+		w.full -= inlineRampSegments
+		w.size = min(2*w.size, w.segmentBytes)
+	}
+	if w.size >= w.segmentBytes {
+		w.full = 0
+	}
+}
+
 func (w *slotWriter) Write(p []byte) (int, error) {
+	return w.writeUntil(p, nil, nil)
+}
+
+// writeUntil is Write that gives up with errWriteStopped, having returned the
+// bytes it took into buf, once either channel is closed
+func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.applyGrowLocked()
 
 	if w.err != nil {
 		return 0, w.err
@@ -300,13 +328,25 @@ func (w *slotWriter) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	w.buf = append(w.buf, p...)
-	for len(w.buf) >= w.size {
-		if err := w.flushLocked(); err != nil {
-			return 0, err
+	accepted := 0
+	for len(p) > 0 {
+		if w.err != nil {
+			return accepted, w.err
+		}
+		if w.closed {
+			return accepted, io.ErrClosedPipe
+		}
+		n := min(len(p), w.segmentBytes-len(w.buf))
+		w.buf = append(w.buf, p[:n]...)
+		accepted += n
+		p = p[n:]
+		for len(w.buf) >= w.size {
+			if err := w.flushLocked(deadline, closing); err != nil {
+				return accepted, err
+			}
 		}
 	}
-	return len(p), nil
+	return accepted, nil
 }
 
 func (w *slotWriter) flushLoop() {
@@ -319,8 +359,11 @@ func (w *slotWriter) flushLoop() {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
-				w.flushLocked()
+			if !w.flushing {
+				w.applyGrowLocked()
+			}
+			if !w.closed && w.err == nil && !w.flushing && len(w.buf) > 0 && w.readyToFlush() {
+				w.flushLocked(nil, nil)
 			}
 			done := w.closed || w.err != nil
 			w.mu.Unlock()
@@ -349,16 +392,34 @@ func (w *slotWriter) readyToFlush() bool {
 
 // flushLocked sends a segment off buf once a slot is free, which it waits for
 // without w.mu, so that a reader that falls behind holds Write back. w.mu is
-// held
-func (w *slotWriter) flushLocked() error {
+// held. Either stop channel, when closed, ends the wait with errWriteStopped
+func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
+	select {
+	case <-deadline:
+		return errWriteStopped
+	case <-closing:
+		return errWriteStopped
+	default:
+	}
+	// A second flusher taking a token while this one waits would make the
+	// token count look busier than the batch is when it is cut.
+	w.flushing = true
 	w.mu.Unlock()
+	var stopped error
 	select {
 	case w.slots <- struct{}{}:
 	case <-w.ctx.Done():
-		w.mu.Lock()
-		return w.ctx.Err()
+		stopped = w.ctx.Err()
+	case <-deadline:
+		stopped = errWriteStopped
+	case <-closing:
+		stopped = errWriteStopped
 	}
 	w.mu.Lock()
+	w.flushing = false
+	if stopped != nil {
+		return stopped
+	}
 	if w.err != nil || len(w.buf) == 0 {
 		<-w.slots
 		return w.err
@@ -374,14 +435,15 @@ func (w *slotWriter) flushLocked() error {
 		// a burst goes at the full size at once
 		n = min(len(w.buf), w.segmentBytes)
 	}
-	if n > slotInlineLimit && len(w.buf) <= 2*cap(w.slots)*slotInlineLimit {
-		n = slotInlineLimit
+	// Count the token acquired above as available to this batch. Fan out
+	// inline only if the whole buffer fits without waiting for an upload, and
+	// once the size has ramped only for data below one segment.
+	free := cap(w.slots) - len(w.slots) + 1
+	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free && (w.size <= slotInlineLimit || len(w.buf) < w.size) {
+		n = min(len(w.buf), slotInlineLimit, w.segmentBytes)
 	}
-	if n == w.size && w.size < w.segmentBytes {
-		if w.full++; w.full == inlineRampSegments {
-			w.full = 0
-			w.size = min(2*w.size, w.segmentBytes)
-		}
+	if n >= w.size && w.size < w.segmentBytes {
+		w.full += n / w.size
 	}
 
 	chunk := bytes.Clone(w.buf[:n])
@@ -397,8 +459,11 @@ func (w *slotWriter) flushLocked() error {
 	w.lastSize = len(w.buf)
 	w.held = 0
 
+	idx := int(seq % int64(len(w.table.Slots)))
+	prev, done := w.gates[idx], make(chan struct{})
+	w.gates[idx] = done
 	w.wg.Add(1)
-	go w.upload(seq, chunk)
+	go w.upload(seq, chunk, prev, done)
 	return nil
 }
 
@@ -406,9 +471,10 @@ func (w *slotWriter) slotID(seq int64) string {
 	return w.table.Slots[seq%int64(len(w.table.Slots))]
 }
 
-func (w *slotWriter) upload(seq int64, chunk []byte) {
+func (w *slotWriter) upload(seq int64, chunk []byte, prev, done chan struct{}) {
 	defer w.wg.Done()
 	defer func() { <-w.slots }()
+	defer close(done)
 
 	mode := byte(slotMedia)
 	if len(chunk) <= slotInlineLimit {
@@ -419,6 +485,17 @@ func (w *slotWriter) upload(seq int64, chunk []byte) {
 	if err := w.await(seq); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
+	}
+	// A seeded first frame can be acknowledged before its upload finishes.
+	// The watermark permits reuse, but only this gate orders physical writes
+	// (including lazy creation and an error marker) across laps.
+	if prev != nil {
+		select {
+		case <-prev:
+		case <-w.ctx.Done():
+			w.fail(w.ctx.Err())
+			return
+		}
 	}
 	awaited := time.Since(began)
 	putAt := time.Now()
@@ -468,7 +545,7 @@ func (w *slotWriter) drained(seq int64) (bool, error) {
 		w.ackMu.Unlock()
 		return true, nil
 	}
-	if time.Since(w.ackedAt) < slotWatermarkTTL || w.reading {
+	if time.Since(w.ackedAt) < w.watermarkTTL || w.reading {
 		w.ackMu.Unlock()
 		return false, nil
 	}
@@ -508,7 +585,7 @@ func (w *slotWriter) prefetchWatermark(seq int64) {
 	depth := int64(len(w.table.Slots))
 	margin := min(depth, max(depth/4, int64(slotWriteInflight)))
 	w.ackMu.Lock()
-	start := seq-depth+margin > w.acked && time.Since(w.ackedAt) >= slotWatermarkTTL && !w.reading
+	start := seq-depth+margin > w.acked && time.Since(w.ackedAt) >= w.watermarkTTL && !w.reading
 	if start {
 		w.reading = true
 	}
@@ -523,7 +600,7 @@ func (w *slotWriter) prefetchWatermark(seq int64) {
 // without progress once the writer is closed
 func (w *slotWriter) await(seq int64) error {
 	start := time.Now()
-	wait := slotAckRetry
+	wait := w.ackRetry
 	for {
 		ok, err := w.drained(seq)
 		if ok {
@@ -547,7 +624,7 @@ func (w *slotWriter) await(seq int64) error {
 		if err != nil {
 			wait = min(2*wait, 2*time.Second)
 		} else {
-			wait = slotAckRetry
+			wait = w.ackRetry
 		}
 		select {
 		case <-w.ctx.Done():
@@ -571,9 +648,14 @@ func (w *slotWriter) Close() error {
 		w.mu.Unlock()
 		return nil
 	}
+	// Publish a fresh grace period before uploads can observe closed while
+	// Close is still waiting for tokens to flush the buffered tail.
+	w.ackMu.Lock()
+	w.progress = time.Now()
+	w.ackMu.Unlock()
 	w.closed = true
 	for len(w.buf) > 0 && w.err == nil {
-		if err := w.flushLocked(); err != nil {
+		if err := w.flushLocked(nil, nil); err != nil {
 			w.mu.Unlock()
 			return err
 		}
@@ -626,6 +708,9 @@ type slotReader struct {
 	reads        atomic.Int64
 	tailMin      time.Duration
 	tailMax      time.Duration
+	huntFloor    time.Duration
+	huntCeiling  time.Duration
+	ackRetry     time.Duration
 	stallTimeout time.Duration
 	ackDelay     time.Duration
 	bodyRate     float64
@@ -652,11 +737,15 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		wake:         make(chan struct{}, 1),
 		acks:         make(chan struct{}, 1),
 		grow:         make(chan struct{}, 1),
+		frontier:     -1,
 		hitAt:        time.Now(),
 		activeAt:     time.Now(),
 		active:       make(chan struct{}),
 		tailMin:      slotTailMin,
 		tailMax:      slotTailMax,
+		huntFloor:    slotHuntFloor,
+		huntCeiling:  slotHuntCeiling,
+		ackRetry:     slotAckRetry,
 		stallTimeout: slotStallTimeout,
 		ackDelay:     ackDelay,
 		lazy:         table.lazy,
@@ -727,7 +816,7 @@ func (r *slotReader) run() {
 		r.mu.Unlock()
 
 		window := 1
-		if started {
+		if started || frontier >= head {
 			window = min(max(int(frontier-head)+slotFetchAhead, slotFetchAhead), len(r.table.Slots))
 		}
 		for i := range window {
@@ -824,7 +913,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 
 	id := r.slotID(seq)
-	backoff := slotHuntFloor
+	backoff := r.huntFloor
 	var goneSince, warnedAt, visibleSince time.Time
 	for {
 		var description string
@@ -931,16 +1020,16 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		wait, a, b := backoff, (<-chan struct{})(r.wake), (<-chan struct{})(nil)
 		switch {
 		case head:
-			ceiling := slotHuntCeiling
+			ceiling := r.huntCeiling
 			if idle {
 				ceiling = max(ceiling, r.maxPollInterval)
 			}
 			backoff = min(2*backoff, ceiling)
 		case idle:
 			// only the head is asked for until something comes
-			wait, a, b, backoff = 0, f.promoted, active, slotHuntFloor
+			wait, a, b, backoff = 0, f.promoted, active, r.huntFloor
 		default:
-			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, slotHuntFloor
+			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, r.huntFloor
 			select {
 			case <-f.near:
 				b = nil
@@ -976,7 +1065,7 @@ func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string
 		}()
 	}
 	launch()
-	ticker := time.NewTicker(slotHuntCeiling)
+	ticker := time.NewTicker(r.huntCeiling)
 	defer ticker.Stop()
 	var last result
 	seen := false
@@ -1132,7 +1221,7 @@ func (r *slotReader) ackLoop() {
 	if depth >= 16 {
 		batch = depth / 4
 	}
-	wait := slotAckRetry
+	wait := r.ackRetry
 	timer := time.NewTimer(r.ackDelay)
 	defer timer.Stop()
 	writeWM := func(want int64) bool {
@@ -1170,7 +1259,7 @@ func (r *slotReader) ackLoop() {
 		}
 		if want > acked && (want-acked >= batch || (!oldest.IsZero() && time.Since(oldest) >= r.ackDelay) || idle) {
 			if writeWM(want) {
-				acked, wait, oldest = want, slotAckRetry, time.Time{}
+				acked, wait, oldest = want, r.ackRetry, time.Time{}
 			} else {
 				wait = min(2*wait, 5*time.Second)
 				select {
@@ -1181,6 +1270,19 @@ func (r *slotReader) ackLoop() {
 				continue
 			}
 		}
+		// With an ack pending, the timer is due ackDelay after the oldest
+		// unacknowledged segment, not after the latest event.
+		next := r.ackDelay
+		if !oldest.IsZero() {
+			next = max(r.ackDelay-time.Since(oldest), 0)
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(next)
 		select {
 		case <-r.ctx.Done():
 			if want > acked {
@@ -1190,13 +1292,6 @@ func (r *slotReader) ackLoop() {
 		case <-r.acks:
 		case <-timer.C:
 		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(r.ackDelay)
 	}
 }
 

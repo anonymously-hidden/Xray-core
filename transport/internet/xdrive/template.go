@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -230,23 +231,14 @@ func (s *templateStorage) accessToken(ctx context.Context) (string, error) {
 		return s.token, nil
 	}
 
-	form := make(map[string]string, len(s.tmpl.Auth.Form))
+	form := make(url.Values, len(s.tmpl.Auth.Form))
 	vars := s.baseVars()
-	values := strings.Builder{}
-	first := true
 	for k, v := range s.tmpl.Auth.Form {
-		form[k] = subst(v, vars)
-		if !first {
-			values.WriteByte('&')
-		}
-		first = false
-		values.WriteString(k)
-		values.WriteByte('=')
-		values.WriteString(form[k])
+		form.Add(k, subst(v, vars))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.tmpl.Auth.TokenURL,
-		strings.NewReader(values.String()))
+		strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", errors.New("failed to build the token request").Base(err)
 	}

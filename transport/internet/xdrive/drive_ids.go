@@ -41,10 +41,105 @@ func (s *driveStorage) generateIDs(ctx context.Context, n int) ([]string, error)
 	return parsed.IDs, nil
 }
 
-// takeIDs drops expired ids, refills in one background request when below one
-// ring's worth, and returns up to n ids (generating inline only if empty).
 func (s *driveStorage) takeIDs(ctx context.Context, n, ringWorth int) ([]string, error) {
-	s.poolMu.Lock()
+	if n <= 0 {
+		return nil, nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if s.isWorkClosed() {
+			return nil, context.Canceled
+		}
+		s.poolMu.Lock()
+		s.poolRing = max(s.poolRing, 2*ringWorth)
+		s.prunePoolLocked()
+		if len(s.idPool) < n {
+			if f := s.poolFlight; f != nil {
+				s.poolMu.Unlock()
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-f.done:
+					if f.err != nil {
+						return nil, f.err
+					}
+				}
+				continue
+			}
+			if time.Now().Before(s.poolRetryAt) && s.poolErr != nil {
+				err := s.poolErr
+				s.poolMu.Unlock()
+				return nil, err
+			}
+		}
+		take := min(n, len(s.idPool))
+		taken := append([]idPoolEntry(nil), s.idPool[:take]...)
+		s.idPool = s.idPool[take:]
+		out := make([]string, 0, n)
+		for _, e := range taken {
+			out = append(out, e.id)
+		}
+		if take == n {
+			s.refillPoolLocked()
+			s.poolMu.Unlock()
+			return out, nil
+		}
+		f := &idPoolFlight{done: make(chan struct{})}
+		s.poolFlight = f
+		s.poolMu.Unlock()
+
+		var ids []string
+		var err error
+		shortfall := n - take
+		if shortfall > 1000 {
+			err = errors.New("Drive id shortfall exceeds 1000")
+		} else {
+			ids, err = s.generateIDs(ctx, shortfall)
+			if err == nil && len(ids) != shortfall {
+				err = errors.New("Drive returned ", len(ids), " ids, want ", shortfall)
+			}
+		}
+		s.poolMu.Lock()
+		if err != nil {
+			s.idPool = append(s.idPool, taken...)
+			s.prunePoolLocked()
+		}
+		s.finishPoolFlightLocked(f, err)
+		if err == nil {
+			s.refillPoolLocked()
+		}
+		s.poolMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return append(out, ids...), nil
+	}
+}
+
+// Called with poolMu held; registration precedes publishing the goroutine so
+// root Close joins it. Maintenance uses the root transport, never a session's.
+func (s *driveShared) refillPoolLocked() {
+	if s.owner == nil || len(s.idPool) >= 2*s.poolRing {
+		return
+	}
+	f, want := s.beginRefillLocked(false)
+	if f == nil {
+		return
+	}
+	ctx, finish, ok := s.beginWork(30 * time.Second)
+	if !ok {
+		s.finishPoolFlightLocked(f, context.Canceled)
+		return
+	}
+	go func() { defer finish(); s.owner.refillIDs(ctx, f, want) }()
+}
+
+func (s *driveShared) prunePoolLocked() {
+	if s.poolRing <= 0 {
+		s.poolRing = 2 * (64 + 1)
+	}
 	now := time.Now()
 	kept := s.idPool[:0]
 	for _, e := range s.idPool {
@@ -52,38 +147,68 @@ func (s *driveStorage) takeIDs(ctx context.Context, n, ringWorth int) ([]string,
 			kept = append(kept, e)
 		}
 	}
-	s.idPool = kept
-	if len(s.idPool) < ringWorth && !s.poolRefill {
-		s.poolRefill = true
-		go s.refillIDs(2 * ringWorth)
-	}
-	take := min(n, len(s.idPool))
-	out := make([]string, 0, take)
-	for i := 0; i < take; i++ {
-		out = append(out, s.idPool[i].id)
-	}
-	s.idPool = s.idPool[take:]
-	s.poolMu.Unlock()
-	if len(out) > 0 {
-		return out, nil
-	}
-	return s.generateIDs(ctx, n)
+	s.idPool = kept[max(0, len(kept)-3*s.poolRing):]
 }
 
-func (s *driveStorage) refillIDs(want int) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	ids, err := s.generateIDs(ctx, want)
+func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
+	if s.poolFlight != nil || time.Now().Before(s.poolRetryAt) {
+		return nil, 0
+	}
+	want := 3*s.poolRing - len(s.idPool)
+	if refreshOld {
+		for _, e := range s.idPool {
+			if time.Since(e.at) > 5*time.Minute {
+				want++
+			}
+		}
+	}
+	if want <= 0 {
+		return nil, 0
+	}
+	f := &idPoolFlight{done: make(chan struct{})}
+	s.poolFlight = f
+	return f, want
+}
+
+func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
+	f.err = err
+	s.poolErr = err
+	if err != nil {
+		s.coolMu.Lock()
+		s.poolRetryAt = s.coolUntil
+		s.coolMu.Unlock()
+	} else {
+		s.poolRetryAt = time.Time{}
+	}
+	s.poolFlight = nil
+	close(f.done)
+}
+
+func (s *driveStorage) refillIDs(ctx context.Context, f *idPoolFlight, want int) {
+	var err error
+	for want > 0 {
+		batch := min(want, 1000)
+		var ids []string
+		ids, err = s.generateIDs(ctx, batch)
+		if err == nil && len(ids) != batch {
+			err = errors.New("Drive returned ", len(ids), " ids, want ", batch)
+		}
+		if err != nil {
+			break
+		}
+		s.poolMu.Lock()
+		now := time.Now()
+		for _, id := range ids {
+			s.idPool = append(s.idPool, idPoolEntry{id: id, at: now})
+		}
+		s.prunePoolLocked()
+		s.poolMu.Unlock()
+		want -= batch
+	}
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
-	s.poolRefill = false
-	if err != nil {
-		return
-	}
-	now := time.Now()
-	for _, id := range ids {
-		s.idPool = append(s.idPool, idPoolEntry{id: id, at: now})
-	}
+	s.prunePoolLocked()
+	s.finishPoolFlightLocked(f, err)
 }
 
 // createError carries a non-200 create status so createSlot can decide whether
@@ -133,7 +258,6 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 	}
 	err := s.createWithID(ctx, metadata, body)
 	if err == nil {
-		s.rememberID(flat, id)
 		return nil
 	}
 	ce, ok := err.(createError)
@@ -150,9 +274,17 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 }
 
 // pool state lives on driveShared; declared here to keep it beside its users.
+type idPoolFlight struct {
+	done chan struct{}
+	err  error
+}
+
 type idPoolState struct {
 	poolMu          sync.Mutex
 	idPool          []idPoolEntry
-	poolRefill      bool
+	poolRing        int
+	poolFlight      *idPoolFlight
+	poolRetryAt     time.Time
+	poolErr         error
 	fallbackLogOnce sync.Once
 }

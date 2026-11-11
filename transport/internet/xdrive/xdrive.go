@@ -92,10 +92,15 @@ type spareRing struct {
 }
 
 type spareBox struct {
-	ch   chan spareRing
-	busy atomic.Bool
-	last atomic.Int64
-	stop atomic.Bool
+	ch     chan spareRing
+	busy   atomic.Bool
+	last   atomic.Int64
+	stop   atomic.Bool
+	closed atomic.Bool
+	mu     sync.Mutex
+	ctx    context.Context
+	cancel context.CancelFunc
+	timer  *time.Timer
 }
 
 var spareBoxes sync.Map
@@ -104,15 +109,51 @@ func spareBoxFor(config *Config) *spareBox {
 	if b, ok := spareBoxes.Load(config); ok {
 		return b.(*spareBox)
 	}
-	b, _ := spareBoxes.LoadOrStore(config, &spareBox{ch: make(chan spareRing, spareCount)})
+	ctx, cancel := context.WithCancel(context.Background())
+	b, loaded := spareBoxes.LoadOrStore(config, &spareBox{ch: make(chan spareRing, spareCount), ctx: ctx, cancel: cancel})
+	if loaded {
+		cancel()
+	}
 	return b.(*spareBox)
 }
 
-func dropSpare(s spareRing) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func dropSpare(ctx context.Context, s spareRing) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	s.storage.Delete(ctx, sessionPrefix(s.session))
 	s.storage.Close()
+}
+
+// close stops refilling. It is idempotent and touches no channel the box may
+// own, so a box created inside a fake-clock test can be closed later, from a
+// goroutine in another bubble, without a cross-bubble receive or wait.
+func (box *spareBox) close() {
+	if !box.closed.CompareAndSwap(false, true) {
+		return
+	}
+	box.stop.Store(true)
+	box.cancel()
+	box.mu.Lock()
+	if box.timer != nil {
+		box.timer.Stop()
+		box.timer = nil
+	}
+	box.mu.Unlock()
+}
+
+func stopSpares(config *Config) {
+	if box, ok := spareBoxes.Load(config); ok {
+		box.(*spareBox).close()
+	}
+}
+
+func stopAllSpares() {
+	spareBoxes.Range(func(key, value any) bool {
+		if box, ok := spareBoxes.LoadAndDelete(key); ok {
+			box.(*spareBox).close()
+		}
+		return true
+	})
 }
 
 func takeSpare(config *Config, p params) (spareRing, bool) {
@@ -123,7 +164,14 @@ func takeSpare(config *Config, p params) (spareRing, bool) {
 			if time.Since(s.at) < p.sessionTTL*2/3 {
 				return s, true
 			}
-			go dropSpare(s)
+			box.mu.Lock()
+			if !box.stop.Load() {
+				go dropSpare(box.ctx, s)
+				box.mu.Unlock()
+			} else {
+				box.mu.Unlock()
+				s.storage.Close()
+			}
 		default:
 			return spareRing{}, false
 		}
@@ -137,9 +185,16 @@ func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 
 func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
 	box := spareBoxFor(config)
-	if !box.busy.CompareAndSwap(false, true) {
+	box.mu.Lock()
+	if box.stop.Load() || !box.busy.CompareAndSwap(false, true) {
+		box.mu.Unlock()
 		return
 	}
+	if box.timer != nil {
+		box.timer.Stop()
+	}
+	box.timer = nil
+	box.mu.Unlock()
 	go func() {
 		defer box.busy.Store(false)
 		for n := len(box.ch); n > 0; n-- {
@@ -148,17 +203,16 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 				if time.Since(s.at) < p.sessionTTL/3 {
 					box.ch <- s
 				} else {
-					dropSpare(s)
+					dropSpare(box.ctx, s)
 				}
 			default:
 			}
 		}
 		for len(box.ch) < cap(box.ch) {
-			for range 40 {
-				if box.stop.Load() {
-					return
-				}
-				time.Sleep(50 * time.Millisecond)
+			select {
+			case <-box.ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
 			}
 			if box.stop.Load() {
 				return
@@ -178,11 +232,11 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 				storage.Close()
 				return
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(box.ctx, 30*time.Second)
 			r, err := makeRing(ctx, slots, session, p)
 			cancel()
 			if err != nil {
-				dropSpare(spareRing{storage: storage, session: session})
+				dropSpare(box.ctx, spareRing{storage: storage, session: session})
 				return
 			}
 			select {
@@ -192,7 +246,12 @@ func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 				return
 			}
 		}
-		time.AfterFunc(p.sessionTTL/4, func() {
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		if box.stop.Load() {
+			return
+		}
+		box.timer = time.AfterFunc(p.sessionTTL/4, func() {
 			if !box.stop.Load() && time.Since(time.Unix(0, box.last.Load())) < spareIdleStop {
 				fillSpares(streamSettings, config, p)
 			}
@@ -234,7 +293,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}); lok {
 			depth := max(p.concurrency, 2)
 			worth := depth + 1
-			if ids, e := ls.takeIDs(ctx, 2*worth, worth); e == nil && len(ids) >= 2*worth {
+			ids, e := ls.takeIDs(ctx, 2*worth, worth)
+			if e != nil {
+				if cooled, ok := storage.(interface{ waitCool(context.Context) error }); ok {
+					if e = cooled.waitCool(ctx); e == nil {
+						ids, e = ls.takeIDs(ctx, 2*worth, worth)
+					}
+				}
+			}
+			if e == nil && len(ids) >= 2*worth {
 				r = lazyRing(session, depth, ids)
 				lazy = true
 			}
@@ -451,7 +518,21 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 }
 
 func (l *Listener) drop(name string) {
-	l.storage.Delete(context.WithValue(l.ctx, cleanupKey{}, true), name)
+	ctx := context.WithValue(l.ctx, cleanupKey{}, true)
+	for attempt := 0; attempt < cleanupMaxRetries && ctx.Err() == nil; attempt++ {
+		if err := l.storage.Delete(ctx, name); err == nil {
+			return
+		} else {
+			errors.LogDebug(ctx, "failed to drop ", name, ": ", err)
+		}
+		if attempt+1 < cleanupMaxRetries {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(cleanupRetryDelay + jitter(cleanupRetryDelay)):
+			}
+		}
+	}
 }
 
 func (l *Listener) claim(session string) bool {
