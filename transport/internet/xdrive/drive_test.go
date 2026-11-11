@@ -789,6 +789,90 @@ func generatedResponse(r *http.Request) *http.Response {
 	return memoryResponse(http.StatusOK, string(body))
 }
 
+func TestDriveIDWaiterSurvivesInitiatorCancellation(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		started := make(chan struct{})
+		var requests atomic.Int32
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			if requests.Add(1) == 1 {
+				close(started)
+				<-r.Context().Done()
+				return nil, r.Context().Err()
+			}
+			return generatedResponse(r), nil
+		}))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		leader := make(chan error, 1)
+		go func() { _, err := s.takeIDs(ctx, 2, 1); leader <- err }()
+		<-started
+		waiter := make(chan error, 1)
+		go func() {
+			ids, err := s.takeIDs(context.Background(), 2, 1)
+			if err == nil && len(ids) != 2 {
+				err = fmt.Errorf("got %d IDs, want 2", len(ids))
+			}
+			waiter <- err
+		}()
+		synctest.Wait()
+		cancel()
+		if err := <-leader; err != context.Canceled {
+			t.Fatalf("initiator: %v", err)
+		}
+		if err := <-waiter; err != nil {
+			t.Fatalf("uncancelled waiter: %v", err)
+		}
+	})
+}
+
+type driveTimeoutBody struct{ ctx context.Context }
+
+func (b driveTimeoutBody) Read([]byte) (int, error) {
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+func (driveTimeoutBody) Close() error { return nil }
+
+func TestDriveBodyStallRetiresBulkOnly(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var primaryConnections, bulkConnections atomic.Int32
+		primary := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+			primaryConnections.Add(1)
+			return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+				return memoryResponse(http.StatusOK, "control"), nil
+			})}
+		})}
+		bulk := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+			first := bulkConnections.Add(1) == 1
+			return &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+				resp := memoryResponse(http.StatusOK, "media")
+				if first {
+					resp.Body = driveTimeoutBody{r.Context()}
+				}
+				return resp, nil
+			})}
+		})}
+		defer primary.Close()
+		defer bulk.Close()
+		s := memoryDrive(primary)
+		s.bulkClient = &http.Client{Transport: bulk}
+		get := func(ctx context.Context, want string) {
+			t.Helper()
+			status, body, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil)
+			if err != nil || status != http.StatusOK || string(body) != want {
+				t.Fatalf("GET %s: status=%d body=%q err=%v", want, status, body, err)
+			}
+		}
+		get(context.Background(), "control")
+		ctx := context.WithValue(context.Background(), attemptKey{}, time.Second)
+		get(context.WithValue(ctx, bodyKey{}, true), "media")
+		get(context.Background(), "control")
+		if primaryConnections.Load() != 1 || bulkConnections.Load() != 2 {
+			t.Fatalf("opened connections: control=%d bulk=%d", primaryConnections.Load(), bulkConnections.Load())
+		}
+	})
+}
+
 func TestDriveAuthErrorIsSticky(t *testing.T) {
 	var requests atomic.Int32
 	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
@@ -853,8 +937,12 @@ func TestKeeperPrunesAndStopsIdle(t *testing.T) {
 		defer s.Close()
 		<-time.NewTimer(s.keepWarmEvery).C
 		synctest.Wait()
-		if len(s.idPool) != 18 || s.idPool[0].id == "expired" {
-			t.Fatalf("keeper retained expired IDs or failed to refill: reserve=%d", len(s.idPool))
+		s.poolMu.Lock()
+		reserve := len(s.idPool)
+		expired := reserve > 0 && s.idPool[0].id == "expired"
+		s.poolMu.Unlock()
+		if reserve != 18 || expired {
+			t.Fatalf("keeper retained expired IDs or failed to refill: reserve=%d", reserve)
 		}
 		<-time.NewTimer(20 * time.Minute).C
 		synctest.Wait()
@@ -863,7 +951,10 @@ func TestKeeperPrunesAndStopsIdle(t *testing.T) {
 		default:
 			t.Error("maintenance extended the idle keeper's lifetime")
 		}
-		if !s.lastTraffic.Equal(start) {
+		s.trafficMu.Lock()
+		lastTraffic := s.lastTraffic
+		s.trafficMu.Unlock()
+		if !lastTraffic.Equal(start) {
 			t.Error("maintenance counted as user traffic")
 		}
 	})

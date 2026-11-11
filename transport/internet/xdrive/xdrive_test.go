@@ -1067,6 +1067,50 @@ func (r queuedReader) chunks() <-chan []byte { return r.ch }
 func (queuedReader) Err() error              { return nil }
 func (queuedReader) Wake()                   {}
 
+func TestConcurrentReadsPreserveBufferedBytes(t *testing.T) {
+	r := queuedReader{make(chan []byte, 1)}
+	payload := make([]byte, 256)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	r.ch <- payload
+	close(r.ch)
+	c := &Conn{reader: r, readDeadline: newPipeDeadline(), closing: make(chan struct{})}
+	var first [1]byte
+	if n, err := c.Read(first[:]); n != 1 || err != nil || first[0] != 0 {
+		t.Fatalf("first read: %d, %v, %v", n, first, err)
+	}
+	start, got := make(chan struct{}), make(chan byte, 255)
+	var wg sync.WaitGroup
+	for range 15 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for range 17 {
+				var b [1]byte
+				if n, err := c.Read(b[:]); n != 1 || err != nil {
+					t.Errorf("concurrent read: n=%d err=%v", n, err)
+					return
+				}
+				got <- b[0]
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(got)
+	var counts [256]int
+	for b := range got {
+		counts[b]++
+	}
+	for i := 1; i < len(counts); i++ {
+		if counts[i] != 1 {
+			t.Errorf("byte %d delivered %d times", i, counts[i])
+		}
+	}
+}
+
 func TestPendingReadDeadlineWakeAndClear(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		r := queuedReader{make(chan []byte)}
