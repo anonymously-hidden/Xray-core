@@ -504,7 +504,7 @@ func TestTakeSpareSkipsStale(t *testing.T) {
 	}
 }
 
-func TestDropSpareDeletesSession(t *testing.T) {
+func TestDropSpareLeavesSessionForServer(t *testing.T) {
 	st, err := newLocalStorage(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -514,8 +514,8 @@ func TestDropSpareDeletesSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	dropSpare(context.Background(), spareRing{storage: st, session: "gone"})
-	if got, _ := st.List(context.Background(), sessionPrefix("gone")); len(got) != 0 {
-		t.Fatalf("%d entries left of a dropped spare", len(got))
+	if got, err := st.Get(context.Background(), name); err != nil || string(got) != "x" {
+		t.Fatalf("dropped spare data was removed before server collection: %q, %v", got, err)
 	}
 }
 

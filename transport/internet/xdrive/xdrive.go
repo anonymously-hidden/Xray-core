@@ -117,10 +117,7 @@ func spareBoxFor(config *Config) *spareBox {
 	return b.(*spareBox)
 }
 
-func dropSpare(ctx context.Context, s spareRing) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	s.storage.Delete(ctx, sessionPrefix(s.session))
+func dropSpare(_ context.Context, s spareRing) {
 	s.storage.Close()
 }
 
@@ -354,7 +351,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 	errors.LogInfo(ctx, "opened session ", session)
 	return newConn(context.Background(), storage,
-		uplinkPrefix(session), downlinkPrefix(session), p, func() {
+		uplinkPrefix(session), downlinkPrefix(session), p, false, func() {
 			storage.Close()
 		}), nil
 }
@@ -565,7 +562,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 		}
 	}
 	errors.LogInfo(logCtx, "accepted session ", session)
-	return newConn(l.ctx, storage, downlinkPrefix(session), uplinkPrefix(session), l.params, onClose)
+	return newConn(l.ctx, storage, downlinkPrefix(session), uplinkPrefix(session), l.params, true, onClose)
 }
 
 func (l *Listener) collectLoop(logCtx context.Context) {

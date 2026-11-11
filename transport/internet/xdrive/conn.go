@@ -44,12 +44,12 @@ type chunkReader interface {
 	Wake()
 }
 
-func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, onClose func()) *Conn {
+func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, discard bool, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Conn{
 		cancel:  cancel,
 		writer:  newWALWriter(ctx, storage, writePrefix, p),
-		reader:  newWALReader(ctx, storage, readPrefix, p),
+		reader:  newWALReader(ctx, storage, readPrefix, p, discard),
 		onClose: onClose,
 
 		readDeadline:  newPipeDeadline(),

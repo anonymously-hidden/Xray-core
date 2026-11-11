@@ -250,6 +250,7 @@ type walReader struct {
 	seq int64
 
 	ch        chan []byte
+	discard   bool
 	discards  chan string
 	wake      chan struct{}
 	holeSince time.Time
@@ -258,18 +259,21 @@ type walReader struct {
 	err   error
 }
 
-func newWALReader(ctx context.Context, storage Storage, prefix string, p params) *walReader {
+func newWALReader(ctx context.Context, storage Storage, prefix string, p params, discard bool) *walReader {
 	r := &walReader{
-		ctx:      ctx,
-		storage:  storage,
-		prefix:   prefix,
-		params:   p,
-		ch:       make(chan []byte, p.concurrency),
-		discards: make(chan string, 4*p.concurrency),
-		wake:     make(chan struct{}, 1),
+		ctx:     ctx,
+		storage: storage,
+		prefix:  prefix,
+		params:  p,
+		ch:      make(chan []byte, p.concurrency),
+		discard: discard,
+		wake:    make(chan struct{}, 1),
+	}
+	if discard {
+		r.discards = make(chan string, 4*p.concurrency)
+		go r.discardLoop()
 	}
 	go r.run()
-	go r.discardLoop()
 	return r
 }
 
@@ -369,7 +373,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 
 	for {
 		if entry, ok := pending[r.seq]; ok && strings.HasSuffix(entry.Name, errSuffix) {
-			r.discard(r.prefix + "/" + entry.Name)
+			r.queueDiscard(r.prefix + "/" + entry.Name)
 			return advanced, false, errors.New("the peer could not store segment ", r.seq)
 		}
 
@@ -397,7 +401,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			}
 			r.seq++
 			advanced = true
-			r.discard(r.prefix + "/" + batch[i].Name)
+			r.queueDiscard(r.prefix + "/" + batch[i].Name)
 		}
 	}
 }
@@ -410,7 +414,7 @@ func (r *walReader) nextBatch(pending map[int64]Entry) (batch []Entry, done bool
 		}
 		if !strings.HasSuffix(entry.Name, segSuffix) {
 			if i == 0 && strings.HasSuffix(entry.Name, endSuffix) {
-				r.discard(r.prefix + "/" + entry.Name)
+				r.queueDiscard(r.prefix + "/" + entry.Name)
 				return nil, true
 			}
 			break
@@ -446,7 +450,11 @@ func (r *walReader) fetch(batch []Entry) ([][]byte, error) {
 	return chunks, nil
 }
 
-func (r *walReader) discard(name string) {
+func (r *walReader) queueDiscard(name string) {
+	if !r.discard {
+		// Downlink segments stay until the server collects the idle session after sessionTTL.
+		return
+	}
 	select {
 	case r.discards <- name:
 	default:
@@ -454,6 +462,9 @@ func (r *walReader) discard(name string) {
 }
 
 func (r *walReader) discardLoop() {
+	if !r.discard {
+		return
+	}
 	var wg sync.WaitGroup
 	defer wg.Wait()
 

@@ -460,7 +460,7 @@ func TestMissingSegment(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	reader := newWALReader(ctx, storage, "hole", p)
+	reader := newWALReader(ctx, storage, "hole", p, false)
 	select {
 	case _, ok := <-reader.ch:
 		if ok {
@@ -486,7 +486,7 @@ func TestIdleStreamWaits(t *testing.T) {
 	defer cancel()
 
 	p := paramsFromConfig(&Config{PollIntervalMs: 5, MaxPollIntervalMs: 20, HoleTimeoutMs: 100})
-	reader := newWALReader(ctx, storage, "idle", p)
+	reader := newWALReader(ctx, storage, "idle", p, false)
 
 	time.Sleep(400 * time.Millisecond)
 	if err := storage.Put(ctx, objectName("idle", 0, segSuffix), []byte("late")); err != nil {
@@ -523,7 +523,7 @@ func TestFailureMarker(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	reader := newWALReader(ctx, storage, "broken", p)
+	reader := newWALReader(ctx, storage, "broken", p, false)
 
 	select {
 	case data, ok := <-reader.ch:
@@ -576,7 +576,7 @@ func TestInlinePayload(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	reader := newWALReader(ctx, storage, "inline", paramsFromConfig(&Config{PollIntervalMs: 5}))
+	reader := newWALReader(ctx, storage, "inline", paramsFromConfig(&Config{PollIntervalMs: 5}), false)
 	select {
 	case data, ok := <-reader.ch:
 		if !ok {
@@ -977,5 +977,51 @@ func TestLocalSessionStorage(t *testing.T) {
 	}
 	if sessionStorage(storage) != Storage(storage) {
 		t.Fatal("a session of local storage got a storage of its own")
+	}
+}
+
+type recordingDeleteStorage struct {
+	Storage
+	deletes atomic.Int32
+	closes  atomic.Int32
+}
+
+func (s *recordingDeleteStorage) Delete(context.Context, string) error {
+	s.deletes.Add(1)
+	return nil
+}
+
+func (s *recordingDeleteStorage) Close() error {
+	s.closes.Add(1)
+	return s.Storage.Close()
+}
+
+func TestClientNeverDeletes(t *testing.T) {
+	base, err := newLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &recordingDeleteStorage{Storage: base}
+	ctx := context.Background()
+	for seq, suffix := range []string{segSuffix, endSuffix} {
+		if err := s.Put(ctx, objectName(downlinkPrefix("client"), int64(seq), suffix), []byte("reply")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := newConn(ctx, s, uplinkPrefix("client"), downlinkPrefix("client"), paramsFromConfig(&Config{}), false, func() { s.Close() })
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(testPatience))
+	if data, err := io.ReadAll(c); err != nil || string(data) != "reply" {
+		t.Fatalf("client read: %q, %v", data, err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	r := c.reader.(*walReader)
+	r.queueDiscard("unused")
+	r.discardLoop()
+	dropSpare(ctx, spareRing{storage: s, session: "spare"})
+	if s.deletes.Load() != 0 || s.closes.Load() != 2 {
+		t.Fatalf("client cleanup: deletes=%d closes=%d", s.deletes.Load(), s.closes.Load())
 	}
 }

@@ -25,6 +25,8 @@ type Entry struct {
 	Inline []byte
 }
 
+// Config.Secrets for clients need only create/update/read/list permissions;
+// only server credentials need delete permission.
 type Storage interface {
 	Put(ctx context.Context, name string, data []byte) error
 	Get(ctx context.Context, name string) ([]byte, error)
