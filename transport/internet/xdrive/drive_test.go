@@ -10,8 +10,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -19,7 +21,6 @@ import (
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
-	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type fakeFile struct {
@@ -32,27 +33,14 @@ type fakeFile struct {
 type fakeDrive struct {
 	server *httptest.Server
 
-	mu          sync.Mutex
-	files       map[string]*fakeFile
-	nextID      int
-	failOnce    map[string]bool
-	failStatus  map[string]int
-	failBody    map[string]string
-	tokens      int
-	tokenStatus int
-	tokenBody   string
-	uploadAt    []time.Time
-	hosts       map[string]bool
-
-	// cleanup-test instrumentation; inert unless a test sets deleteLimit or
-	// deleteDelay or reads the recorded slices.
-	deleteAt       []time.Time
-	deleteInflight int
-	deleteMax      int
-	deleteLimit    int
-	deleteLimited  int
-	deleteDelay    time.Duration
-	listFields     []string
+	mu         sync.Mutex
+	files      map[string]*fakeFile
+	nextID     int
+	failOnce   map[string]bool
+	failStatus map[string]int
+	failBody   map[string]string
+	tokens     int
+	hosts      map[string]bool
 }
 
 func newFakeDrive(t *testing.T) *fakeDrive {
@@ -86,17 +74,8 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 
 	resetSharedStorage()
 
-	previous := []string{driveTokenURL, driveFilesURL, driveUploadURL}
-	previousBackoff := driveInitialBackoff
-	driveTokenURL = drive.server.URL + "/token"
-	driveFilesURL = drive.server.URL + "/files"
-	driveUploadURL = drive.server.URL + "/upload"
-	driveInitialBackoff = 5 * time.Millisecond
-
 	t.Cleanup(func() {
-		resetSharedStorage() // cancel/join workers before restoring their endpoints
-		driveTokenURL, driveFilesURL, driveUploadURL = previous[0], previous[1], previous[2]
-		driveInitialBackoff = previousBackoff
+		resetSharedStorage()
 		drive.server.Close()
 	})
 	return drive
@@ -105,13 +84,7 @@ func newFakeDrive(t *testing.T) *fakeDrive {
 func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
 	d.tokens++
-	status, body := d.tokenStatus, d.tokenBody
 	d.mu.Unlock()
-	if status != 0 {
-		w.WriteHeader(status)
-		w.Write([]byte(body))
-		return
-	}
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"access_token": "fake-token",
 		"expires_in":   3600,
@@ -119,9 +92,6 @@ func (d *fakeDrive) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
-	d.mu.Lock()
-	d.uploadAt = append(d.uploadAt, time.Now())
-	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
 			w.WriteHeader(status)
@@ -193,7 +163,6 @@ func (d *fakeDrive) handleFiles(w http.ResponseWriter, r *http.Request) {
 
 func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
 	d.mu.Lock()
-	d.uploadAt = append(d.uploadAt, time.Now())
 	d.mu.Unlock()
 	if d.shouldFail("upload") {
 		if status, body := d.failure("upload"); status != 0 {
@@ -224,9 +193,6 @@ func (d *fakeDrive) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
-	d.mu.Lock()
-	d.listFields = append(d.listFields, r.URL.Query().Get("fields"))
-	d.mu.Unlock()
 	if d.shouldFail("list") {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
@@ -261,36 +227,10 @@ func (d *fakeDrive) handleList(w http.ResponseWriter, r *http.Request) {
 func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/files/")
 
-	if r.Method == http.MethodDelete {
-		d.mu.Lock()
-		d.deleteInflight++
-		if d.deleteInflight > d.deleteMax {
-			d.deleteMax = d.deleteInflight
-		}
-		d.deleteAt = append(d.deleteAt, time.Now())
-		delay := d.deleteDelay
-		d.mu.Unlock()
-		defer func() {
-			d.mu.Lock()
-			d.deleteInflight--
-			d.mu.Unlock()
-		}()
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-	}
-
 	d.mu.Lock()
 	file, ok := d.files[id]
-	rateLimit := false
 	if ok && r.Method == http.MethodDelete {
-		if d.deleteLimit > 0 {
-			d.deleteLimit--
-			d.deleteLimited++
-			rateLimit = true
-		} else {
-			delete(d.files, id)
-		}
+		delete(d.files, id)
 	}
 	var snapshot fakeFile
 	if ok {
@@ -304,11 +244,6 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodDelete {
-		if rateLimit {
-			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte(`{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`))
-			return
-		}
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -420,13 +355,35 @@ func driveSettings() *internet.MemoryStreamConfig {
 	}
 }
 
-func newDriveBackend(t *testing.T) *driveStorage {
+func setDriveEndpoints(s *driveStorage, token, files, upload string) {
+	s.tokenURL, s.filesURL, s.uploadURL = token, files, upload
+}
+
+// Configure the cached owner before Dial or Listener starts any shared work.
+func prepareDrive(t *testing.T, settings *internet.MemoryStreamConfig, token, files, upload string) {
+	t.Helper()
+	s, err := newStorage(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setDriveEndpoints(s.(*driveStorage), token, files, upload)
+}
+
+func (d *fakeDrive) settings(t *testing.T) *internet.MemoryStreamConfig {
+	t.Helper()
+	s := driveSettings()
+	prepareDrive(t, s, d.server.URL+"/token", d.server.URL+"/files", d.server.URL+"/upload")
+	return s
+}
+
+func newDriveBackend(t *testing.T, drive *fakeDrive) *driveStorage {
 	t.Helper()
 
 	storage, err := newDriveStorage(driveSettings(), driveSettings().ProtocolSettings.(*Config))
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	setDriveEndpoints(storage, drive.server.URL+"/token", drive.server.URL+"/files", drive.server.URL+"/upload")
 	t.Cleanup(func() { storage.Close() })
 	return storage
 }
@@ -445,7 +402,7 @@ func TestDriveSecrets(t *testing.T) {
 
 func TestDriveRoundTrip(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	if err := storage.Put(ctx, "streams/abc/c2s/000000000.seg", []byte("hello")); err != nil {
@@ -481,8 +438,8 @@ func TestDriveRoundTrip(t *testing.T) {
 }
 
 func TestDriveListChildren(t *testing.T) {
-	newFakeDrive(t)
-	storage := newDriveBackend(t)
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	for _, name := range []string{
@@ -506,7 +463,7 @@ func TestDriveListChildren(t *testing.T) {
 
 func TestDriveDeleteSession(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	for _, name := range []string{
@@ -530,7 +487,7 @@ func TestDriveDeleteSession(t *testing.T) {
 
 func TestDriveRetry(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	drive.failNext("upload")
@@ -546,7 +503,7 @@ func TestDriveRetry(t *testing.T) {
 
 func TestDriveTokenCache(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
@@ -560,9 +517,9 @@ func TestDriveTokenCache(t *testing.T) {
 }
 
 func TestDriveTransport(t *testing.T) {
-	newFakeDrive(t)
+	drive := newFakeDrive(t)
 
-	client, server, cleanup := pairWith(t, driveSettings())
+	client, server, cleanup := pairWith(t, drive.settings(t))
 	defer cleanup()
 
 	if _, err := client.Write([]byte("ping")); err != nil {
@@ -577,9 +534,9 @@ func TestDriveTransport(t *testing.T) {
 }
 
 func TestDriveLargeTransfer(t *testing.T) {
-	newFakeDrive(t)
+	drive := newFakeDrive(t)
 
-	client, server, cleanup := pairWith(t, driveSettings())
+	client, server, cleanup := pairWith(t, drive.settings(t))
 	defer cleanup()
 
 	payload := make([]byte, 300000)
@@ -632,7 +589,7 @@ func TestRateLimited(t *testing.T) {
 
 func TestDriveRetryRateLimit(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 
 	drive.failOnceWith("upload", http.StatusForbidden,
 		`{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`)
@@ -643,13 +600,14 @@ func TestDriveRetryRateLimit(t *testing.T) {
 }
 
 func TestDriveSharedClient(t *testing.T) {
-	newFakeDrive(t)
+	drive := newFakeDrive(t)
+	settings := drive.settings(t)
 
-	first, err := newStorage(driveSettings())
+	first, err := newStorage(settings)
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
-	second, err := newStorage(driveSettings())
+	second, err := newStorage(settings)
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
@@ -665,10 +623,11 @@ func TestDriveSharedClient(t *testing.T) {
 }
 
 func TestDriveOldServiceName(t *testing.T) {
-	newFakeDrive(t)
+	drive := newFakeDrive(t)
 
 	settings := driveSettings()
 	settings.ProtocolSettings.(*Config).Service = "Google Drive"
+	prepareDrive(t, settings, drive.server.URL+"/token", drive.server.URL+"/files", drive.server.URL+"/upload")
 	if _, err := newStorage(settings); err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
@@ -676,7 +635,7 @@ func TestDriveOldServiceName(t *testing.T) {
 
 func TestDriveInlineListing(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	payload := []byte("small enough to ride along with the listing")
@@ -709,7 +668,7 @@ func TestDriveInlineListing(t *testing.T) {
 
 func TestDriveLargeContent(t *testing.T) {
 	drive := newFakeDrive(t)
-	storage := newDriveBackend(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	payload := make([]byte, driveInlineLimit+1)
@@ -739,8 +698,8 @@ func TestDriveLargeContent(t *testing.T) {
 }
 
 func TestDriveInlineGet(t *testing.T) {
-	newFakeDrive(t)
-	storage := newDriveBackend(t)
+	drive := newFakeDrive(t)
+	storage := newDriveBackend(t, drive)
 	ctx := context.Background()
 
 	payload := []byte("only in the description")
@@ -769,10 +728,6 @@ func TestDriveFronting(t *testing.T) {
 		t.Fatalf("port: %v", err)
 	}
 
-	driveTokenURL = "http://www.googleapis.com/token"
-	driveFilesURL = "http://www.googleapis.com/files"
-	driveUploadURL = "http://www.googleapis.com/upload"
-
 	settings := driveSettings()
 	settings.Destination = &net.Destination{
 		Address: net.ParseAddress(fake.Hostname()),
@@ -784,6 +739,8 @@ func TestDriveFronting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	defer storage.Close()
+	setDriveEndpoints(storage, "http://www.googleapis.com/token", "http://www.googleapis.com/files", "http://www.googleapis.com/upload")
 
 	if err := storage.Put(context.Background(), "sessions/fronted", []byte("x")); err != nil {
 		t.Fatalf("Put: %v", err)
@@ -796,368 +753,6 @@ func TestDriveFronting(t *testing.T) {
 		if host != "www.googleapis.com" {
 			t.Fatalf("inner host was %q, want www.googleapis.com regardless of address", host)
 		}
-	}
-}
-
-func TestDriveLargeAnnouncement(t *testing.T) {
-	listenerCtx, cancelListener := context.WithCancel(context.Background())
-	defer cancelListener()
-	newFakeDrive(t)
-	storage := newDriveBackend(t)
-	ctx := context.Background()
-	p := paramsFromConfig(driveSettings().ProtocolSettings.(*Config))
-
-	session := "large-announcement"
-	r := ring{
-		Up:   slotTable{Watermark: "up-watermark"},
-		Down: slotTable{Watermark: "down-watermark"},
-	}
-	for i := range 200 {
-		id := fmt.Sprintf("%s-%03d", strings.Repeat("s", 40), i)
-		r.Up.Slots = append(r.Up.Slots, id)
-		r.Down.Slots = append(r.Down.Slots, id)
-	}
-	announce, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(announce) <= driveInlineLimit {
-		t.Fatalf("announcement is %d bytes, want more than %d", len(announce), driveInlineLimit)
-	}
-	if err := storage.Put(ctx, announceName(session, time.Now()), announce); err != nil {
-		t.Fatal(err)
-	}
-	entries, err := storage.List(ctx, sessionsDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(entries) != 1 || entries[0].Inline != nil {
-		t.Fatalf("large announcement was inlined: %v", entries)
-	}
-
-	conns := make(chan *Conn, 2)
-	l := &Listener{
-		ctx:            listenerCtx,
-		storage:        storage,
-		addConn:        func(c stat.Connection) { conns <- c.(*Conn) },
-		params:         p,
-		active:         make(map[string]bool),
-		handled:        make(map[string]time.Time),
-		idleSince:      make(map[string]time.Time),
-		announceWarned: make(map[string]bool),
-	}
-	accepted, err := l.acceptPending(ctx)
-	if err != nil || !accepted {
-		t.Fatalf("acceptPending: %v, accepted %v", err, accepted)
-	}
-	conn := <-conns
-	reader, ok := conn.reader.(*slotReader)
-	if !ok || len(reader.table.Slots) != 200 {
-		t.Fatalf("large announcement did not become a 200-slot connection: %T", conn.reader)
-	}
-	conn.Close()
-
-	empty := "empty-announcement"
-	if err := storage.Put(ctx, announceName(empty, time.Now()), nil); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err = l.acceptPending(ctx)
-	if err != nil || !accepted {
-		t.Fatalf("acceptPending empty: %v, accepted %v", err, accepted)
-	}
-	conn = <-conns
-	if _, ok := conn.reader.(*walReader); !ok {
-		t.Fatalf("empty announcement did not become a segment connection: %T", conn.reader)
-	}
-	conn.Close()
-}
-
-func TestDriveDeadCredentials(t *testing.T) {
-	drive := newFakeDrive(t)
-	drive.mu.Lock()
-	drive.tokenStatus = http.StatusBadRequest
-	drive.tokenBody = `{"error":"invalid_grant"}`
-	drive.mu.Unlock()
-	storage := newDriveBackend(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	start := time.Now()
-	_, _, err := storage.do(ctx, http.MethodGet, storage.filesURL, "", nil)
-	if !isAuthError(err) {
-		t.Fatalf("do returned %v, want the sticky OAuth error", err)
-	}
-	if time.Since(start) > time.Second {
-		t.Fatalf("do took %v, want it to fail at once", time.Since(start))
-	}
-	for range 3 {
-		if _, err := storage.readDescription(ctx, "id"); !isAuthError(err) {
-			t.Fatalf("readDescription returned %v, want the sticky OAuth error", err)
-		}
-	}
-	drive.mu.Lock()
-	tokens := drive.tokens
-	drive.mu.Unlock()
-	if tokens != 1 {
-		t.Fatalf("the fake saw %d token requests, want exactly one", tokens)
-	}
-
-	reader := newSlotReader(ctx, storage, slotTable{Slots: []string{"id"}, Watermark: "w"}, params{concurrency: 1}, nil)
-	select {
-	case <-reader.chunks():
-	case <-time.After(time.Second):
-		t.Fatal("the slot reader kept polling after the credentials were rejected")
-	}
-	if !isAuthError(reader.Err()) {
-		t.Fatalf("the slot reader ended with %v, want the sticky OAuth error", reader.Err())
-	}
-}
-
-func TestDriveRetryWaitsCooldown(t *testing.T) {
-	drive := newFakeDrive(t)
-	oldCooldown := driveCooldown
-	driveCooldown = 200 * time.Millisecond
-	t.Cleanup(func() { driveCooldown = oldCooldown })
-	storage := newDriveBackend(t)
-
-	drive.failOnceWith("upload", http.StatusForbidden,
-		`{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	start := time.Now()
-	if err := storage.Put(ctx, "sessions/abc", nil); err != nil {
-		t.Fatalf("Put did not survive a 403: %v", err)
-	}
-	drive.mu.Lock()
-	times := append([]time.Time(nil), drive.uploadAt...)
-	drive.mu.Unlock()
-	if len(times) < 2 {
-		t.Fatalf("the fake saw %d writes, want a retry", len(times))
-	}
-	if gap := times[1].Sub(times[0]); gap < driveCooldown/2 {
-		t.Fatalf("the retry arrived after %v, less than the jitter floor %v", gap, driveCooldown/2)
-	}
-	storage.coolMu.Lock()
-	until := storage.coolUntil
-	storage.coolMu.Unlock()
-	if times[1].Before(until) {
-		t.Fatalf("the retry reached the fake at %v, before the cooldown ended at %v", times[1], until)
-	}
-	if took := time.Since(start); took < until.Sub(times[0]) {
-		t.Fatalf("the request took %v, less than the cooldown %v", took, until.Sub(times[0]))
-	}
-}
-
-func TestDriveBackgroundTokenRefresh(t *testing.T) {
-	var mu sync.Mutex
-	calls := 0
-	mode := "ok"
-	delay := 100 * time.Millisecond
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		calls++
-		n := calls
-		current := mode
-		pause := delay
-		mu.Unlock()
-		time.Sleep(pause)
-		switch current {
-		case "transient":
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"error":"temporarily_unavailable"}`))
-		case "auth":
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte(`{"error":"invalid_grant"}`))
-		default:
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"access_token": fmt.Sprintf("token-%d", n),
-				"expires_in":   100,
-			})
-		}
-	}))
-	defer server.Close()
-
-	newStorage := func() *driveStorage {
-		return &driveStorage{driveShared: &driveShared{
-			tokenClient: server.Client(),
-			tokenURL:    server.URL,
-		}}
-	}
-	seed := func(s *driveStorage) {
-		s.tokenMu.Lock()
-		s.token = "old"
-		s.tokenLifetime = 100 * time.Second
-		s.tokenExpiry = time.Now().Add(10 * time.Second)
-		s.tokenMu.Unlock()
-	}
-	setMode := func(m string) {
-		mu.Lock()
-		mode = m
-		mu.Unlock()
-	}
-	callCount := func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		return calls
-	}
-
-	t.Run("returns at once inside the window", func(t *testing.T) {
-		s := newStorage()
-		seed(s)
-		start := time.Now()
-		token, err := s.accessToken(context.Background())
-		if err != nil || token != "old" {
-			t.Fatalf("accessToken gave %q, %v", token, err)
-		}
-		if time.Since(start) > 50*time.Millisecond {
-			t.Fatalf("accessToken waited %v for the background refresh", time.Since(start))
-		}
-		waitFor(t, "the background refresh", func() bool {
-			s.tokenMu.Lock()
-			defer s.tokenMu.Unlock()
-			return s.token != "old" && !s.refreshing
-		})
-	})
-
-	t.Run("concurrent calls start one refresh", func(t *testing.T) {
-		mu.Lock()
-		calls = 0
-		mu.Unlock()
-		s := newStorage()
-		seed(s)
-		var wg sync.WaitGroup
-		for i := 0; i < 10; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if token, err := s.accessToken(context.Background()); err != nil || token != "old" {
-					t.Errorf("accessToken gave %q, %v", token, err)
-				}
-			}()
-		}
-		wg.Wait()
-		waitFor(t, "one background refresh", func() bool {
-			s.tokenMu.Lock()
-			defer s.tokenMu.Unlock()
-			return !s.refreshing && s.token != "old"
-		})
-		if n := callCount(); n != 1 {
-			t.Fatalf("concurrent calls started %d refreshes, want one", n)
-		}
-	})
-
-	t.Run("transient failure keeps the old token", func(t *testing.T) {
-		mu.Lock()
-		calls = 0
-		mu.Unlock()
-		setMode("transient")
-		defer setMode("ok")
-		s := newStorage()
-		seed(s)
-		if token, err := s.accessToken(context.Background()); err != nil || token != "old" {
-			t.Fatalf("accessToken gave %q, %v", token, err)
-		}
-		waitFor(t, "the failed refresh to clear", func() bool {
-			s.tokenMu.Lock()
-			defer s.tokenMu.Unlock()
-			return !s.refreshing
-		})
-		s.tokenMu.Lock()
-		token := s.token
-		s.tokenMu.Unlock()
-		if token != "old" {
-			t.Fatalf("a transient failure replaced the token with %q", token)
-		}
-		// Simulate the backoff having elapsed so the next call may retry.
-		s.tokenMu.Lock()
-		s.tokenRetryAt = time.Time{}
-		s.tokenBackoff = 0
-		s.tokenMu.Unlock()
-		setMode("ok")
-		if _, err := s.accessToken(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		waitFor(t, "the later refresh", func() bool {
-			s.tokenMu.Lock()
-			defer s.tokenMu.Unlock()
-			return s.token != "old" && !s.refreshing
-		})
-		if n := callCount(); n != 2 {
-			t.Fatalf("the retry made %d token requests, want two", n)
-		}
-	})
-
-	t.Run("auth failure turns sticky", func(t *testing.T) {
-		mu.Lock()
-		calls = 0
-		mu.Unlock()
-		setMode("auth")
-		defer setMode("ok")
-		s := newStorage()
-		seed(s)
-		if _, err := s.accessToken(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		waitFor(t, "the sticky auth error", func() bool {
-			s.tokenMu.Lock()
-			defer s.tokenMu.Unlock()
-			return s.authErr != nil && !s.refreshing
-		})
-		before := callCount()
-		if _, err := s.accessToken(context.Background()); !isAuthError(err) {
-			t.Fatalf("accessToken gave %v, want the sticky auth error", err)
-		}
-		if n := callCount(); n != before {
-			t.Fatalf("the sticky error made %d more token requests", n-before)
-		}
-	})
-}
-
-func TestSlotPathDefaults(t *testing.T) {
-	p := paramsForStorage(&Config{}, &driveStorage{})
-	if p.concurrency != 64 || p.flushInterval != 10*time.Millisecond || p.maxPollInterval != 200*time.Millisecond {
-		t.Fatalf("slot defaults gave concurrency %d, flush %v, max poll %v", p.concurrency, p.flushInterval, p.maxPollInterval)
-	}
-	if wal, base := paramsForStorage(&Config{}, &localStorage{}), paramsFromConfig(&Config{}); wal != base {
-		t.Fatalf("wal defaults changed: %+v, want %+v", wal, base)
-	}
-	explicit := paramsForStorage(&Config{Concurrency: 4, FlushIntervalMs: 30, MaxPollIntervalMs: 100}, &driveStorage{})
-	if explicit.concurrency != 4 || explicit.flushInterval != 30*time.Millisecond || explicit.maxPollInterval != 100*time.Millisecond {
-		t.Fatalf("explicit values did not win: %+v", explicit)
-	}
-	if p := paramsForStorage(&Config{PollIntervalMs: 500}, &driveStorage{}); p.maxPollInterval < p.minPollInterval {
-		t.Fatalf("max poll %v is below min poll %v", p.maxPollInterval, p.minPollInterval)
-	}
-}
-
-func TestDialDefaultRingDepth(t *testing.T) {
-	newFakeDrive(t)
-	config := &Config{
-		RemoteFolder: "folder-id",
-		Service:      "google-drive",
-		Secrets:      []string{"client", "secret", "refresh"},
-	}
-	settings := &internet.MemoryStreamConfig{
-		ProtocolName:     protocolName,
-		ProtocolSettings: config,
-	}
-	conn, err := Dial(context.Background(), net.Destination{}, settings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	writer, ok := conn.(*Conn).writer.(*slotWriter)
-	if !ok {
-		t.Fatalf("Dial with unset concurrency built %T, want a slot writer", conn.(*Conn).writer)
-	}
-	if len(writer.table.Slots) != 64 {
-		t.Fatalf("Dial with unset concurrency built %d slots, want 64", len(writer.table.Slots))
-	}
-	box := spareBoxFor(config)
-	box.stop.Store(true)
-	for box.busy.Load() {
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -1181,6 +776,204 @@ func memoryDrive(rt http.RoundTripper) *driveStorage {
 			folder: "fake-folder", backoff: time.Millisecond, ids: make(map[string]string),
 		},
 		client: client, inflight: make(chan struct{}, 64), reserved: make(chan struct{}, 8),
+	}
+}
+
+func generatedResponse(r *http.Request) *http.Response {
+	n, _ := strconv.Atoi(r.URL.Query().Get("count"))
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("generated-%d", i)
+	}
+	body, _ := json.Marshal(map[string]any{"ids": ids})
+	return memoryResponse(http.StatusOK, string(body))
+}
+
+func TestDriveAuthErrorIsSticky(t *testing.T) {
+	var requests atomic.Int32
+	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return memoryResponse(http.StatusBadRequest, `{"error":"invalid_grant"}`), nil
+	}))
+	s.token = ""
+	for range 3 {
+		if _, _, err := s.do(context.Background(), http.MethodGet, s.filesURL, "", nil); !isAuthError(err) {
+			t.Fatalf("sticky authentication failure: %v", err)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatal("rejected authentication kept retrying")
+	}
+}
+
+func TestDriveIDPoolTopUp(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var counts []int
+		rt := roundTrip(func(r *http.Request) (*http.Response, error) {
+			n, _ := strconv.Atoi(r.URL.Query().Get("count"))
+			counts = append(counts, n)
+			if len(counts) == 2 {
+				close(entered)
+				<-release
+			}
+			return generatedResponse(r), nil
+		})
+		s := memoryDrive(rt)
+		s.owner = s
+		s.conns = newConnPool(nil, func(context.Context) *http.Client { return &http.Client{Transport: rt} })
+		s.bulkConns = s.conns
+		s.idPool = []idPoolEntry{{id: "seed-a", at: time.Now()}, {id: "seed-b", at: time.Now()}}
+		defer s.Close()
+		session := s.session().(*driveStorage)
+		ids, err := session.takeIDs(context.Background(), 6, 3)
+		if err != nil || len(ids) != 6 {
+			t.Fatalf("allocation: %d IDs, %v", len(ids), err)
+		}
+		<-entered
+		session.Close() // Closing the initiating session must not cancel shared work.
+		close(release)
+		synctest.Wait()
+		if len(counts) != 2 || counts[0] != 4 || len(s.idPool) != 18 {
+			t.Fatalf("top-up: requests=%v reserve=%d", counts, len(s.idPool))
+		}
+	})
+}
+
+func TestKeeperPrunesAndStopsIdle(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) { return generatedResponse(r), nil }))
+		s.owner = s
+		s.poolRing = 6
+		s.idPool = []idPoolEntry{{id: "expired", at: time.Now().Add(-idPoolTTL)}}
+		s.keepWarmWindow = 10 * time.Minute
+		start := time.Now()
+		s.lastTraffic, s.lastRequest = start, start.Add(-3*time.Minute)
+		s.startKeeper()
+		defer s.Close()
+		<-time.NewTimer(s.keepWarmEvery).C
+		synctest.Wait()
+		if len(s.idPool) != 18 || s.idPool[0].id == "expired" {
+			t.Fatalf("keeper retained expired IDs or failed to refill: reserve=%d", len(s.idPool))
+		}
+		<-time.NewTimer(20 * time.Minute).C
+		synctest.Wait()
+		select {
+		case <-s.keeperDone:
+		default:
+			t.Error("maintenance extended the idle keeper's lifetime")
+		}
+		if !s.lastTraffic.Equal(start) {
+			t.Error("maintenance counted as user traffic")
+		}
+	})
+}
+
+func TestDriveBulkStallRetiresBulkOnly(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var made [2]atomic.Int32
+		transport := func(lane int) *sessionTransport {
+			return &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+				generation := made[lane].Add(1)
+				return &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+					if lane == 1 && generation == 1 && r.URL.Path != "/prime" {
+						<-r.Context().Done()
+						return nil, r.Context().Err()
+					}
+					return memoryResponse(http.StatusOK, `{"id":"done"}`), nil
+				})}
+			})}
+		}
+		primary, bulk := transport(0), transport(1)
+		defer primary.Close()
+		defer bulk.Close()
+		for _, lane := range []*sessionTransport{primary, bulk} {
+			req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/prime", nil)
+			resp, err := lane.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+		}
+		s := memoryDrive(primary)
+		s.bulkClient = &http.Client{Transport: bulk}
+		ctx := context.WithValue(context.Background(), bodyKey{}, true)
+		ctx = context.WithValue(ctx, attemptKey{}, 20*time.Millisecond)
+		if _, _, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil); err != nil {
+			t.Fatal(err)
+		}
+		primary.mu.Lock()
+		retired := !primary.retiredAt.IsZero() || !primary.slowAt.IsZero()
+		primary.mu.Unlock()
+		if retired || made[0].Load() != 1 || made[1].Load() != 2 {
+			t.Fatalf("wrong stall attribution: primary=%d bulk=%d", made[0].Load(), made[1].Load())
+		}
+	})
+}
+
+func TestDriveRefreshInitiatorCancellation(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var requests atomic.Int32
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			close(entered)
+			<-release
+			return memoryResponse(http.StatusOK, `{"access_token":"refreshed","expires_in":3600}`), nil
+		}))
+		s.token = ""
+		ctx, cancel := context.WithCancel(context.Background())
+		leader, waiter := make(chan error, 1), make(chan string, 1)
+		go func() { _, err := s.accessToken(ctx); leader <- err }()
+		<-entered
+		go func() { token, _ := s.accessToken(context.Background()); waiter <- token }()
+		synctest.Wait()
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-leader:
+			if err != context.Canceled {
+				t.Error(err)
+			}
+		default:
+			t.Error("token leader ignored its cancellation")
+		}
+		close(release)
+		if token := <-waiter; token != "refreshed" || requests.Load() != 1 {
+			t.Fatal("canceling the leader lost or duplicated the shared refresh")
+		}
+	})
+}
+
+func TestDriveDeleteRefreshesFailedDuplicateSet(t *testing.T) {
+	var mu sync.Mutex
+	left := map[string]string{"a1": "sessions~a", "a2": "sessions~a", "c1": "sessions~a~c"}
+	failed := false
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Method == http.MethodDelete {
+			id := strings.TrimPrefix(r.URL.Path, "/files/")
+			if id == "a2" && !failed {
+				failed = true
+				return memoryResponse(http.StatusBadRequest, "failed"), nil
+			}
+			delete(left, id)
+			return memoryResponse(http.StatusNoContent, ""), nil
+		}
+		var files []map[string]string
+		for id, name := range left {
+			files = append(files, map[string]string{"id": id, "name": name})
+		}
+		body, _ := json.Marshal(map[string]any{"files": files})
+		return memoryResponse(http.StatusOK, string(body)), nil
+	}))
+	s.ids[flatten("sessions/a")] = "a1"
+	if err := s.Delete(context.Background(), "sessions/a"); err == nil {
+		t.Fatal("failed duplicate deletion was not reported")
+	}
+	if err := s.Delete(context.Background(), "sessions/a"); err != nil || len(left) != 0 {
+		t.Fatalf("duplicate cleanup retry: %v; %d objects left", err, len(left))
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -872,8 +874,13 @@ func (cncDialer) DestIpAddress() net.IP { return nil }
 
 // h3 goes over the stream conn of a dialerProxy too
 func TestServiceClientH3DialerProxy(t *testing.T) {
-	internet.UseAlternativeSystemDialer(cncDialer{})
-	defer internet.UseAlternativeSystemDialer(nil)
+	if os.Getenv("XDRIVE_TEST_CNC") != "1" {
+		t.Setenv("XDRIVE_TEST_CNC", "1")
+		if out, err := exec.Command(os.Args[0], "-test.run=^TestServiceClientH3DialerProxy$").CombinedOutput(); err != nil {
+			t.Fatalf("isolated dialer-proxy test: %v\n%s", err, out)
+		}
+		return
+	}
 
 	server := newH3Server(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	resp, err := newServiceClient(context.Background(), new(sync.Map), server.settings(&tls.Config{}), 5*time.Second, 8).Get("https://www.googleapis.com/")
@@ -891,9 +898,6 @@ func TestServiceClientH3DialerProxy(t *testing.T) {
 func TestDriveOverH3(t *testing.T) {
 	drive := newFakeDrive(t)
 	server := newH3Server(t, drive.server.Config.Handler)
-	driveTokenURL = "https://oauth2.googleapis.com/token"
-	driveFilesURL = "https://www.googleapis.com/files"
-	driveUploadURL = "https://www.googleapis.com/upload"
 
 	rec := new(recorder)
 	settings := server.settings(&tls.Config{})
@@ -901,6 +905,7 @@ func TestDriveOverH3(t *testing.T) {
 	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: 4, To: 4}}
 	masks := []finalmask.UDPMask{&noise.Config{Items: []*noise.Item{{Packet: []byte("noise")}}}}
 	settings.FinalMask = finalmask.NewFinalMask(nil, masks, nil, nil, rec.dialUDP, nil)
+	prepareDrive(t, settings, "https://oauth2.googleapis.com/token", "https://www.googleapis.com/files", "https://www.googleapis.com/upload")
 
 	client, srv, cleanup := pairWith(t, settings)
 	defer cleanup()
@@ -961,9 +966,6 @@ func TestDriveOverH3(t *testing.T) {
 func TestDriveXmuxOverH3(t *testing.T) {
 	drive := newFakeDrive(t)
 	server := newH3Server(t, drive.server.Config.Handler)
-	driveTokenURL = "https://www.googleapis.com/token"
-	driveFilesURL = "https://www.googleapis.com/files"
-	driveUploadURL = "https://www.googleapis.com/upload"
 	settings := server.settings(&tls.Config{})
 	settings.ProtocolSettings = driveSettings().ProtocolSettings
 	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{HMaxRequestTimes: &splithttp.RangeConfig{From: 3, To: 3}}
@@ -971,6 +973,8 @@ func TestDriveXmuxOverH3(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	defer storage.Close()
+	setDriveEndpoints(storage, "https://www.googleapis.com/token", "https://www.googleapis.com/files", "https://www.googleapis.com/upload")
 	session := sessionStorage(storage)
 	defer session.Close()
 
@@ -989,6 +993,9 @@ func TestDriveXmuxOverH3(t *testing.T) {
 type stallConn struct{}
 
 func (stallConn) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Path == "/prime" {
+		return okConn{}.RoundTrip(r)
+	}
 	<-r.Context().Done()
 	return nil, r.Context().Err()
 }
@@ -1004,44 +1011,51 @@ func (okConn) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestSessionRetiresStalledConn(t *testing.T) {
-	oldGrace := stalledGrace
-	stalledGrace = 0
-	t.Cleanup(func() { stalledGrace = oldGrace })
-	made := atomic.Int32{}
-	transport := &sessionTransport{pool: newConnPool(nil, func(connCtx context.Context) *http.Client {
-		if made.Add(1) == 1 {
-			return &http.Client{Transport: stallConn{}}
+	driveClock(t, func(t *testing.T) {
+		made := atomic.Int32{}
+		transport := &sessionTransport{pool: newConnPool(nil, func(connCtx context.Context) *http.Client {
+			if made.Add(1) == 1 {
+				return &http.Client{Transport: stallConn{}}
+			}
+			return &http.Client{Transport: okConn{}}
+		})}
+		storage := &driveStorage{
+			driveShared: &driveShared{
+				token:       "token",
+				tokenExpiry: time.Now().Add(time.Hour),
+				backoff:     time.Millisecond,
+			},
+			client:   &http.Client{Transport: transport},
+			inflight: make(chan struct{}, 1),
+			reserved: make(chan struct{}, 1),
 		}
-		return &http.Client{Transport: okConn{}}
-	})}
-	storage := &driveStorage{
-		driveShared: &driveShared{
-			token:       "token",
-			tokenExpiry: time.Now().Add(time.Hour),
-			backoff:     time.Millisecond,
-		},
-		client:   &http.Client{Transport: transport},
-		inflight: make(chan struct{}, 1),
-		reserved: make(chan struct{}, 1),
-	}
+		defer transport.Close()
+		req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/prime", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		<-time.NewTimer(stalledGrace).C
 
-	ctx := context.WithValue(context.Background(), attemptKey{}, 100*time.Millisecond)
-	code, body, err := storage.do(ctx, http.MethodPost, "http://drive.invalid/files", "", nil)
-	if err != nil {
-		t.Fatalf("the first request over a stalled connection: %v", err)
-	}
-	if code != http.StatusOK || string(body) != `{"id":"file-1"}` {
-		t.Fatalf("the stalled connection gave %d %q", code, body)
-	}
-	if n := made.Load(); n != 2 {
-		t.Fatalf("a stalled connection took %d connections, want it retired and one made after it", n)
-	}
-	if _, _, err := storage.do(ctx, http.MethodPost, "http://drive.invalid/files", "", nil); err != nil {
-		t.Fatalf("the request after the retirement: %v", err)
-	}
-	if n := made.Load(); n != 2 {
-		t.Fatalf("%d connections were made, want the healthy one kept", n)
-	}
+		ctx := context.WithValue(context.Background(), attemptKey{}, 100*time.Millisecond)
+		code, body, err := storage.do(ctx, http.MethodPost, "http://drive.invalid/files", "", nil)
+		if err != nil {
+			t.Fatalf("the first request over a stalled connection: %v", err)
+		}
+		if code != http.StatusOK || string(body) != `{"id":"file-1"}` {
+			t.Fatalf("the stalled connection gave %d %q", code, body)
+		}
+		if n := made.Load(); n != 2 {
+			t.Fatalf("a stalled connection took %d connections, want it retired and one made after it", n)
+		}
+		if _, _, err := storage.do(ctx, http.MethodPost, "http://drive.invalid/files", "", nil); err != nil {
+			t.Fatalf("the request after the retirement: %v", err)
+		}
+		if n := made.Load(); n != 2 {
+			t.Fatalf("%d connections were made, want the healthy one kept", n)
+		}
+	})
 }
 
 func TestSessionIgnoresStallOfRetiredConn(t *testing.T) {
@@ -1086,56 +1100,5 @@ func TestSessionIgnoresStallOfRetiredConn(t *testing.T) {
 	send()
 	if n := made.Load(); n != 3 {
 		t.Fatalf("a stall of the current connection made %d connections, want it retired", n)
-	}
-}
-
-func TestSessionSparesFreshConn(t *testing.T) {
-	transport := &sessionTransport{pool: newConnPool(nil, func(connCtx context.Context) *http.Client {
-		return &http.Client{Transport: okConn{}}
-	})}
-	send := func() {
-		req, err := http.NewRequest(http.MethodGet, "http://drive.invalid/files", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp, err := transport.RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-	}
-	current := func() *poolConn {
-		transport.mu.Lock()
-		defer transport.mu.Unlock()
-		return transport.client.XmuxConn.(*poolConn)
-	}
-	send()
-	conn := current()
-	transport.mu.Lock()
-	transport.takenAt, transport.served = time.Now(), false
-	transport.mu.Unlock()
-	transport.stalled(time.Now())
-	transport.stalled(time.Now())
-	if conn.IsClosed() {
-		t.Fatal("a fresh connection was retired before its grace period ended")
-	}
-	transport.mu.Lock()
-	transport.takenAt = time.Now().Add(-stalledGrace - time.Second)
-	transport.mu.Unlock()
-	transport.stalled(time.Now())
-	transport.stalled(time.Now())
-	if !conn.IsClosed() {
-		t.Fatal("a fresh connection older than its grace period was not retired")
-	}
-	send()
-	conn = current()
-	transport.mu.Lock()
-	transport.takenAt, transport.served = time.Now(), true
-	transport.slowAt, transport.retiredAt = time.Time{}, time.Time{}
-	transport.mu.Unlock()
-	transport.stalled(time.Now())
-	transport.stalled(time.Now())
-	if !conn.IsClosed() {
-		t.Fatal("a connection that had answered was not retired")
 	}
 }

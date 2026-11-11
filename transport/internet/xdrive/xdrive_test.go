@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/rand"
 	gotls "crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/xtls/xray-core/common/net"
@@ -19,9 +22,43 @@ import (
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+	"google.golang.org/protobuf/proto"
 )
 
 const testPatience = 30 * time.Second
+
+// Install process-lifetime guards before any test worker starts; never restore
+// mutable request hooks while a teardown goroutine might still be using them.
+func TestMain(m *testing.M) {
+	for _, name := range []string{"XRAY_XDRIVE_DRIVE_SECRETS", "XDRIVE_YANDEX_USER", "XDRIVE_YANDEX_PASS"} {
+		os.Unsetenv(name)
+	}
+	testServiceDial = func(dest net.Destination) error { return localTestTarget(dest.Address.String()) }
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		if err := localTestTarget(host); err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	http.DefaultTransport = transport
+	if os.Getenv("XDRIVE_TEST_CNC") == "1" {
+		internet.UseAlternativeSystemDialer(cncDialer{})
+	}
+	os.Exit(m.Run())
+}
+
+func localTestTarget(host string) error {
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("xdrive test blocked non-loopback target %q before DNS/dial", host)
+}
 
 func settings(folder string) *internet.MemoryStreamConfig {
 	return &internet.MemoryStreamConfig{
@@ -753,12 +790,10 @@ func TestXmuxConnections(t *testing.T) {
 func TestDriveXmuxConnections(t *testing.T) {
 	drive := newFakeDrive(t)
 	server := newTLSServer(t, &gotls.Config{NextProtos: chromeALPN}, drive.server.Config.Handler.ServeHTTP)
-	driveTokenURL = server.URL + "/token"
-	driveFilesURL = server.URL + "/files"
-	driveUploadURL = server.URL + "/upload"
 	settings := driveSettings()
 	settings.SecuritySettings = server.settings(&tls.Config{}).SecuritySettings
 	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: 3, To: 3}}
+	prepareDrive(t, settings, server.URL+"/token", server.URL+"/files", server.URL+"/upload")
 
 	runSessions(t, settings, 3)
 	if got := server.conns.Load(); got != 4 {
@@ -823,14 +858,14 @@ func TestSessionKnowsHTTP1Hosts(t *testing.T) {
 
 	drive := newFakeDrive(t)
 	server = newTLSServer(t, &gotls.Config{NextProtos: []string{"http/1.1"}}, slow(drive.server.Config.Handler.ServeHTTP))
-	driveTokenURL = server.URL + "/token"
-	driveFilesURL = server.URL + "/files"
 	settings = driveSettings()
 	settings.SecuritySettings = server.settings(&tls.Config{}).SecuritySettings
 	google, err := newDriveStorage(settings, settings.ProtocolSettings.(*Config))
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	defer google.Close()
+	setDriveEndpoints(google, server.URL+"/token", server.URL+"/files", server.URL+"/upload")
 	check("drive", server, google)
 }
 
@@ -958,14 +993,14 @@ func TestSessionTokenConnection(t *testing.T) {
 
 	drive := newFakeDrive(t)
 	server = newTLSServer(t, &gotls.Config{NextProtos: chromeALPN}, drive.server.Config.Handler.ServeHTTP)
-	driveTokenURL = server.URL + "/token"
-	driveFilesURL = server.URL + "/files"
 	settings = driveSettings()
 	settings.SecuritySettings = server.settings(&tls.Config{}).SecuritySettings
 	google, err := newDriveStorage(settings, settings.ProtocolSettings.(*Config))
 	if err != nil {
 		t.Fatalf("newDriveStorage: %v", err)
 	}
+	defer google.Close()
+	setDriveEndpoints(google, server.URL+"/token", server.URL+"/files", server.URL+"/upload")
 	check("drive", server, google)
 }
 
@@ -1023,5 +1058,115 @@ func TestClientNeverDeletes(t *testing.T) {
 	dropSpare(ctx, spareRing{storage: s, session: "spare"})
 	if s.deletes.Load() != 0 || s.closes.Load() != 2 {
 		t.Fatalf("client cleanup: deletes=%d closes=%d", s.deletes.Load(), s.closes.Load())
+	}
+}
+
+type queuedReader struct{ ch chan []byte }
+
+func (r queuedReader) chunks() <-chan []byte { return r.ch }
+func (queuedReader) Err() error              { return nil }
+func (queuedReader) Wake()                   {}
+
+func TestPendingReadDeadlineWakeAndClear(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		r := queuedReader{make(chan []byte)}
+		c := &Conn{reader: r, readDeadline: newPipeDeadline(), closing: make(chan struct{})}
+		c.SetReadDeadline(time.Now().Add(testPatience))
+		done := make(chan error, 1)
+		go func() { _, err := c.Read(make([]byte, 1)); done <- err }()
+		synctest.Wait()
+		c.SetReadDeadline(time.Now().Add(time.Second))
+		if err := <-done; !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("pending read after moving deadline: %v", err)
+		}
+		c.SetReadDeadline(time.Time{})
+		go func() { _, err := c.Read(make([]byte, 1)); done <- err }()
+		r.ch <- []byte("x")
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+type heldWALStorage struct {
+	Storage
+	gate    chan struct{}
+	started atomic.Int32
+}
+
+func (s *heldWALStorage) Put(ctx context.Context, _ string, _ []byte) error {
+	s.started.Add(1)
+	select {
+	case <-s.gate:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestWALBackpressureHonorsDeadline(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := paramsFromConfig(&Config{SegmentBytes: 1024, Concurrency: 4})
+		s := &heldWALStorage{gate: make(chan struct{})}
+		w := newWALWriter(ctx, s, "wal", p)
+		deadline := make(chan struct{})
+		done := make(chan struct{})
+		var n int
+		var err error
+		go func() { n, err = w.writeUntil(make([]byte, 100<<10), deadline, nil); close(done) }()
+		synctest.Wait()
+		close(deadline)
+		<-done
+		if err != errWriteStopped || n > 2*p.concurrency*p.segmentBytes || s.started.Load() > int32(p.concurrency) {
+			t.Errorf("unbounded/unstoppable write: n=%d err=%v uploads=%d", n, err, s.started.Load())
+		}
+		close(s.gate)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestStorageKeyProfilesAndStability(t *testing.T) {
+	base := func() *internet.MemoryStreamConfig {
+		return &internet.MemoryStreamConfig{
+			ProtocolSettings: &Config{Service: "s3", RemoteFolder: "folder", Secrets: []string{"dummy"}, Xmux: &splithttp.XmuxConfig{}, S3: &S3Config{Bucket: "bucket"}},
+			SecuritySettings: &tls.Config{ServerName: "one.invalid", NextProtocol: []string{"h2"}},
+			SocketSettings:   &internet.SocketConfig{}, QuicParams: &internet.QuicParams{},
+		}
+	}
+	key := func(s *internet.MemoryStreamConfig) string { return shareKey(s, s.ProtocolSettings.(*Config)) }
+	a := base()
+	if key(a) != key(base()) {
+		t.Fatal("equivalent profiles have different keys")
+	}
+	for name, change := range map[string]func(*internet.MemoryStreamConfig){
+		"tls":    func(s *internet.MemoryStreamConfig) { s.SecuritySettings.(*tls.Config).ServerName = "two.invalid" },
+		"alpn":   func(s *internet.MemoryStreamConfig) { s.SecuritySettings.(*tls.Config).NextProtocol = []string{"h3"} },
+		"socket": func(s *internet.MemoryStreamConfig) { s.SocketSettings.DialerProxy = "other" },
+		"quic":   func(s *internet.MemoryStreamConfig) { s.QuicParams.DisableGSO = true },
+		"xmux": func(s *internet.MemoryStreamConfig) {
+			s.ProtocolSettings.(*Config).Xmux.MaxConnections = &splithttp.RangeConfig{From: 2, To: 2}
+		},
+		"s3":     func(s *internet.MemoryStreamConfig) { s.ProtocolSettings.(*Config).S3.Bucket = "other" },
+		"secret": func(s *internet.MemoryStreamConfig) { s.ProtocolSettings.(*Config).Secrets[0] = "other-dummy" },
+		"template": func(s *internet.MemoryStreamConfig) {
+			s.ProtocolSettings.(*Config).Template = `{"auth":{"type":"none"}}`
+		},
+	} {
+		b := base()
+		change(b)
+		if key(a) == key(b) {
+			t.Errorf("different %s profiles share storage", name)
+		}
+	}
+	c := a.ProtocolSettings.(*Config)
+	before := proto.Clone(c)
+	paramsForStorage(c, &driveStorage{})
+	newConnPool(c.Xmux, func(context.Context) *http.Client { t.Error("pool eagerly dialed"); return nil })
+	if !proto.Equal(c, before) || key(a) != key(base()) {
+		t.Fatal("parameter/pool setup mutated the config or key")
 	}
 }

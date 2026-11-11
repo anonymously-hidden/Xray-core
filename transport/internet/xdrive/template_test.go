@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,28 @@ import (
 
 	"github.com/xtls/xray-core/transport/internet"
 )
+
+func TestTemplateOAuthEscapesValues(t *testing.T) {
+	secrets := []string{"dummy&+= value雪", "dummy%+/refresh"}
+	client := &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+		want := url.Values{"client_id": {secrets[0]}, "refresh_token": {secrets[1]}}
+		if err := r.ParseForm(); err != nil || !reflect.DeepEqual(r.PostForm, want) {
+			t.Error("OAuth form failed to preserve substituted values")
+		}
+		return memoryResponse(http.StatusOK, `{"access_token":"dummy-token","expires_in":3600}`), nil
+	})}
+	s := &templateStorage{templateShared: &templateShared{
+		tmpl: &storageTemplate{Auth: authTemplate{
+			Type: "oauth2", TokenURL: "https://oauth.invalid/token", ExpiryPath: "expires_in",
+			Form:   map[string]string{"client_id": "{secret0}", "refresh_token": "{secret1}"},
+			Header: map[string]string{"Authorization": "Bearer {token}"},
+		}},
+		tokenClient: client, secrets: secrets,
+	}}
+	if h, err := s.authHeaders(context.Background(), s.baseVars()); err != nil || h["Authorization"] != "Bearer dummy-token" {
+		t.Fatalf("OAuth headers: %v", err)
+	}
+}
 
 type fakeStore struct {
 	server *httptest.Server

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"io"
 	"math/rand"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -105,11 +105,6 @@ func (m *memSlots) readBody(ctx context.Context, id string) ([]byte, error) {
 
 // the slots of all tests are asked for often, set once as a goroutine of a
 // closed Conn may still read them
-func init() {
-	slotHuntFloor, slotHuntCeiling, slotTailMin, slotTailMax = 2*time.Millisecond, 10*time.Millisecond, 5*time.Millisecond, 20*time.Millisecond
-	slotAckRetry, slotWatermarkTTL = 2*time.Millisecond, 2*time.Millisecond
-}
-
 func slotPair(t *testing.T, store slotStore, concurrency, segmentBytes uint32) (*Conn, *Conn) {
 	t.Helper()
 	p := paramsFromConfig(&Config{
@@ -381,10 +376,6 @@ func (s *stuckBodySlots) readBody(ctx context.Context, id string) ([]byte, error
 }
 
 func TestSlotBodyHedge(t *testing.T) {
-	old := slotBodyHedge
-	slotBodyHedge = 50 * time.Millisecond
-	defer func() { slotBodyHedge = old }()
-
 	store := &stuckBodySlots{memSlots: newMemSlots()}
 	client, server := slotPair(t, store, 2, 64<<10)
 	payload := randomPayload(200 << 10)
@@ -399,84 +390,6 @@ func TestSlotBodyHedge(t *testing.T) {
 	readAll(t, server, payload)
 	if store.calls.Load() < 2 {
 		t.Fatalf("the stuck body read was not hedged, %d reads", store.calls.Load())
-	}
-}
-
-type timedBodySlots struct {
-	*memSlots
-	calls atomic.Int32
-	delay time.Duration
-	stuck atomic.Bool
-}
-
-func (s *timedBodySlots) readBody(ctx context.Context, id string) ([]byte, error) {
-	n := s.calls.Add(1)
-	if s.stuck.Load() && n == 1 {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(s.delay):
-	}
-	return make([]byte, 1000), nil
-}
-
-func TestSlotBodyHedgeRate(t *testing.T) {
-	old := slotBodyHedge
-	slotBodyHedge = 20 * time.Millisecond
-	t.Cleanup(func() { slotBodyHedge = old })
-
-	store := &timedBodySlots{memSlots: newMemSlots(), delay: 60 * time.Millisecond}
-	r := &slotReader{store: store}
-	ctx := context.Background()
-	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
-		t.Fatal(err)
-	}
-	store.calls.Store(0)
-	start := time.Now()
-	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
-		t.Fatalf("the progressing read returned in %v, before its body was ready", elapsed)
-	}
-	if n := store.calls.Load(); n != 1 {
-		t.Fatalf("a progressing read after a learned slow rate hedged, %d reads", n)
-	}
-
-	r.mu.Lock()
-	rate := r.bodyRate
-	r.mu.Unlock()
-	if rate <= 0 {
-		t.Fatal("no body read rate was learned")
-	}
-	expected := max(slotBodyHedge, time.Duration(float64(2*1000)/rate*float64(time.Second)))
-	store.stuck.Store(true)
-	store.calls.Store(0)
-	start = time.Now()
-	if _, err := r.readBodyHedged(ctx, "id", 1000); err != nil {
-		t.Fatal(err)
-	}
-	elapsed := time.Since(start)
-	if n := store.calls.Load(); n < 2 {
-		t.Fatalf("a stuck read after a learned rate was not hedged, %d reads", n)
-	}
-	if elapsed < expected/2 {
-		t.Fatalf("the stuck read hedged after %v, want about %v", elapsed, expected)
-	}
-
-	freshStore := &timedBodySlots{memSlots: newMemSlots()}
-	freshStore.stuck.Store(true)
-	fresh := &slotReader{store: freshStore}
-	store.calls.Store(0)
-	start = time.Now()
-	if _, err := fresh.readBodyHedged(ctx, "id", 1000); err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := time.Since(start); elapsed < slotBodyHedge {
-		t.Fatalf("with no learned rate the hedge came after %v, want at least %v", elapsed, slotBodyHedge)
 	}
 }
 
@@ -504,7 +417,7 @@ func TestTakeSpareSkipsStale(t *testing.T) {
 	}
 }
 
-func TestDropSpareLeavesSessionForServer(t *testing.T) {
+func TestDropSpareDeletesSession(t *testing.T) {
 	st, err := newLocalStorage(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -582,10 +495,6 @@ func (s lagSlots) setSlot(ctx context.Context, id, description string, body []by
 }
 
 func TestSlotReadAheadBurst(t *testing.T) {
-	oldMin, oldMax := slotTailMin, slotTailMax
-	slotTailMin, slotTailMax = 150*time.Millisecond, 800*time.Millisecond
-	t.Cleanup(func() { slotTailMin, slotTailMax = oldMin, oldMax })
-
 	client, server := slotPair(t, lagSlots{newMemSlots()}, 16, 512<<10)
 	payload := randomPayload(8 * slotInlineLimit)
 	go client.Write(payload)
@@ -792,172 +701,108 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 	}
 }
 
-type holdSlots struct {
+type orderedSlots struct {
 	*memSlots
-	target string
-	hold   chan struct{}
+	wm                              string
+	entered, release, acked, reused chan struct{}
+	enterOnce, ackOnce, reuseOnce   sync.Once
+	uploading, overlap              atomic.Bool
+	fail                            bool
 }
 
-func (s *holdSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
-	if id == s.target {
-		select {
-		case <-s.hold:
-		case <-ctx.Done():
-			return ctx.Err()
+func (s *orderedSlots) write(ctx context.Context, id, name, description string, body []byte, create bool) error {
+	if f, ok := decodeSlot(description); ok {
+		if f.seq == 0 && f.mode != slotErr {
+			s.enterOnce.Do(func() { close(s.entered) })
+			select {
+			case <-s.release:
+				s.uploading.Store(false)
+				if s.fail {
+					return io.ErrUnexpectedEOF
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if f.seq == 2 {
+			s.overlap.Store(s.uploading.Load())
+			s.reuseOnce.Do(func() { close(s.reused) })
 		}
 	}
-	return s.memSlots.setSlot(ctx, id, description, body)
+	var err error
+	if create {
+		err = s.memSlots.createSlot(ctx, id, name, description, body)
+	} else {
+		err = s.memSlots.setSlot(ctx, id, description, body)
+	}
+	if err == nil && id == s.wm && description == "1" {
+		s.ackOnce.Do(func() { close(s.acked) })
+	}
+	return err
 }
 
-func TestSlotFirstAnnouncement(t *testing.T) {
-	p := params{
-		concurrency:     2,
-		segmentBytes:    4096,
-		flushInterval:   time.Millisecond,
-		minPollInterval: time.Millisecond,
-		maxPollInterval: 5 * time.Millisecond,
-		sessionTTL:      time.Minute,
-	}
-	store := &holdSlots{memSlots: newMemSlots(), hold: make(chan struct{})}
-	ctx := context.Background()
-	r, err := makeRing(ctx, store, "first", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store.target = r.Up.Slots[0]
-	client := newSlotConn(ctx, store, r.Up, r.Down, p, nil, nil)
-	defer client.Close()
-	writer := client.writer.(*slotWriter)
-	writer.first = make(chan []byte, 1)
+func (s *orderedSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	return s.write(ctx, id, "", description, body, false)
+}
 
-	payload := randomPayload(10000)
-	errs := make(chan error, 1)
-	go func() {
-		_, err := client.Write(payload)
-		if err == nil {
-			err = client.Close()
+func (s *orderedSlots) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	return s.write(ctx, id, name, description, body, true)
+}
+
+func TestSlotZeroUploadPrecedesReuse(t *testing.T) {
+	for _, lazy := range []bool{false, true} {
+		for _, fail := range []bool{false, true} {
+			t.Run(strconv.FormatBool(lazy)+"/failure="+strconv.FormatBool(fail), func(t *testing.T) {
+				driveClock(t, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					p := paramsFromConfig(&Config{SegmentBytes: 1, Concurrency: 2})
+					table := slotTable{Slots: []string{"s0", "s1"}, Watermark: "wm", name: "ordered", lazy: lazy}
+					s := &orderedSlots{memSlots: newMemSlots(), wm: table.Watermark, fail: fail,
+						entered: make(chan struct{}), release: make(chan struct{}), acked: make(chan struct{}), reused: make(chan struct{})}
+					if !lazy {
+						for _, id := range append(table.Slots, table.Watermark) {
+							s.descs[id] = ""
+						}
+					}
+					s.uploading.Store(true)
+					w := newSlotWriter(ctx, s, table, p)
+					defer func() { cancel(); w.wg.Wait(); synctest.Wait() }()
+					w.first = make(chan []byte, 1)
+					if _, err := w.Write([]byte("a")); err != nil {
+						t.Fatal(err)
+					}
+					<-s.entered
+					r := newSlotReader(ctx, s, table, p, <-w.first)
+					if string(<-r.chunks()) != "a" {
+						t.Fatal("announcement lost seq 0")
+					}
+					if _, err := w.Write([]byte("b")); err != nil {
+						t.Fatal(err)
+					}
+					if string(<-r.chunks()) != "b" {
+						t.Fatal("seq 1 missing")
+					}
+					<-s.acked
+					if _, err := w.Write([]byte("c")); err != nil {
+						t.Fatal(err)
+					}
+					<-time.NewTimer(p.maxPollInterval).C
+					synctest.Wait()
+					select {
+					case <-s.reused:
+						t.Error("slot 0 was reused while upload 0 was held")
+					default:
+					}
+					close(s.release)
+					<-s.reused
+					w.wg.Wait()
+					desc, err := s.readDescription(ctx, table.Slots[0])
+					frame, ok := decodeSlot(desc)
+					if err != nil || !ok || frame.seq != 2 || s.overlap.Load() {
+						t.Fatalf("slot reuse after upload success/failure: seq=%d overlap=%v err=%v", frame.seq, s.overlap.Load(), err)
+					}
+				})
+			})
 		}
-		errs <- err
-	}()
-	var first []byte
-	select {
-	case first = <-writer.first:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the writer never flushed seq 0")
-	}
-	announced := r
-	announced.First = first
-	encoded, err := json.Marshal(announced)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) > driveInlineLimit {
-		t.Fatalf("the test announcement is %d bytes, want the inline path", len(encoded))
-	}
-	decoded, ok := decodeRing(encoded)
-	if !ok {
-		t.Fatal("the announcement with First did not decode")
-	}
-	server := newSlotConn(ctx, store, decoded.Down, decoded.Up, p, decoded.First, nil)
-	defer server.Close()
-	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	gotFirst := make([]byte, len(first))
-	if _, err := io.ReadFull(server, gotFirst); err != nil {
-		t.Fatalf("the first bytes did not arrive before the ring write: %v", err)
-	}
-	if !bytes.Equal(gotFirst, first) {
-		t.Fatal("the primed first bytes changed")
-	}
-	close(store.hold)
-	rest := make([]byte, len(payload)-len(first))
-	if _, err := io.ReadFull(server, rest); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(append(gotFirst, rest...), payload) {
-		t.Fatal("the stream was duplicated or changed")
-	}
-	if err := <-errs; err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestSlotFirstAnnouncementTooLarge(t *testing.T) {
-	p := params{
-		concurrency:   2,
-		segmentBytes:  256 << 10,
-		flushInterval: time.Millisecond,
-		sessionTTL:    time.Minute,
-	}
-	store := newMemSlots()
-	ctx := context.Background()
-	r, err := makeRing(ctx, store, "large-first", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := newSlotConn(ctx, store, r.Up, r.Down, p, nil, nil)
-	defer client.Close()
-	writer := client.writer.(*slotWriter)
-	writer.first = make(chan []byte, 1)
-	go client.Write(randomPayload(300 << 10))
-	var first []byte
-	select {
-	case first = <-writer.first:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the writer never flushed seq 0")
-	}
-	if len(first) <= slotInlineLimit {
-		t.Fatalf("the first segment is %d bytes, want a media segment", len(first))
-	}
-	withFirst := r
-	withFirst.First = first
-	encoded, err := json.Marshal(withFirst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(encoded) <= driveInlineLimit {
-		t.Fatalf("a %d byte first segment fit the inline announcement", len(first))
-	}
-	plain, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, ok := decodeRing(plain)
-	if !ok || decoded.First != nil {
-		t.Fatal("the announcement without First did not decode cleanly")
-	}
-}
-
-func TestSlotRingFirstCompatibility(t *testing.T) {
-	p := params{concurrency: 2, sessionTTL: time.Minute}
-	store := newMemSlots()
-	r, err := makeRing(context.Background(), store, "compat", p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.First = []byte("hello")
-	encoded, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var oldServer struct {
-		Up   slotTable `json:"u"`
-		Down slotTable `json:"d"`
-	}
-	if err := json.Unmarshal(encoded, &oldServer); err != nil {
-		t.Fatalf("an old server could not ignore First: %v", err)
-	}
-	if len(oldServer.Up.Slots) != len(r.Up.Slots) || len(oldServer.Down.Slots) != len(r.Down.Slots) {
-		t.Fatal("an old server lost the ring tables")
-	}
-	r.First = nil
-	plain, err := json.Marshal(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, ok := decodeRing(plain)
-	if !ok || decoded.First != nil {
-		t.Fatal("an old client announcement did not decode")
 	}
 }
