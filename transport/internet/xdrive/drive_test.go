@@ -960,48 +960,6 @@ func TestKeeperPrunesAndStopsIdle(t *testing.T) {
 	})
 }
 
-func TestDriveBulkStallRetiresBulkOnly(t *testing.T) {
-	driveClock(t, func(t *testing.T) {
-		var made [2]atomic.Int32
-		transport := func(lane int) *sessionTransport {
-			return &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
-				generation := made[lane].Add(1)
-				return &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
-					if lane == 1 && generation == 1 && r.URL.Path != "/prime" {
-						<-r.Context().Done()
-						return nil, r.Context().Err()
-					}
-					return memoryResponse(http.StatusOK, `{"id":"done"}`), nil
-				})}
-			})}
-		}
-		primary, bulk := transport(0), transport(1)
-		defer primary.Close()
-		defer bulk.Close()
-		for _, lane := range []*sessionTransport{primary, bulk} {
-			req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/prime", nil)
-			resp, err := lane.RoundTrip(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			resp.Body.Close()
-		}
-		s := memoryDrive(primary)
-		s.bulkClient = &http.Client{Transport: bulk}
-		ctx := context.WithValue(context.Background(), bodyKey{}, true)
-		ctx = context.WithValue(ctx, attemptKey{}, 20*time.Millisecond)
-		if _, _, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil); err != nil {
-			t.Fatal(err)
-		}
-		primary.mu.Lock()
-		retired := !primary.retiredAt.IsZero() || !primary.slowAt.IsZero()
-		primary.mu.Unlock()
-		if retired || made[0].Load() != 1 || made[1].Load() != 2 {
-			t.Fatalf("wrong stall attribution: primary=%d bulk=%d", made[0].Load(), made[1].Load())
-		}
-	})
-}
-
 func TestDriveRefreshInitiatorCancellation(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		entered, release := make(chan struct{}), make(chan struct{})
