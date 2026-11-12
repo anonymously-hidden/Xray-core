@@ -1116,6 +1116,15 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	start := time.Now()
+	var progress struct {
+		sync.Mutex
+		at time.Time
+	}
+	ctx = context.WithValue(ctx, bodyProgressKey{}, func() {
+		progress.Lock()
+		progress.at = time.Now()
+		progress.Unlock()
+	})
 
 	type result struct {
 		body []byte
@@ -1155,6 +1164,15 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([
 				return nil, last.err
 			}
 		case <-timer.C:
+			// A body that is moving shares the bulk connection with its hedge;
+			// duplicating it would compete with the bytes already on their way.
+			progress.Lock()
+			remaining := delay - time.Since(progress.at)
+			progress.Unlock()
+			if remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
 			if outstanding == 1 {
 				launch()
 				outstanding++

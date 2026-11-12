@@ -873,6 +873,57 @@ func TestDriveBodyStallRetiresBulkOnly(t *testing.T) {
 	})
 }
 
+func TestDriveBodyHedgeWaitsForStall(t *testing.T) {
+	for _, mode := range []string{"moving", "body-stall", "header-stall"} {
+		t.Run(mode, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				var calls atomic.Int32
+				s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+					if calls.Add(1) > 1 {
+						return memoryResponse(http.StatusOK, "xxxxxx"), nil
+					}
+					if mode == "header-stall" {
+						<-req.Context().Done()
+						return nil, req.Context().Err()
+					}
+					reader, writer := io.Pipe()
+					stop := context.AfterFunc(req.Context(), func() { reader.CloseWithError(req.Context().Err()) })
+					go func() {
+						defer stop()
+						defer writer.Close()
+						for i := range 6 {
+							if mode == "body-stall" && i == 3 {
+								<-req.Context().Done()
+								return
+							}
+							<-time.NewTimer(slotBodyHedge / 2).C
+							if _, err := io.WriteString(writer, "x"); err != nil {
+								return
+							}
+						}
+					}()
+					resp := memoryResponse(http.StatusOK, "")
+					resp.Body = reader
+					return resp, nil
+				}))
+				r := &slotReader{store: s}
+				start := time.Now()
+				body, err := r.readBodyHedged(context.Background(), "body", 6)
+				synctest.Wait()
+				wantCalls, wantTime := int32(2), slotBodyHedge
+				if mode == "moving" {
+					wantCalls, wantTime = 1, 3*slotBodyHedge
+				} else if mode == "body-stall" {
+					wantTime = 5 * slotBodyHedge / 2
+				}
+				if err != nil || string(body) != "xxxxxx" || calls.Load() != wantCalls || time.Since(start) != wantTime {
+					t.Fatalf("body=%q err=%v calls=%d elapsed=%v", body, err, calls.Load(), time.Since(start))
+				}
+			})
+		})
+	}
+}
+
 func TestDriveAuthErrorIsSticky(t *testing.T) {
 	var requests atomic.Int32
 	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {

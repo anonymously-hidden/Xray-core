@@ -72,6 +72,9 @@ type laneKey struct{}
 // small reads/acks off the connection saturated by large transfers.
 type bodyKey struct{}
 
+// bodyProgressKey carries the callback for a media read's hedge timer.
+type bodyProgressKey struct{}
+
 type attemptKey struct{}
 
 // cleanupKey marks session-cleanup requests (the child deletions of Delete and
@@ -647,6 +650,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		limit := int64(driveMaxResponse)
 		if v, ok := ctx.Value(maxBodyKey{}).(int64); ok && v > 0 {
 			limit = v
+		}
+		if progress, ok := ctx.Value(bodyProgressKey{}).(func()); ok {
+			resp.Body = &progressBody{ReadCloser: resp.Body, alive: progress}
 		}
 		payload, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 		if err != nil {
