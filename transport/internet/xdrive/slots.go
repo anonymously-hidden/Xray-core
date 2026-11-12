@@ -436,10 +436,10 @@ func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
 		n = min(len(w.buf), w.segmentBytes)
 	}
 	// Count the token acquired above as available to this batch. Fan out
-	// inline only if the whole buffer fits without waiting for an upload, and
-	// once the size has ramped only for data below one segment.
+	// inline if the whole buffer fits without waiting for an upload, even
+	// after the segment size has ramped during an earlier burst.
 	free := cap(w.slots) - len(w.slots) + 1
-	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free && (w.size <= slotInlineLimit || len(w.buf) < w.size) {
+	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free {
 		n = min(len(w.buf), slotInlineLimit, w.segmentBytes)
 	}
 	if n >= w.size && w.size < w.segmentBytes {

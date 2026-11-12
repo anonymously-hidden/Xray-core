@@ -701,6 +701,55 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 	}
 }
 
+func TestSlotRampedBurstSplitsInline(t *testing.T) {
+	for _, busy := range []int{0, slotWriteInflight - 1} {
+		t.Run(strconv.Itoa(busy), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store := newMemSlots()
+				p := paramsFromConfig(&Config{Concurrency: 64})
+				ring, err := makeRing(ctx, store, "ramped", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := newSlotWriter(ctx, store, ring.Up, p)
+				w.mu.Lock()
+				w.size = 2 * slotInlineLimit
+				w.mu.Unlock()
+				for range busy {
+					w.slots <- struct{}{}
+				}
+				payload := randomPayload(2 * slotInlineLimit)
+				if n, err := w.Write(payload); err != nil || n != len(payload) {
+					t.Fatalf("Write: %d, %v", n, err)
+				}
+				for range busy {
+					<-w.slots
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store.mu.Lock()
+				defer store.mu.Unlock()
+				var got []byte
+				for seq := int64(0); seq < w.seq; seq++ {
+					id := w.slotID(seq)
+					frame, ok := decodeSlot(store.descs[id])
+					if !ok || frame.seq != seq {
+						t.Fatalf("invalid frame for segment %d", seq)
+					}
+					got = append(got, frame.data...)
+					got = append(got, store.bodies[id]...)
+				}
+				if !bytes.Equal(got, payload) || (len(store.bodies) > 0) != (busy > 0) {
+					t.Fatalf("ramped burst: %d bytes in %d bodies, busy=%d", len(got), len(store.bodies), busy)
+				}
+			})
+		})
+	}
+}
+
 type orderedSlots struct {
 	*memSlots
 	wm                              string
