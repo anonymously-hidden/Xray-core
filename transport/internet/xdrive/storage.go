@@ -101,11 +101,15 @@ func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) strin
 		QUIC                                                 *internet.QuicParams
 		XMUX                                                 *splithttp.XmuxConfig
 		HasFinalMask                                         bool
-	}{Service: config.Service, Folder: config.RemoteFolder, Secrets: config.Secrets,
-		Template: config.Template, XMUX: config.Xmux}
+	}{
+		Service: config.Service, Folder: config.RemoteFolder, Secrets: config.Secrets,
+		Template: config.Template, XMUX: config.Xmux,
+	}
 	if config.S3 != nil {
-		profile.S3 = &S3Config{Endpoint: config.S3.Endpoint, Region: s3Region(config.S3.Region),
-			Bucket: config.S3.Bucket, PathStyle: config.S3.PathStyle}
+		profile.S3 = &S3Config{
+			Endpoint: config.S3.Endpoint, Region: s3Region(config.S3.Region),
+			Bucket: config.S3.Bucket, PathStyle: config.S3.PathStyle,
+		}
 	}
 	if streamSettings != nil {
 		profile.SecurityType = streamSettings.SecurityType

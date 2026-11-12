@@ -483,8 +483,10 @@ func TestSlotPromotesPendingRead(t *testing.T) {
 				store := &promotionSlots{memSlots: newMemSlots(), first: first}
 				want := newSlotFrame(1, slotInline, []byte("tail")).encode()
 				store.descs["tail"] = want
-				r := &slotReader{store: store, huntCeiling: slotHuntCeiling,
-					params: paramsFromConfig(&Config{}), activeAt: time.Now()}
+				r := &slotReader{
+					store: store, huntCeiling: slotHuntCeiling,
+					params: paramsFromConfig(&Config{}), activeAt: time.Now(),
+				}
 				promoted := make(chan struct{})
 				done := make(chan string, 1)
 				start := time.Now()
@@ -798,6 +800,7 @@ func (s *bulkPrefetchSlots) readDescription(ctx context.Context, id string) (str
 		return description, err
 	}
 }
+
 func (s *bulkPrefetchSlots) readBody(ctx context.Context, id string) ([]byte, error) {
 	s.calls.Add(1)
 	select {
@@ -1067,8 +1070,10 @@ func TestSlotZeroUploadPrecedesReuse(t *testing.T) {
 					ctx, cancel := context.WithCancel(context.Background())
 					p := paramsFromConfig(&Config{SegmentBytes: 1, Concurrency: 2})
 					table := slotTable{Slots: []string{"s0", "s1"}, Watermark: "wm", name: "ordered", lazy: lazy}
-					s := &orderedSlots{memSlots: newMemSlots(), wm: table.Watermark, fail: fail,
-						entered: make(chan struct{}), release: make(chan struct{}), acked: make(chan struct{}), reused: make(chan struct{})}
+					s := &orderedSlots{
+						memSlots: newMemSlots(), wm: table.Watermark, fail: fail,
+						entered: make(chan struct{}), release: make(chan struct{}), acked: make(chan struct{}), reused: make(chan struct{}),
+					}
 					if !lazy {
 						for _, id := range append(table.Slots, table.Watermark) {
 							s.descs[id] = ""

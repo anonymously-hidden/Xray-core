@@ -51,8 +51,10 @@ type timingSample struct {
 	hasServer bool
 }
 
-const timingWindow = 60 * time.Second
-const timingRing = 512
+const (
+	timingWindow = 60 * time.Second
+	timingRing   = 512
+)
 
 type timingAggregator struct {
 	mu       sync.Mutex
