@@ -681,6 +681,196 @@ func TestSlotReaderReachesPastWindow(t *testing.T) {
 	}
 }
 
+type bulkPermitSlots struct {
+	*memSlots
+	finish   chan struct{}
+	writes   atomic.Int32
+	throttle atomic.Int64
+	cool     atomic.Bool
+}
+
+func (s *bulkPermitSlots) throttled() int64 { return s.throttle.Load() }
+func (s *bulkPermitSlots) cooling() bool    { return s.cool.Load() }
+func (s *bulkPermitSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if f, ok := decodeSlot(description); ok && (f.mode == slotInline || f.mode == slotMedia) {
+		s.writes.Add(1)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.finish:
+		}
+	}
+	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotBulkPermits(t *testing.T) {
+	payload := randomPayload((slotBulkInflight + 1) * defaultSegmentBytes)
+	for _, mode := range []string{"cold", "warm", "limited", "throttled", "cooling", "small-ring"} {
+		t.Run(mode, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store := &bulkPermitSlots{memSlots: newMemSlots(), finish: make(chan struct{})}
+				p := paramsFromConfig(&Config{Concurrency: slotBulkDepth})
+				if mode == "small-ring" {
+					p.concurrency = 16
+				}
+				ring, err := makeRing(ctx, store, "bulk", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := newSlotWriter(ctx, store, ring.Down, p)
+				if _, err := w.Write(payload[:p.segmentBytes]); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				w.mu.Lock()
+				if mode != "cold" {
+					w.bulkSegments = 2 * p.concurrency
+					w.seq = int64(w.bulkSegments + 1)
+					w.ackMu.Lock()
+					w.acked = w.seq
+					w.ackMu.Unlock()
+				}
+				w.bulkLimited = mode == "limited"
+				w.mu.Unlock()
+				if mode == "throttled" {
+					store.throttle.Add(1)
+				}
+				store.cool.Store(mode == "cooling")
+				closing, done := make(chan struct{}), make(chan error, 1)
+				go func() { _, err := w.writeUntil(payload, nil, closing); done <- err }()
+				synctest.Wait()
+				want := slotWriteInflight
+				if mode == "warm" {
+					want = slotBulkInflight
+				}
+				if got := int(store.writes.Load()); got != want {
+					t.Fatalf("uploads=%d, want %d", got, want)
+				}
+				if mode == "warm" {
+					store.cool.Store(true)
+					for range slotBulkInflight - slotWriteInflight {
+						store.finish <- struct{}{}
+					}
+					synctest.Wait()
+					if int(store.writes.Load()) != want {
+						t.Fatal("cooling admitted an upload above the base window")
+					}
+					store.finish <- struct{}{}
+					synctest.Wait()
+					if int(store.writes.Load()) != want+1 {
+						t.Fatal("returning a permit did not wake the writer")
+					}
+				}
+				close(closing)
+				if err := <-done; err != errWriteStopped {
+					t.Fatalf("stopped write: %v", err)
+				}
+				cancel()
+				w.wg.Wait()
+			})
+		})
+	}
+}
+
+type bulkPrefetchSlots struct {
+	*memSlots
+	start       chan struct{}
+	seen        chan struct{}
+	last        string
+	bodiesReady map[string]chan struct{}
+	calls       atomic.Int32
+}
+
+func (s *bulkPrefetchSlots) readDescription(ctx context.Context, id string) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-s.start:
+		description, err := s.memSlots.readDescription(ctx, id)
+		if id == s.last {
+			select {
+			case s.seen <- struct{}{}:
+			default:
+			}
+		}
+		return description, err
+	}
+}
+func (s *bulkPrefetchSlots) readBody(ctx context.Context, id string) ([]byte, error) {
+	s.calls.Add(1)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.bodiesReady[id]:
+		return s.memSlots.readBody(ctx, id)
+	}
+}
+
+func TestSlotBulkPrefetch(t *testing.T) {
+	for _, bulk := range []bool{false, true} {
+		t.Run(strconv.FormatBool(bulk), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store := &bulkPrefetchSlots{memSlots: newMemSlots(), start: make(chan struct{}), seen: make(chan struct{}, 1), bodiesReady: make(map[string]chan struct{})}
+				p := paramsFromConfig(&Config{Concurrency: slotBulkDepth})
+				ring, err := makeRing(ctx, store, "prefetch", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				payload := randomPayload(slotInlineLimit + 1)
+				store.last = ring.Down.Slots[p.concurrency-1]
+				for i, id := range ring.Down.Slots {
+					store.bodiesReady[id] = make(chan struct{})
+					if err := store.setSlot(ctx, id, newSlotFrame(int64(i), slotMedia, payload).encode(), payload); err != nil {
+						t.Fatal(err)
+					}
+				}
+				r := newSlotReader(ctx, store, ring.Down, p, nil)
+				if bulk {
+					r.mu.Lock()
+					r.bulkBytes = int64(p.concurrency) * int64(p.segmentBytes)
+					r.mu.Unlock()
+				}
+				close(store.start)
+				<-store.seen
+				synctest.Wait()
+				want := p.concurrency
+				if bulk {
+					want = slotBodyAhead
+				}
+				r.mu.Lock()
+				frontier := r.frontier
+				r.mu.Unlock()
+				if int(store.calls.Load()) != want || frontier != int64(p.concurrency-1) {
+					t.Fatalf("bodies=%d frontier=%d", store.calls.Load(), frontier)
+				}
+				close(store.bodiesReady[ring.Down.Slots[0]])
+				synctest.Wait()
+				if bulk && int(store.calls.Load()) != want+1 {
+					t.Fatal("head advancement did not admit the next body")
+				}
+				for _, id := range ring.Down.Slots[1:] {
+					close(store.bodiesReady[id])
+				}
+				synctest.Wait()
+				<-time.NewTimer(r.eagerWindow + r.huntCeiling).C
+				r.Wake()
+				r.mu.Lock()
+				remaining := r.bulkBytes
+				r.mu.Unlock()
+				if remaining != 0 {
+					t.Fatal("idle reader retained its bulk window")
+				}
+				cancel()
+				synctest.Wait()
+			})
+		})
+	}
+}
+
 type countSlots struct {
 	*memSlots
 	cur  atomic.Int32
