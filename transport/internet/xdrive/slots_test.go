@@ -926,7 +926,7 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 	for _, c := range []struct {
 		pieces int
 		media  bool
-	}{{12, false}, {13, true}} {
+	}{{18, false}, {19, true}} {
 		store := newMemSlots()
 		client, server := slotPair(t, store, 16, 512<<10)
 		payload := randomPayload(c.pieces * slotInlineLimit)
@@ -948,12 +948,15 @@ func TestSlotBurstInlineWaves(t *testing.T) {
 }
 
 func TestSlotRampedBurstSplitsInline(t *testing.T) {
-	for _, busy := range []int{0, slotWriteInflight - 1} {
-		t.Run(strconv.Itoa(busy), func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
+	for _, c := range []struct {
+		pieces int
+		media  bool
+	}{{1 + slotWriteInflight/2, false}, {2 + slotWriteInflight/2, true}} {
+		t.Run(strconv.Itoa(c.pieces), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				store := newMemSlots()
+				store := &bulkPermitSlots{memSlots: newMemSlots(), finish: make(chan struct{})}
 				p := paramsFromConfig(&Config{Concurrency: 64})
 				ring, err := makeRing(ctx, store, "ramped", p)
 				if err != nil {
@@ -961,25 +964,37 @@ func TestSlotRampedBurstSplitsInline(t *testing.T) {
 				}
 				w := newSlotWriter(ctx, store, ring.Up, p)
 				w.mu.Lock()
-				w.size = 2 * slotInlineLimit
+				w.size = p.segmentBytes
 				w.mu.Unlock()
-				for range busy {
+				// all permits but one stay with uploads that never finish
+				for range slotWriteInflight - 1 {
 					w.slots <- struct{}{}
 				}
-				payload := randomPayload(2 * slotInlineLimit)
-				if n, err := w.Write(payload); err != nil || n != len(payload) {
-					t.Fatalf("Write: %d, %v", n, err)
-				}
-				for range busy {
-					<-w.slots
-				}
-				if err := w.Close(); err != nil {
+				payload := randomPayload(c.pieces * slotInlineLimit)
+				if _, err := w.Write(payload); err != nil {
 					t.Fatal(err)
 				}
+				segments := c.pieces
+				if c.media {
+					segments = 1
+				}
+				// a tick for the burst to settle, then a segment every tick
+				deadline := time.After(time.Duration(segments+2) * p.flushInterval)
+				for range segments {
+					select {
+					case store.finish <- struct{}{}:
+					case <-deadline:
+						t.Fatalf("%d pieces: %d of %d uploads began in time", c.pieces, store.writes.Load(), segments)
+					}
+				}
+				synctest.Wait()
+				w.mu.Lock()
+				sent := w.seq
+				w.mu.Unlock()
 				store.mu.Lock()
 				defer store.mu.Unlock()
 				var got []byte
-				for seq := int64(0); seq < w.seq; seq++ {
+				for seq := range sent {
 					id := w.slotID(seq)
 					frame, ok := decodeSlot(store.descs[id])
 					if !ok || frame.seq != seq {
@@ -988,8 +1003,8 @@ func TestSlotRampedBurstSplitsInline(t *testing.T) {
 					got = append(got, frame.data...)
 					got = append(got, store.bodies[id]...)
 				}
-				if !bytes.Equal(got, payload) || (len(store.bodies) > 0) != (busy > 0) {
-					t.Fatalf("ramped burst: %d bytes in %d bodies, busy=%d", len(got), len(store.bodies), busy)
+				if sent != int64(segments) || !bytes.Equal(got, payload) || (len(store.bodies) > 0) != c.media {
+					t.Fatalf("%d pieces: %d bytes in %d segments and %d bodies", c.pieces, len(got), sent, len(store.bodies))
 				}
 			})
 		})

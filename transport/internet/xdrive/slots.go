@@ -395,7 +395,9 @@ func (w *slotWriter) readyToFlush() bool {
 	grew := len(w.buf) > w.lastSize
 	w.lastSize = len(w.buf)
 
-	if len(w.slots) > 0 && w.held < maxCoalescedTicks && len(w.buf) < w.size/2 {
+	// While uploads are outstanding, hold only a buffer too small for an
+	// inline segment, so the rest of a split burst leaves a piece every tick.
+	if len(w.slots) > 0 && w.held < maxCoalescedTicks && len(w.buf) < min(w.size/2, slotInlineLimit) {
 		w.held++
 		return false
 	}
@@ -481,10 +483,11 @@ func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
 		n = min(len(w.buf), w.segmentBytes)
 	}
 	// Count the token acquired above as available to this batch. Fan out
-	// inline if the whole buffer fits without waiting for an upload, even
-	// after the segment size has ramped during an earlier burst.
+	// inline if the whole buffer fits in the free tokens and half a window
+	// more, even after the segment size has ramped during an earlier burst:
+	// an inline segment that waits for one upload still arrives before media.
 	free := base - len(w.slots) + 1
-	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free {
+	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free+base/2 {
 		n = min(len(w.buf), slotInlineLimit, w.segmentBytes)
 	}
 	if n >= w.size && w.size < w.segmentBytes {
