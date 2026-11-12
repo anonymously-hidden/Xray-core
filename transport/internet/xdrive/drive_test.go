@@ -890,6 +890,17 @@ func TestDriveAuthErrorIsSticky(t *testing.T) {
 	}
 }
 
+func TestDriveClosedSessionFailsFast(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		transport := &sessionTransport{pool: newConnPool(nil, nil)}
+		transport.Close()
+		start := time.Now()
+		if _, _, err := memoryDrive(transport).do(context.Background(), http.MethodGet, "http://drive.invalid/files", "", nil); err == nil || time.Since(start) != 0 {
+			t.Fatalf("closed session: %v after %v of retries", err, time.Since(start))
+		}
+	})
+}
+
 func TestDriveIDPoolTopUp(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		entered, release := make(chan struct{}), make(chan struct{})

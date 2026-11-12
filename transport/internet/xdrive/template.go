@@ -350,6 +350,9 @@ func (s *templateStorage) do(ctx context.Context, op *opTemplate, vars map[strin
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("request failed").Base(err)
+			if errors.Cause(err) == errSessionClosed {
+				return 0, nil, lastErr
+			}
 			continue
 		}
 		payload, err := io.ReadAll(resp.Body)

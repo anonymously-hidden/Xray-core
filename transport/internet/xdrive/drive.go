@@ -637,6 +637,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("Drive request failed").Base(err)
+			if errors.Cause(err) == errSessionClosed {
+				return 0, nil, lastErr
+			}
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
 			continue
