@@ -1343,9 +1343,12 @@ func (r *slotReader) ackLoop() {
 	acked := int64(-1)
 	var oldest time.Time
 	depth := int64(len(r.table.Slots))
+	// Writes run one at a time and each takes most of a second: a larger
+	// batch holds back the writer's credit, a smaller one only keeps writes
+	// back to back and makes uploads, and so body reads, come in bursts.
 	batch := int64(1)
 	if depth >= 16 {
-		batch = depth / 4
+		batch = depth / 6
 	}
 	wait := r.ackRetry
 	timer := time.NewTimer(r.ackDelay)
