@@ -139,7 +139,7 @@ func traceDumpAdopt(path string, snapRx, peerRx uint64) {
 		sb.WriteString("S ")
 		writeTuple(&sb, t)
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return
 	}

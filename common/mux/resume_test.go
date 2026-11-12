@@ -376,7 +376,8 @@ func TestGateTransientLossRetriedInOrder(t *testing.T) {
 	}
 }
 
-func TestGateSuspendBlocksUntilResume(t *testing.T) {	done := make(chan struct{})
+func TestGateSuspendBlocksUntilResume(t *testing.T) {
+	done := make(chan struct{})
 	defer close(done)
 	carrier := &flakyCarrierForTest{}
 	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
@@ -828,8 +829,6 @@ func TestFallbackV1Matrix(t *testing.T) {
 	}
 }
 
-
-
 func TestGateConcurrentFlushStaysConsistent(t *testing.T) {
 	done := make(chan struct{})
 	defer close(done)
@@ -874,7 +873,8 @@ func TestGateConcurrentFlushStaysConsistent(t *testing.T) {
 	}
 }
 
-func TestGateVerifyRxHashDrift(t *testing.T) {	done := make(chan struct{})
+func TestGateVerifyRxHashDrift(t *testing.T) {
+	done := make(chan struct{})
 	defer close(done)
 	carrier := &flakyCarrierForTest{}
 	g := mux.NewGateForTest(carrier, done, mux.DefaultResumePolicy())
@@ -912,7 +912,6 @@ func TestGateVerifyRxHashDrift(t *testing.T) {	done := make(chan struct{})
 	}
 }
 
-
 func TestRxStateAdmitGeneration(t *testing.T) {
 	r := mux.NewRxStateForTest()
 	mb := countedFrameBytesForTest(t, 9, mux.SessionStatusKeep, "gen-probe")
@@ -938,7 +937,6 @@ func TestRxStateAdmitGeneration(t *testing.T) {
 		t.Fatalf("current-generation admit = (%d, %v), want (2, true)", n, ok)
 	}
 }
-
 
 func TestClientReadLoopExitsAfterRealSwap(t *testing.T) {
 	downR, _ := pipe.New(pipe.WithSizeLimit(64 * 1024))

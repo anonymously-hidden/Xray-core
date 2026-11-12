@@ -321,11 +321,11 @@ func (w *ServerWorker) handleStatusNew(ctx context.Context, meta *FrameMetadata,
 			errors.LogInfoInner(ctx, err, "XUDP new ", meta.GlobalID)
 		}
 		x.Mux = &Session{
-			input:        x.Mux.input,
-			output:       x.Mux.output,
-			parent:       w.sessionManager.Load(),
-			ID:           meta.SessionID,
-			XUDP:         x,
+			input:  x.Mux.input,
+			output: x.Mux.output,
+			parent: w.sessionManager.Load(),
+			ID:     meta.SessionID,
+			XUDP:   x,
 		}
 		x.Mux.storeTransferType(protocol.TransferTypePacket)
 		x.Status = Active

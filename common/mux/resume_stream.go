@@ -98,11 +98,11 @@ type carrierGate struct {
 	// flush never take sendMu, so they can't deadlock a blocked sender.
 	sendMu sync.Mutex
 
-	tx             Counter
-	frames         []storedFrame
-	baseSeq        uint64
-	storedByte     int64
-	streamBytes    map[uint16]int64
+	tx          Counter
+	frames      []storedFrame
+	baseSeq     uint64
+	storedByte  int64
+	streamBytes map[uint16]int64
 	// lastFlushMax/lastFlushEpoch record the newest completed flush:
 	// live writers skip only seqs it covered on the still-current
 	// target. Stale-epoch marks never suppress (their carrier may have
@@ -113,10 +113,10 @@ type carrierGate struct {
 	// hashBaseSeq checkpoint the newest freed one. Together they verify
 	// a peer's (RxCount, Hash) tip against sent history: exact hit on a
 	// retained frame or the base, fail-closed drift close on mismatch.
-	hashTip     uint64
-	hashTipSeq  uint64
-	hashBase    uint64
-	hashBaseSeq uint64
+	hashTip        uint64
+	hashTipSeq     uint64
+	hashBase       uint64
+	hashBaseSeq    uint64
 	onCarrierError func()
 
 	// flushMu serializes rebind flushes: overlapping adopts on one gate
@@ -142,8 +142,8 @@ type carrierGate struct {
 	// Diagnostic only (muxtrace attribution).
 	dir string
 
-	ackCh      chan struct{}
-	resumeCh   chan struct{}
+	ackCh       chan struct{}
+	resumeCh    chan struct{}
 	pendingAck  uint64
 	pendingHash uint64
 	hasPending  bool

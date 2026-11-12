@@ -185,9 +185,9 @@ type Session struct {
 	output buf.Writer
 	// pmu guards parent: adopt (Reparent) swaps it while draining
 	// handle() goroutines may Close() concurrently.
-	pmu          sync.Mutex
-	parent       *SessionManager
-	ID           uint16
+	pmu    sync.Mutex
+	parent *SessionManager
+	ID     uint16
 	// transferType is written once before the session is shared
 	// (Dispatch computes it synchronously after Allocate) and read on
 	// the reader goroutine: atomic so a fast echo can't race the
