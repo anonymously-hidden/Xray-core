@@ -455,6 +455,62 @@ func TestSlotHeadReadOverlaps(t *testing.T) {
 	}
 }
 
+type promotionSlots struct {
+	*memSlots
+	first time.Duration
+	calls atomic.Int32
+}
+
+func (s *promotionSlots) readDescription(ctx context.Context, id string) (string, error) {
+	delay := 340 * time.Millisecond
+	if s.calls.Add(1) == 1 {
+		delay = s.first
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case <-timer.C:
+		return s.memSlots.readDescription(ctx, id)
+	}
+}
+
+func TestSlotPromotesPendingRead(t *testing.T) {
+	for _, first := range []time.Duration{200 * time.Millisecond, 1100 * time.Millisecond} {
+		t.Run(first.String(), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				store := &promotionSlots{memSlots: newMemSlots(), first: first}
+				want := newSlotFrame(1, slotInline, []byte("tail")).encode()
+				store.descs["tail"] = want
+				r := &slotReader{store: store, huntCeiling: slotHuntCeiling,
+					params: paramsFromConfig(&Config{}), activeAt: time.Now()}
+				promoted := make(chan struct{})
+				done := make(chan string, 1)
+				start := time.Now()
+				go func() {
+					description, _ := r.readSlotDescription(context.Background(), "tail", 1, promoted)
+					done <- description
+				}()
+				<-time.NewTimer(100 * time.Millisecond).C
+				if store.calls.Load() != 1 {
+					t.Fatal("tail read overlapped before promotion")
+				}
+				r.mu.Lock()
+				r.head = 1
+				r.mu.Unlock()
+				close(promoted)
+				got := <-done
+				synctest.Wait()
+				elapsed := min(first, 100*time.Millisecond+slotHuntCeiling+340*time.Millisecond)
+				if got != want || time.Since(start) != elapsed || store.calls.Load() != 3 {
+					t.Fatalf("valid=%v elapsed=%v calls=%d", got == want, time.Since(start), store.calls.Load())
+				}
+			})
+		})
+	}
+}
+
 func TestSlotBurstReadsTogether(t *testing.T) {
 	client, server := slotPair(t, newMemSlots(), 16, 512<<10)
 	payload := randomPayload(8 * slotInlineLimit)

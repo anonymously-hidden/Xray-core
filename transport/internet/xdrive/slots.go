@@ -916,17 +916,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	backoff := r.huntFloor
 	var goneSince, warnedAt, visibleSince time.Time
 	for {
-		var description string
-		var err error
-		r.mu.Lock()
-		hot := time.Since(r.activeAt) <= r.eagerWindow
-		r.mu.Unlock()
-		if hot && r.isHead(seq) {
-			description, err = r.readHead(ctx, id, seq)
-		} else {
-			r.reads.Add(1)
-			description, err = r.store.readDescription(ctx, id)
-		}
+		description, err := r.readSlotDescription(ctx, id, seq, f.promoted)
 		frame, ok := decodeSlot(description)
 		if err == errNotFound || (err == nil && description == "") {
 			// An absent or empty slot is idle, not a failure.
@@ -1045,10 +1035,33 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 }
 
-func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string, error) {
+func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	ctx = context.WithValue(ctx, laneKey{}, true)
+	r.mu.Lock()
+	head := r.head == seq
+	if head {
+		promoted = nil
+	}
+	head = head && time.Since(r.activeAt) <= r.eagerWindow
+	r.mu.Unlock()
+	var ticker *time.Ticker
+	var ticks <-chan time.Time
+	var wake <-chan struct{}
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	hunt := func() {
+		head = true
+		promoted = nil
+		ticker = time.NewTicker(r.huntCeiling)
+		ticks, wake = ticker.C, r.wake
+	}
+	if head {
+		hunt()
+	}
 
 	type result struct {
 		description string
@@ -1058,29 +1071,35 @@ func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string
 	outstanding := 0
 	launch := func() {
 		outstanding++
+		readCtx := ctx
+		if head {
+			readCtx = context.WithValue(ctx, laneKey{}, true)
+		}
 		go func() {
 			r.reads.Add(1)
-			description, err := r.store.readDescription(ctx, id)
+			description, err := r.store.readDescription(readCtx, id)
 			results <- result{description, err}
 		}()
 	}
 	launch()
-	ticker := time.NewTicker(r.huntCeiling)
-	defer ticker.Stop()
 	var last result
 	seen := false
 	for {
 		select {
 		case res := <-results:
 			outstanding--
-			if res.err != nil {
+			if !head || res.err != nil {
 				return res.description, res.err
 			}
 			if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
 				return res.description, nil
 			}
 			last, seen = res, true
-		case <-ticker.C:
+		case <-promoted:
+			// Keep the pending tail read in the head's overlap budget rather
+			// than waiting for it to finish before starting the head hunt.
+			hunt()
+		case <-ticks:
 			r.mu.Lock()
 			idle := time.Since(r.activeAt) > r.eagerWindow
 			r.mu.Unlock()
@@ -1090,7 +1109,7 @@ func (r *slotReader) readHead(ctx context.Context, id string, seq int64) (string
 			case !idle && outstanding < 3:
 				launch()
 			}
-		case <-r.wake:
+		case <-wake:
 			if outstanding < 3 {
 				launch()
 			}
