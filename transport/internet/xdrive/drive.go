@@ -623,7 +623,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		<-pool
 		respAt := time.Now()
 		noteTimeout := func() {
-			if attemptCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			if ctx.Err() == nil && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
 				s.throttle.Add(1)
 				s.coolMu.Lock()
 				s.lastThrottle = time.Now()
@@ -1322,7 +1322,7 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 		return r.status, r.payload, r.err
 	case <-timer.C:
 	}
-	if !s.takeHedgeToken() {
+	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeHedgeToken() {
 		r := <-ch
 		return r.status, r.payload, r.err
 	}

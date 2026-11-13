@@ -834,43 +834,76 @@ func (b driveTimeoutBody) Read([]byte) (int, error) {
 func (driveTimeoutBody) Close() error { return nil }
 
 func TestDriveBodyStallRetiresBulkOnly(t *testing.T) {
-	driveClock(t, func(t *testing.T) {
-		var primaryConnections, bulkConnections atomic.Int32
-		primary := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
-			primaryConnections.Add(1)
-			return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
-				return memoryResponse(http.StatusOK, "control"), nil
-			})}
-		})}
-		bulk := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
-			first := bulkConnections.Add(1) == 1
-			return &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
-				resp := memoryResponse(http.StatusOK, "media")
-				if first {
-					resp.Body = driveTimeoutBody{r.Context()}
+	for _, mode := range []string{"attempt", "body", "headers", "cancelled"} {
+		t.Run(mode, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				var primaryConnections, bulkConnections atomic.Int32
+				primary := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+					primaryConnections.Add(1)
+					return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+						return memoryResponse(http.StatusOK, "control"), nil
+					})}
+				})}
+				bulk := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+					first := bulkConnections.Add(1) == 1
+					next := roundTrip(func(r *http.Request) (*http.Response, error) {
+						resp := memoryResponse(http.StatusOK, "media")
+						if first {
+							if mode == "headers" {
+								<-r.Context().Done()
+								return nil, r.Context().Err()
+							}
+							resp.Body = driveTimeoutBody{r.Context()}
+						}
+						return resp, nil
+					})
+					if mode == "attempt" {
+						return &http.Client{Transport: next}
+					}
+					return &http.Client{Transport: &serviceTransport{plain: next, stall: driveTimeout}}
+				})}
+				defer primary.Close()
+				defer bulk.Close()
+				s := memoryDrive(primary)
+				s.bulkClient = &http.Client{Transport: bulk}
+				get := func(ctx context.Context, want string) {
+					t.Helper()
+					status, body, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil)
+					if err != nil || status != http.StatusOK || string(body) != want {
+						t.Fatalf("GET %s: status=%d body=%q err=%v", want, status, body, err)
+					}
 				}
-				return resp, nil
-			})}
-		})}
-		defer primary.Close()
-		defer bulk.Close()
-		s := memoryDrive(primary)
-		s.bulkClient = &http.Client{Transport: bulk}
-		get := func(ctx context.Context, want string) {
-			t.Helper()
-			status, body, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil)
-			if err != nil || status != http.StatusOK || string(body) != want {
-				t.Fatalf("GET %s: status=%d body=%q err=%v", want, status, body, err)
-			}
-		}
-		get(context.Background(), "control")
-		ctx := context.WithValue(context.Background(), attemptKey{}, time.Second)
-		get(context.WithValue(ctx, bodyKey{}, true), "media")
-		get(context.Background(), "control")
-		if primaryConnections.Load() != 1 || bulkConnections.Load() != 2 {
-			t.Fatalf("opened connections: control=%d bulk=%d", primaryConnections.Load(), bulkConnections.Load())
-		}
-	})
+				get(context.Background(), "control")
+				ctx := context.WithValue(context.Background(), bodyKey{}, true)
+				if mode == "attempt" {
+					ctx = context.WithValue(ctx, attemptKey{}, time.Second)
+				}
+				if mode == "cancelled" {
+					ctx, cancel := context.WithCancel(ctx)
+					cancel()
+					if _, _, err := s.do(ctx, http.MethodGet, s.filesURL, "", nil); err != context.Canceled || s.throttled() != 0 {
+						t.Fatalf("caller cancellation: err=%v throttles=%d", err, s.throttled())
+					}
+					return
+				}
+				// Two overlapping media stalls must retire the bulk connection; a
+				// successful header response must not hide a later body stall.
+				done := make(chan struct{}, 2)
+				for range 2 {
+					go func() {
+						defer func() { done <- struct{}{} }()
+						get(ctx, "media")
+					}()
+				}
+				<-done
+				<-done
+				get(context.Background(), "control")
+				if primaryConnections.Load() != 1 || bulkConnections.Load() != 2 || s.throttled() != 2 {
+					t.Fatalf("opened connections: control=%d bulk=%d throttles=%d", primaryConnections.Load(), bulkConnections.Load(), s.throttled())
+				}
+			})
+		})
+	}
 }
 
 func TestDriveBodyHedgeWaitsForStall(t *testing.T) {
@@ -921,6 +954,66 @@ func TestDriveBodyHedgeWaitsForStall(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestDriveHedgesRecheckRateLimit(t *testing.T) {
+	for _, body := range []bool{false, true} {
+		for _, state := range []string{"healthy", "cooling", "recent"} {
+			t.Run(fmt.Sprintf("body=%v/%s", body, state), func(t *testing.T) {
+				driveClock(t, func(t *testing.T) {
+					release := make(chan struct{})
+					var calls atomic.Int32
+					s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+						calls.Add(1)
+						select {
+						case <-release:
+							return memoryResponse(http.StatusOK, "ok"), nil
+						case <-req.Context().Done():
+							return nil, req.Context().Err()
+						}
+					}))
+					s.bulkClient = s.client
+					s.readHedge, s.readHedgeTokens = slotReadHedge, 3
+					done := make(chan error, 1)
+					go func() {
+						var err error
+						if body {
+							r := &slotReader{store: s}
+							_, err = r.readBodyHedged(context.Background(), "body", 2)
+						} else {
+							_, _, err = s.readDescHedged(context.Background(), s.filesURL)
+						}
+						done <- err
+					}()
+					synctest.Wait()
+					if calls.Load() != 1 {
+						t.Fatal("primary request did not start")
+					}
+					if state != "healthy" {
+						s.cool()
+						if state == "recent" {
+							s.coolMu.Lock()
+							s.coolUntil = time.Now()
+							s.coolMu.Unlock()
+						}
+					}
+					<-time.NewTimer(slotBodyHedge).C
+					synctest.Wait()
+					want := int32(1)
+					if state == "healthy" {
+						want = 2
+					}
+					if calls.Load() != want || state != "healthy" && s.readHedgeTokens != 3 {
+						t.Fatalf("requests=%d want=%d tokens=%d", calls.Load(), want, s.readHedgeTokens)
+					}
+					close(release)
+					if err := <-done; err != nil {
+						t.Fatal(err)
+					}
+				})
+			})
+		}
 	}
 }
 

@@ -1279,6 +1279,12 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([
 				continue
 			}
 			if outstanding == 1 {
+				if s, ok := r.store.(interface {
+					cooling() bool
+					lastRateLimitAt() time.Time
+				}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
+					continue
+				}
 				launch()
 				outstanding++
 			}
