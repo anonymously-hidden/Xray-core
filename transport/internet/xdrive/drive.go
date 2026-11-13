@@ -535,6 +535,11 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	defer s.noteRequest(ctx)
 	backoff := s.backoff
 	var lastErr error
+	kind := -1
+	if s.timing != nil {
+		// the same for every attempt, and it may decode the body
+		kind = classifyDriveRequest(ctx, method, target, contentType, body)
+	}
 
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
@@ -561,7 +566,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		token, err := s.accessToken(ctx)
 		waitTokenDur := time.Since(tokenStart)
 		if err != nil {
-			if isAuthError(err) {
+			if isAuthError(err) || s.isWorkClosed() {
 				return 0, nil, err
 			}
 			lastErr = err
@@ -662,7 +667,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 		began := time.Now()
 		if s.timing != nil {
-			s.timing.request(classifyDriveRequest(ctx, method, target, contentType, body))
+			s.timing.request(kind)
 		}
 		resp, err := httpc.Do(req)
 		respAt := time.Now()
@@ -735,7 +740,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			hasServer: !tr.wrote.IsZero() && !tr.first.IsZero(),
 		}
 		tr.mu.Unlock()
-		s.recordTiming(ctx, method, target, contentType, body, sample)
+		s.recordTiming(kind, sample)
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
@@ -791,10 +796,15 @@ func (s *driveStorage) waitCool(ctx context.Context) error {
 
 func (s *driveStorage) cool() {
 	s.throttle.Add(1)
+	now := time.Now()
+	until := now.Add(jitter(driveCooldown))
 	s.coolMu.Lock()
-	s.coolUntil = time.Now().Add(jitter(driveCooldown))
-	s.lastThrottle = time.Now()
-	s.lastRateLimit = time.Now()
+	// a later, shorter draw must not end a cooldown that is still running
+	if until.After(s.coolUntil) {
+		s.coolUntil = until
+	}
+	s.lastThrottle = now
+	s.lastRateLimit = now
 	s.coolMu.Unlock()
 }
 

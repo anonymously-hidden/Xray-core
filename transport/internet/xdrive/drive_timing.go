@@ -173,12 +173,12 @@ func maxTime(a, b time.Time) time.Time {
 	return b
 }
 
-// recordTiming classifies and records one attempt sample.
-func (s *driveStorage) recordTiming(ctx context.Context, method, target, contentType string, body []byte, sample timingSample) {
+// recordTiming records one attempt sample of a classified request.
+func (s *driveStorage) recordTiming(kind int, sample timingSample) {
 	if s.timing == nil {
 		return
 	}
-	s.timing.record(classifyDriveRequest(ctx, method, target, contentType, body), sample)
+	s.timing.record(kind, sample)
 }
 
 func (a *timingAggregator) flush() {

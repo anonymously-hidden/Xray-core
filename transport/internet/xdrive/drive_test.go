@@ -1221,3 +1221,60 @@ func TestKeeperWarmsSessionPools(t *testing.T) {
 		}
 	})
 }
+
+func TestDriveCoolOnlyExtends(t *testing.T) {
+	s := memoryDrive(nil)
+	far := time.Now().Add(time.Hour)
+	s.coolUntil = far
+	s.cool()
+	if !s.coolUntil.Equal(far) || s.lastRateLimitAt().IsZero() || s.lastThrottleAt().IsZero() {
+		t.Fatalf("a shorter cooldown replaced a running one: until=%v", s.coolUntil)
+	}
+	s.coolUntil = time.Time{}
+	s.cool()
+	if !s.cooling() {
+		t.Fatal("cool did not start a cooldown")
+	}
+}
+
+func TestDriveShutdownEndsRequestAtOnce(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var calls atomic.Int32
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return memoryResponse(http.StatusOK, "{}"), nil
+		}))
+		s.closeWork()
+		start := time.Now()
+		_, _, err := s.do(context.Background(), http.MethodGet, s.filesURL+"/x", "", nil)
+		if err != context.Canceled || calls.Load() != 0 || time.Since(start) != 0 {
+			t.Fatalf("err=%v calls=%d after %v, want an immediate cancellation", err, calls.Load(), time.Since(start))
+		}
+	})
+}
+
+// a request is classified once for all of its attempts
+func TestDriveRetriedRequestKeepsOneTimingKind(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var calls atomic.Int32
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return memoryResponse(http.StatusInternalServerError, "{}"), nil
+			}
+			return memoryResponse(http.StatusOK, "{}"), nil
+		}))
+		s.timing = newTimingAggregator()
+		defer s.timing.stop()
+		if status, _, err := s.do(context.Background(), http.MethodPatch, s.filesURL+"/x", "application/json", []byte(`{"description":"d"}`)); err != nil || status != http.StatusOK {
+			t.Fatalf("status=%d err=%v", status, err)
+		}
+		s.timing.mu.Lock()
+		defer s.timing.mu.Unlock()
+		for k := range kindCount {
+			if s.timing.requests[k] == 2 && s.timing.n[k] == 2 {
+				return
+			}
+		}
+		t.Fatalf("attempts split over kinds: requests=%v samples=%v", s.timing.requests, s.timing.n)
+	})
+}

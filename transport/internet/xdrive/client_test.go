@@ -1153,3 +1153,22 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 		}
 	})
 }
+
+func TestPoolConnAcquireRefusesAClosingConnection(t *testing.T) {
+	cancelled := false
+	c := &poolConn{cancel: func() { cancelled = true }}
+	if !c.acquire() || c.inflight != 1 {
+		t.Fatal("an open connection refused a request")
+	}
+	c.Close()
+	if c.acquire() || c.inflight != 1 || cancelled {
+		t.Fatalf("a closing connection took a request: inflight=%d cancelled=%v", c.inflight, cancelled)
+	}
+	c.done()
+	if !cancelled {
+		t.Fatal("the closing connection was not cancelled once idle")
+	}
+	if c.acquire() {
+		t.Fatal("a closed connection took a request")
+	}
+}

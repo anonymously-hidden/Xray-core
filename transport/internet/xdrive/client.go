@@ -406,6 +406,18 @@ func (c *poolConn) IsClosed() bool {
 	return c.closing
 }
 
+// acquire counts a request on the connection unless it is closing, which is
+// decided together with the count so that Close cannot cancel it in between
+func (c *poolConn) acquire() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closing {
+		return false
+	}
+	c.inflight++
+	return true
+}
+
 func (c *poolConn) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -472,25 +484,41 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, errSessionClosed
 	}
 	client := t.client
-	if client == nil || client.XmuxConn.IsClosed() || client.LeftRequests.Add(-1) < 0 || !client.UnreusableAt.IsZero() && time.Now().After(client.UnreusableAt) {
+	var conn *poolConn
+	if client != nil && client.LeftRequests.Add(-1) >= 0 && (client.UnreusableAt.IsZero() || !time.Now().After(client.UnreusableAt)) {
+		// counted under mu and against Close, or another request of the session
+		// that moves on, or another session of the pool that retires the
+		// connection, could close it before this one is sent
+		conn = client.XmuxConn.(*poolConn)
+		if !conn.acquire() {
+			conn = nil
+		}
+	}
+	for try := 0; conn == nil; try++ {
 		t.pool.mu.Lock()
-		t.client = t.pool.xmux.GetXmuxClient(r.Context())
+		next := t.pool.xmux.GetXmuxClient(r.Context())
 		t.pool.mu.Unlock()
-		t.client.AddRunning()
-		t.client.LeftRequests.Add(-1)
+		next.AddRunning()
+		next.LeftRequests.Add(-1)
 		if client != nil {
 			client.DoneRunning()
 			t.movedAt = time.Now()
 		}
-		client = t.client
+		client, t.client = next, next
 		t.takenAt, t.servedAt = time.Now(), time.Time{}
+		conn = client.XmuxConn.(*poolConn)
+		if !conn.acquire() {
+			// XMUX drops a closed connection on the next pick; a last try
+			// is sent anyway and left to the retries of the caller
+			if try < 3 {
+				conn = nil
+				continue
+			}
+			conn.mu.Lock()
+			conn.inflight++
+			conn.mu.Unlock()
+		}
 	}
-	// counted under mu, or another request of the session that moves on could
-	// close the connection before this one is sent
-	conn := client.XmuxConn.(*poolConn)
-	conn.mu.Lock()
-	conn.inflight++
-	conn.mu.Unlock()
 	t.mu.Unlock()
 	resp, err := conn.roundTrip(r)
 	if err == nil {
