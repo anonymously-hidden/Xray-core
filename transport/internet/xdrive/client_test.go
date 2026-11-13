@@ -940,9 +940,10 @@ func TestDriveOverH3(t *testing.T) {
 	// one for the listener to www.googleapis.com, one for the token to
 	// oauth2.googleapis.com and one of XMUX for each end of the session; the
 	// 300 KB burst needs more than the free tokens of inline frames, so it goes
-	// as one media frame and may add a bulk-lane connection at each end
-	if n := len(rec.conns); n < 4 || n > 6 {
-		t.Errorf("%d connections went through the mask, want 4 to 6", n)
+	// as media and may add upload/recovery bulk connections and up to four
+	// independent range-download connections on the receiving end.
+	if n := len(rec.conns); n < 4 || n > 6+driveMediaLanes {
+		t.Errorf("%d connections went through the mask, want 4 to %d", n, 6+driveMediaLanes)
 	}
 	for i, conn := range rec.conns {
 		conn.mu.Lock()
@@ -1101,4 +1102,54 @@ func TestSessionIgnoresStallOfRetiredConn(t *testing.T) {
 	if n := made.Load(); n != 3 {
 		t.Fatalf("a stall of the current connection made %d connections, want it retired", n)
 	}
+}
+
+// A connection that has served nothing since a request began is retired by
+// that request's first stall; one that served meanwhile still needs two.
+func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var made atomic.Int32
+		transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+			made.Add(1)
+			return &http.Client{Transport: okConn{}}
+		})}
+		defer transport.Close()
+		send := func() {
+			req, err := http.NewRequest(http.MethodGet, "http://drive.invalid/files", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+		}
+		send()
+		time.Sleep(2 * time.Millisecond)
+		transport.stalled(time.Now())
+		send()
+		if n := made.Load(); n != 2 {
+			t.Fatalf("the first stall of an idle connection made %d connections", n)
+		}
+		transport.mu.Lock()
+		transport.slowAt, transport.retiredAt = time.Time{}, time.Time{}
+		transport.mu.Unlock()
+		began := time.Now()
+		time.Sleep(2 * time.Millisecond)
+		send()
+		transport.stalled(began)
+		send()
+		if n := made.Load(); n != 2 {
+			t.Fatalf("a stall with a success behind it made %d connections", n)
+		}
+		began = time.Now()
+		time.Sleep(2 * time.Millisecond)
+		send()
+		transport.stalled(began)
+		send()
+		if n := made.Load(); n != 3 {
+			t.Fatalf("the second strike made %d connections, want the connection retired", n)
+		}
+	})
 }

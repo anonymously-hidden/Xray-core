@@ -67,6 +67,34 @@ type timingAggregator struct {
 	conns    [kindCount]int
 	hedges   [kindCount]int
 	won      [kindCount]int
+	requests [kindCount]int
+}
+
+// Count every sent API attempt, including retries and cancelled hedges. The
+// latency reservoir is capped at 512 samples; it is not a request counter.
+func (a *timingAggregator) request(kind int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.started {
+		a.started = true
+		go a.loop()
+	}
+	a.requests[kind]++
+}
+
+func driveQuotaCost(kind int) int {
+	switch kind {
+	case kindToken:
+		return 0
+	case kindCreate, kindSlotInline, kindSlotMedia, kindWatermark, kindDelete:
+		return 50
+	case kindBodyRead:
+		return 200
+	case kindList:
+		return 100
+	default:
+		return 5
+	}
 }
 
 func newTimingAggregator() *timingAggregator {
@@ -158,7 +186,7 @@ func (a *timingAggregator) flush() {
 	defer a.mu.Unlock()
 	for k := 0; k < kindCount; k++ {
 		n := a.n[k]
-		if n == 0 {
+		if n == 0 && a.requests[k] == 0 && a.hedges[k] == 0 {
 			continue
 		}
 		total := make([]time.Duration, 0, n)
@@ -190,6 +218,7 @@ func (a *timingAggregator) flush() {
 		sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
 		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
 			" n=", n,
+			" requests=", a.requests[k], " units=", a.requests[k]*driveQuotaCost(k),
 			" total p50/p95/max ", percentile(total, .5), "/", percentile(total, .95), "/", percentile(total, 1),
 			" wait-pool p50 ", percentile(pool, .5),
 			" wait-conn p50 ", percentile(conn, .5),
@@ -202,6 +231,7 @@ func (a *timingAggregator) flush() {
 		a.conns[k] = 0
 		a.hedges[k] = 0
 		a.won[k] = 0
+		a.requests[k] = 0
 	}
 }
 

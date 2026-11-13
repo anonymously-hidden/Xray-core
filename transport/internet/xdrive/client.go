@@ -462,7 +462,7 @@ type sessionTransport struct {
 	slowAt, retiredAt time.Time
 	movedAt           time.Time
 	takenAt           time.Time
-	served            bool
+	servedAt          time.Time
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -483,7 +483,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			t.movedAt = time.Now()
 		}
 		client = t.client
-		t.takenAt, t.served = time.Now(), false
+		t.takenAt, t.servedAt = time.Now(), time.Time{}
 	}
 	// counted under mu, or another request of the session that moves on could
 	// close the connection before this one is sent
@@ -496,7 +496,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err == nil {
 		t.mu.Lock()
 		if t.client == client {
-			t.served = true
+			t.servedAt = time.Now()
 		}
 		t.mu.Unlock()
 	}
@@ -510,13 +510,21 @@ func (t *sessionTransport) stalled(began time.Time) {
 		return
 	}
 	now := time.Now()
-	if !t.served && now.Sub(t.takenAt) < stalledGrace {
+	if t.servedAt.IsZero() && now.Sub(t.takenAt) < stalledGrace {
 		return
 	}
-	slow := now.Sub(t.slowAt) < 3*time.Second
-	t.slowAt = now
-	if !slow || t.client == nil || now.Sub(t.retiredAt) < 2*time.Second {
+	if t.client == nil {
 		return
+	}
+	// A connection that has served nothing since this request began is dead
+	// already, so its first stall retires it. One that still served other
+	// requests meanwhile keeps the two-strikes rule against a lone hiccup.
+	if t.servedAt.After(began) {
+		slow := now.Sub(t.slowAt) < 3*time.Second
+		t.slowAt = now
+		if !slow || now.Sub(t.retiredAt) < 2*time.Second {
+			return
+		}
 	}
 	t.retiredAt = now
 	t.client.XmuxConn.(*poolConn).Close()

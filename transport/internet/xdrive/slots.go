@@ -32,8 +32,9 @@ const (
 	// slotInlineLimit up to segmentBytes
 	inlineRampSegments = 8
 
-	// Bulk traffic can use a wider upload/body window once a deep ring is
-	// warm. Small rings retain their existing per-file write rate.
+	// Bulk uploads use a wider window once a deep ring is warm. Media reads
+	// have bounded lookahead for mixed traffic too. Small rings retain their
+	// existing per-file write rate.
 	slotBulkInflight = 24
 	slotBodyAhead    = 20
 	slotBulkDepth    = 64
@@ -769,7 +770,6 @@ type slotReader struct {
 	activeAt     time.Time
 	active       chan struct{}
 	frontier     int64
-	bulkBytes    int64
 	err          error
 	stop         context.CancelFunc
 	reads        atomic.Int64
@@ -854,14 +854,17 @@ func (r *slotReader) slotID(seq int64) string {
 type slotFetch struct {
 	ready chan struct{}
 	// promoted is closed when the segment becomes the head
-	promoted chan struct{}
-	near     chan struct{}
-	media    chan struct{} // body prefetch admission, independent of description discovery
-	body     []byte
-	end      bool
-	err      error
-	born     time.Time
-	readyAt  time.Time
+	promoted  chan struct{}
+	near      chan struct{}
+	media     chan struct{} // body prefetch admission, independent of description discovery
+	body      []byte
+	end       bool
+	err       error
+	born      time.Time
+	readyAt   time.Time
+	visibleAt time.Time
+	bodyTime  time.Duration
+	mode      byte
 }
 
 func (f *slotFetch) enter() {
@@ -881,7 +884,6 @@ func (r *slotReader) run() {
 	for {
 		r.mu.Lock()
 		head, started, frontier := r.head, r.started, r.frontier
-		bulk := r.bulkBytes >= int64(len(r.table.Slots))*int64(r.segmentBytes)
 		r.mu.Unlock()
 
 		window := 1
@@ -897,7 +899,8 @@ func (r *slotReader) run() {
 				}
 				go r.fetch(ctx, seq, i, fetches[seq])
 			}
-			if !bulk || i < slotBodyAhead {
+			// Mixed inline/media traffic needs the same bound as a bulk stream.
+			if i < slotBodyAhead {
 				select {
 				case <-fetches[seq].media:
 				default:
@@ -926,16 +929,11 @@ func (r *slotReader) run() {
 		// the slot is free once the bytes are here, not once they are read
 		r.mu.Lock()
 		r.head++
-		if len(f.body) > slotInlineLimit {
-			r.bulkBytes = min(r.bulkBytes+int64(len(f.body)), int64(len(r.table.Slots))*int64(r.segmentBytes))
-		} else {
-			r.bulkBytes = 0
-		}
 		r.started = true
 		r.mu.Unlock()
 		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
 			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body),
-			" reads=", r.reads.Load())
+			" reads=", r.reads.Load(), " mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime)
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1005,6 +1003,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		switch {
 		case err == nil && ok && frame.seq == seq:
+			if f.visibleAt.IsZero() {
+				f.visibleAt = time.Now()
+			}
+			f.mode = frame.mode
 			// what follows it is asked for while its body comes
 			r.mu.Lock()
 			r.touch()
@@ -1030,7 +1032,17 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				case <-ctx.Done():
 					return
 				}
-				body, bodyErr := r.readBodyHedged(ctx, id, frame.size)
+				began := time.Now()
+				var body []byte
+				var bodyErr error
+				if store, ok := r.store.(interface {
+					readFrameBody(context.Context, string, slotFrame) ([]byte, error)
+				}); ok {
+					body, bodyErr = store.readFrameBody(ctx, id, frame)
+				} else {
+					body, bodyErr = r.readBodyHedged(ctx, id, frame.size)
+				}
+				f.bodyTime += time.Since(began)
 				if bodyErr == nil && frame.holds(body) {
 					f.body = body
 					r.hit()
@@ -1175,6 +1187,12 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 		case res := <-results:
 			outstanding--
 			if !head || res.err != nil {
+				if head && outstanding > 0 {
+					// A failed sibling of the overlapping head hunt is not
+					// definitive while another read may be about to succeed,
+					// and returning would cancel it.
+					continue
+				}
 				return res.description, res.err
 			}
 			if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
@@ -1283,6 +1301,9 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([
 					cooling() bool
 					lastRateLimitAt() time.Time
 				}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
+					// The timer just fired and is spent; re-arm it so the
+					// hedge can still start once the cooldown ends.
+					timer.Reset(delay)
 					continue
 				}
 				launch()
@@ -1315,9 +1336,6 @@ func (r *slotReader) hit() {
 
 // touch notes that something came or is likely to. r.mu is held
 func (r *slotReader) touch() {
-	if r.frontier < r.head && time.Since(r.hitAt) > r.eagerWindow {
-		r.bulkBytes = 0
-	}
 	if time.Since(r.activeAt) > r.eagerWindow {
 		close(r.active)
 		r.active = make(chan struct{})

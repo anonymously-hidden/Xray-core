@@ -113,11 +113,13 @@ func isCleanupRateLimited(err error) bool {
 type driveStorage struct {
 	*driveShared
 	// a session has a client and inflight of its own, see session
-	client     *http.Client
-	bulkClient *http.Client
-	inflight   chan struct{}
-	reserved   chan struct{}
-	release    func()
+	client       *http.Client
+	bulkClient   *http.Client
+	mediaClients []*http.Client
+	inflight     chan struct{}
+	reserved     chan struct{}
+	mediaRescue  chan struct{}
+	release      func()
 	// readHedge/budget are copied per instance so tests never mutate globals
 	// that other goroutines read.
 	readHedge       time.Duration
@@ -130,6 +132,7 @@ type driveStorage struct {
 type driveShared struct {
 	conns        *connPool
 	bulkConns    *connPool
+	mediaConns   [driveMediaLanes]*connPool
 	folder       string
 	clientID     string
 	clientSecret string
@@ -237,10 +240,16 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		client:          client,
 		inflight:        make(chan struct{}, driveMaxInflight),
 		reserved:        make(chan struct{}, driveReservedInflight),
+		mediaRescue:     make(chan struct{}, driveMediaLanes),
 		readHedge:       slotReadHedge,
 		readHedgeTokens: 3,
 	}
 	st.driveShared.owner = st
+	for i := range st.mediaConns {
+		st.mediaConns[i] = newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+			return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
+		})
+	}
 	st.driveShared.keepWarmEvery = 4 * time.Minute
 	st.driveShared.keepWarmWindow = 3 * time.Hour
 	st.driveShared.poolRing = 2 * (max(paramsForStorage(config, st).concurrency, 2) + 1)
@@ -254,19 +263,31 @@ func (s *driveStorage) session() Storage {
 	s.startKeeper()
 	transport := &sessionTransport{pool: s.conns}
 	bulkTransport := &sessionTransport{pool: s.bulkConns}
-	return &driveStorage{
+	st := &driveStorage{
 		driveShared:     s.driveShared,
 		client:          &http.Client{Transport: transport},
 		bulkClient:      &http.Client{Transport: bulkTransport},
 		inflight:        make(chan struct{}, driveMaxInflight),
 		reserved:        make(chan struct{}, driveReservedInflight),
+		mediaRescue:     make(chan struct{}, driveMediaLanes),
 		readHedge:       s.readHedge,
 		readHedgeTokens: 3,
-		release: func() {
-			transport.Close()
-			bulkTransport.Close()
-		},
 	}
+	transports := []*sessionTransport{transport, bulkTransport}
+	for _, pool := range s.mediaConns {
+		if pool == nil {
+			continue
+		}
+		t := &sessionTransport{pool: pool}
+		transports = append(transports, t)
+		st.mediaClients = append(st.mediaClients, &http.Client{Transport: t})
+	}
+	st.release = func() {
+		for _, t := range transports {
+			t.Close()
+		}
+	}
+	return st
 }
 
 func flatten(name string) string {
@@ -544,9 +565,15 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			continue
 		}
 
+		media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
 		pool := s.inflight
 		if ctx.Value(laneKey{}) != nil {
 			pool = s.reserved
+		}
+		if media != nil && media.rescue && s.mediaRescue != nil {
+			// A stalled bulk window must not queue its own recovery, nor take
+			// the permits reserved for head descriptions and acknowledgements.
+			pool = s.mediaRescue
 		}
 		poolStart := time.Now()
 		select {
@@ -571,6 +598,10 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
+		if media != nil {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", media.start, media.end-1))
+			req.Header.Set("Accept-Encoding", "identity")
+		}
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
@@ -618,9 +649,14 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if ctx.Value(bodyKey{}) != nil && s.bulkClient != nil {
 			httpc = s.bulkClient
 		}
+		if media != nil && media.client != nil {
+			httpc = media.client
+		}
 		began := time.Now()
+		if s.timing != nil {
+			s.timing.request(classifyDriveRequest(ctx, method, target, contentType, body))
+		}
 		resp, err := httpc.Do(req)
-		<-pool
 		respAt := time.Now()
 		noteTimeout := func() {
 			if ctx.Err() == nil && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
@@ -634,6 +670,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			}
 		}
 		if err != nil {
+			<-pool
 			noteTimeout()
 			cancel()
 			if ctx.Err() != nil {
@@ -660,6 +697,8 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 		resp.Body.Close()
 		cancel()
+		// Keep the permit until EOF/Close, including media response bodies.
+		<-pool
 		bodyEnd := time.Now()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -719,7 +758,10 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			}
 			continue
 		}
-		return resp.StatusCode, payload, nil
+		if media != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
+		}
+		return resp.StatusCode, payload, err
 	}
 
 	return 0, nil, lastErr

@@ -393,6 +393,64 @@ func TestSlotBodyHedge(t *testing.T) {
 	}
 }
 
+type coolingBodySlots struct {
+	*memSlots
+	cool  atomic.Bool
+	calls atomic.Int32
+}
+
+func (s *coolingBodySlots) cooling() bool              { return s.cool.Load() }
+func (s *coolingBodySlots) lastRateLimitAt() time.Time { return time.Time{} }
+
+func (s *coolingBodySlots) readBody(ctx context.Context, id string) ([]byte, error) {
+	s.calls.Add(1)
+	if s.cool.Load() {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return []byte("late"), nil
+}
+
+// A body whose hedge timer fires during a cooldown must still get its hedge
+// once the cooldown ends, instead of waiting out the primary's whole
+// no-progress timeout with the timer spent.
+func TestSlotBodyHedgeWaitsOutCooldown(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		store := &coolingBodySlots{}
+		store.cool.Store(true)
+		r := &slotReader{store: store}
+		type bodyResult struct {
+			body []byte
+			err  error
+		}
+		done := make(chan bodyResult, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			body, err := r.readBodyHedged(ctx, "body", 0)
+			done <- bodyResult{body, err}
+		}()
+		go func() {
+			<-time.NewTimer(3 * slotBodyHedge / 2).C
+			store.cool.Store(false)
+		}()
+		start := time.Now()
+		select {
+		case got := <-done:
+			if got.err != nil || string(got.body) != "late" || store.calls.Load() != 2 {
+				t.Fatalf("body=%q err=%v reads=%d", got.body, got.err, store.calls.Load())
+			}
+			if elapsed := time.Since(start); elapsed != 2*slotBodyHedge {
+				t.Fatalf("the hedged body took %v, want %v", elapsed, 2*slotBodyHedge)
+			}
+		case <-time.After(3 * slotBodyHedge):
+			cancel()
+			synctest.Wait()
+			t.Fatal("the hedge never fired after the cooldown ended")
+		}
+	})
+}
+
 func TestTakeSpareSkipsStale(t *testing.T) {
 	cfg := &Config{}
 	p := params{sessionTTL: 5 * time.Minute}
@@ -453,6 +511,64 @@ func TestSlotHeadReadOverlaps(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+type flakyHeadSlots struct {
+	*memSlots
+	calls atomic.Int32
+}
+
+func (s *flakyHeadSlots) readDescription(ctx context.Context, id string) (string, error) {
+	switch s.calls.Add(1) {
+	case 1:
+		<-ctx.Done()
+		return "", ctx.Err()
+	case 2:
+		return "", errors.New("injected sibling failure")
+	}
+	return s.memSlots.readDescription(ctx, id)
+}
+
+// One failed read of the overlapping head hunt must not cancel the sibling
+// that is still on its way; the hunt waits for the outstanding reads.
+func TestSlotHeadKeepsWaitingAfterSiblingError(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		store := &flakyHeadSlots{memSlots: newMemSlots()}
+		want := newSlotFrame(1, slotInline, []byte("tail")).encode()
+		store.descs["tail"] = want
+		r := &slotReader{
+			store: store, huntCeiling: slotHuntCeiling,
+			params: paramsFromConfig(&Config{}), activeAt: time.Now(),
+		}
+		r.mu.Lock()
+		r.head = 1
+		r.mu.Unlock()
+		type headResult struct {
+			description string
+			err         error
+		}
+		done := make(chan headResult, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			description, err := r.readSlotDescription(ctx, "tail", 1, nil)
+			done <- headResult{description, err}
+		}()
+		start := time.Now()
+		select {
+		case got := <-done:
+			if got.err != nil || got.description != want || store.calls.Load() != 3 {
+				t.Fatalf("valid=%v err=%v reads=%d", got.description == want, got.err, store.calls.Load())
+			}
+			if elapsed := time.Since(start); elapsed != 2*slotHuntCeiling {
+				t.Fatalf("the head took %v, want %v", elapsed, 2*slotHuntCeiling)
+			}
+		case <-time.After(3 * slotHuntCeiling):
+			cancel()
+			synctest.Wait()
+			t.Fatal("a sibling error abandoned the overlapping head reads")
+		}
+	})
 }
 
 type promotionSlots struct {
@@ -812,8 +928,8 @@ func (s *bulkPrefetchSlots) readBody(ctx context.Context, id string) ([]byte, er
 }
 
 func TestSlotBulkPrefetch(t *testing.T) {
-	for _, bulk := range []bool{false, true} {
-		t.Run(strconv.FormatBool(bulk), func(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(strconv.FormatBool(mixed), func(t *testing.T) {
 			driveClock(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -827,22 +943,23 @@ func TestSlotBulkPrefetch(t *testing.T) {
 				store.last = ring.Down.Slots[p.concurrency-1]
 				for i, id := range ring.Down.Slots {
 					store.bodiesReady[id] = make(chan struct{})
+					if mixed && i%2 == 1 {
+						if err := store.setSlot(ctx, id, newSlotFrame(int64(i), slotInline, []byte("inline")).encode(), nil); err != nil {
+							t.Fatal(err)
+						}
+						continue
+					}
 					if err := store.setSlot(ctx, id, newSlotFrame(int64(i), slotMedia, payload).encode(), payload); err != nil {
 						t.Fatal(err)
 					}
 				}
 				r := newSlotReader(ctx, store, ring.Down, p, nil)
-				if bulk {
-					r.mu.Lock()
-					r.bulkBytes = int64(p.concurrency) * int64(p.segmentBytes)
-					r.mu.Unlock()
-				}
 				close(store.start)
 				<-store.seen
 				synctest.Wait()
-				want := p.concurrency
-				if bulk {
-					want = slotBodyAhead
+				want := slotBodyAhead
+				if mixed {
+					want = (want + 1) / 2
 				}
 				r.mu.Lock()
 				frontier := r.frontier
@@ -852,7 +969,7 @@ func TestSlotBulkPrefetch(t *testing.T) {
 				}
 				close(store.bodiesReady[ring.Down.Slots[0]])
 				synctest.Wait()
-				if bulk && int(store.calls.Load()) != want+1 {
+				if int(store.calls.Load()) != want+1 {
 					t.Fatal("head advancement did not admit the next body")
 				}
 				for _, id := range ring.Down.Slots[1:] {
@@ -861,12 +978,6 @@ func TestSlotBulkPrefetch(t *testing.T) {
 				synctest.Wait()
 				<-time.NewTimer(r.eagerWindow + r.huntCeiling).C
 				r.Wake()
-				r.mu.Lock()
-				remaining := r.bulkBytes
-				r.mu.Unlock()
-				if remaining != 0 {
-					t.Fatal("idle reader retained its bulk window")
-				}
 				cancel()
 				synctest.Wait()
 			})
