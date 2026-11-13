@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -90,7 +91,7 @@ func TestDriveMediaHeadRecovery(t *testing.T) {
 				}
 				cancel()
 				synctest.Wait()
-				if elapsed := time.Since(start); elapsed != driveMediaHedge || primary.Load() != 4 || rescues.Load() != 1 || cancelled.Load() != 1 {
+				if elapsed := time.Since(start); elapsed != slotBodyHedge || primary.Load() != 4 || rescues.Load() != 1 || cancelled.Load() != 1 {
 					t.Fatalf("elapsed=%v primary=%d rescues=%d cancelled=%d", elapsed, primary.Load(), rescues.Load(), cancelled.Load())
 				}
 			})
@@ -169,13 +170,13 @@ func TestDriveMediaMovingAndRateLimited(t *testing.T) {
 						defer writer.Close()
 						if mode == "moving" {
 							for range 6 {
-								time.Sleep(driveMediaHedge / 2)
+								time.Sleep(slotBodyHedge / 2)
 								if _, err := writer.Write([]byte{'x'}); err != nil {
 									return
 								}
 							}
 						} else {
-							time.Sleep(3 * driveMediaHedge)
+							time.Sleep(3 * slotBodyHedge)
 							writer.Write(payload)
 						}
 					}()
@@ -184,13 +185,14 @@ func TestDriveMediaMovingAndRateLimited(t *testing.T) {
 					return resp, nil
 				}))
 				s.mediaClients = []*http.Client{s.client}
+				s.readHedgeTokens = 3
 				s.bulkClient = &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
 					hedges.Add(1)
 					return mediaResponse(t, req, payload), nil
 				})}
 				if mode != "moving" {
 					go func() {
-						time.Sleep(driveMediaHedge / 2)
+						time.Sleep(slotBodyHedge / 2)
 						s.cool()
 						if mode == "recent" {
 							s.coolMu.Lock()
@@ -201,7 +203,7 @@ func TestDriveMediaMovingAndRateLimited(t *testing.T) {
 				}
 				start := time.Now()
 				body, err := s.readFrameBody(context.Background(), "body", newSlotFrame(0, slotMedia, payload))
-				if err != nil || !bytes.Equal(body, payload) || calls.Load() != 1 || hedges.Load() != 0 || time.Since(start) != 3*driveMediaHedge {
+				if err != nil || !bytes.Equal(body, payload) || calls.Load() != 1 || hedges.Load() != 0 || time.Since(start) != 3*slotBodyHedge {
 					t.Fatalf("err=%v requests=%d hedges=%d elapsed=%v", err, calls.Load(), hedges.Load(), time.Since(start))
 				}
 			})
@@ -313,6 +315,7 @@ func TestDriveMediaRecoveryBypassesBusyPool(t *testing.T) {
 			return memoryResponse(http.StatusBadRequest, ""), nil
 		}))
 		s.mediaClients = []*http.Client{s.client}
+		s.readHedgeTokens = 1
 		s.inflight = make(chan struct{}, 1)
 		s.inflight <- struct{}{}
 		s.reserved <- struct{}{}
@@ -323,8 +326,93 @@ func TestDriveMediaRecoveryBypassesBusyPool(t *testing.T) {
 		start := time.Now()
 		body, err := s.readFrameBody(context.Background(), "body", newSlotFrame(0, slotMedia, payload))
 		synctest.Wait()
-		if err != nil || !bytes.Equal(body, payload) || time.Since(start) != driveMediaHedge || len(s.mediaRescue) != 0 || len(s.inflight) != 1 || len(s.reserved) != 1 {
+		if err != nil || !bytes.Equal(body, payload) || time.Since(start) != slotBodyHedge || len(s.mediaRescue) != 0 || len(s.inflight) != 1 || len(s.reserved) != 1 {
 			t.Fatalf("recovery did not bypass bulk pool cleanly: %v", err)
+		}
+	})
+}
+
+// A media hedge skipped for cooling or an empty budget must be tried again at
+// the next hedge delay, not abandoned for the whole stall.
+func TestDriveMediaHedgeRearmsAfterSkip(t *testing.T) {
+	for _, mode := range []string{"cooling", "budget"} {
+		t.Run(mode, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				payload := []byte("hedged")
+				var hedges atomic.Int32
+				s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+					<-req.Context().Done()
+					return nil, req.Context().Err()
+				}))
+				s.mediaClients = []*http.Client{s.client}
+				s.bulkClient = &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
+					hedges.Add(1)
+					return mediaResponse(t, req, payload), nil
+				})}
+				s.readHedgeTokens = 1
+				switch mode {
+				case "cooling":
+					s.coolMu.Lock()
+					s.coolUntil = time.Now().Add(3 * time.Second)
+					s.coolMu.Unlock()
+				case "budget":
+					s.readHedgeTokens = 0
+					time.AfterFunc(3*time.Second, func() {
+						s.readHedgeMu.Lock()
+						s.readHedgeTokens = 1
+						s.readHedgeMu.Unlock()
+					})
+				}
+				start := time.Now()
+				body, err := s.readFrameBody(context.Background(), "body", newSlotFrame(0, slotMedia, payload))
+				if err != nil || !bytes.Equal(body, payload) || hedges.Load() != 1 || time.Since(start) != 2*slotBodyHedge || s.readHedgeTokens != 0 {
+					t.Fatalf("err=%v hedges=%d elapsed=%v tokens=%d", err, hedges.Load(), time.Since(start), s.readHedgeTokens)
+				}
+			})
+		})
+	}
+}
+
+// A sustained download must leave inflight to slot writes and tail reads, and
+// still finish the body-admission window in the same two waves as before.
+func TestDriveMediaRangesLeaveInflightFree(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		payload := randomPayload(defaultSegmentBytes)
+		frame := newSlotFrame(0, slotMedia, payload)
+		var started atomic.Int32
+		s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet {
+				return memoryResponse(http.StatusOK, "{}"), nil
+			}
+			started.Add(1)
+			<-time.After(time.Second)
+			return mediaResponse(t, req, payload), nil
+		}))
+		s.mediaRanges = make(chan struct{}, driveMediaInflight)
+		for range driveMediaLanes {
+			s.mediaClients = append(s.mediaClients, s.client)
+		}
+		start := time.Now()
+		var wg sync.WaitGroup
+		for range slotBodyAhead {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if body, err := s.readFrameBody(context.Background(), "body", frame); err != nil || !bytes.Equal(body, payload) {
+					t.Errorf("range body: %v", err)
+				}
+			}()
+		}
+		synctest.Wait()
+		if started.Load() != driveMediaInflight || len(s.mediaRanges) != driveMediaInflight || len(s.inflight) != 0 {
+			t.Fatalf("started=%d ranges=%d inflight=%d", started.Load(), len(s.mediaRanges), len(s.inflight))
+		}
+		if err := s.setSlot(context.Background(), "slot", "description", []byte("upload")); err != nil || time.Since(start) != 0 {
+			t.Fatalf("upload behind the ranges: err=%v after %v", err, time.Since(start))
+		}
+		wg.Wait()
+		if elapsed := time.Since(start); elapsed != 2*time.Second || len(s.mediaRanges) != 0 {
+			t.Fatalf("elapsed=%v ranges=%d, want 2s", elapsed, len(s.mediaRanges))
 		}
 	})
 }

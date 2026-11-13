@@ -17,7 +17,11 @@ const (
 	// configured segments still use at most four requests, not one per 128 KiB.
 	driveMediaLanes = 4
 	driveMediaPart  = 128 << 10
-	driveMediaHedge = time.Second
+	// Range GETs have a permit pool of their own so a sustained download
+	// (slotBodyAhead frames of driveMediaLanes ranges) cannot take the permits
+	// of slot writes and tail reads. It still covers every range of the
+	// body-admission window in two waves, as the shared pool did.
+	driveMediaInflight = driveMaxInflight - 2*driveReservedInflight
 )
 
 type driveMediaKey struct{}
@@ -136,8 +140,14 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	}
 	launch(false)
 	pending := 1
-	timer := time.NewTimer(driveMediaHedge)
-	defer timer.Stop()
+	// The hedge delay and budget are those of slot body and description reads.
+	var timer *time.Timer
+	var hedgeAt <-chan time.Time
+	if slotBodyHedge > 0 {
+		timer = time.NewTimer(slotBodyHedge)
+		defer timer.Stop()
+		hedgeAt = timer.C
+	}
 	hedged, won := false, false
 	defer func() {
 		if hedged && s.timing != nil {
@@ -155,15 +165,21 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			if pending == 0 || isAuthError(res.err) {
 				return nil, res.err
 			}
-		case <-timer.C:
-			if s.bulkClient == nil || r.client == nil || r.client == s.bulkClient || s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+		case <-hedgeAt:
+			if s.bulkClient == nil || r.client == nil || r.client == s.bulkClient {
 				continue
 			}
 			progress.Lock()
-			remaining := driveMediaHedge - time.Since(progress.at)
+			remaining := slotBodyHedge - time.Since(progress.at)
 			progress.Unlock()
 			if remaining > 0 {
 				timer.Reset(remaining)
+				continue
+			}
+			if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeHedgeToken() {
+				// The timer is spent; re-arm it so the hedge can still start
+				// once the cooldown ends or the budget has refilled.
+				timer.Reset(slotBodyHedge)
 				continue
 			}
 			hedged = true

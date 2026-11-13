@@ -119,6 +119,7 @@ type driveStorage struct {
 	inflight     chan struct{}
 	reserved     chan struct{}
 	mediaRescue  chan struct{}
+	mediaRanges  chan struct{}
 	release      func()
 	// readHedge/budget are copied per instance so tests never mutate globals
 	// that other goroutines read.
@@ -241,6 +242,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		inflight:        make(chan struct{}, driveMaxInflight),
 		reserved:        make(chan struct{}, driveReservedInflight),
 		mediaRescue:     make(chan struct{}, driveMediaLanes),
+		mediaRanges:     make(chan struct{}, driveMediaInflight),
 		readHedge:       slotReadHedge,
 		readHedgeTokens: 3,
 	}
@@ -270,6 +272,7 @@ func (s *driveStorage) session() Storage {
 		inflight:        make(chan struct{}, driveMaxInflight),
 		reserved:        make(chan struct{}, driveReservedInflight),
 		mediaRescue:     make(chan struct{}, driveMediaLanes),
+		mediaRanges:     make(chan struct{}, driveMediaInflight),
 		readHedge:       s.readHedge,
 		readHedgeTokens: 3,
 	}
@@ -569,6 +572,11 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		pool := s.inflight
 		if ctx.Value(laneKey{}) != nil {
 			pool = s.reserved
+		}
+		if media != nil && !media.rescue && s.mediaRanges != nil {
+			// Ranges of a long download must not queue slot writes or tail
+			// reads behind them in inflight.
+			pool = s.mediaRanges
 		}
 		if media != nil && media.rescue && s.mediaRescue != nil {
 			// A stalled bulk window must not queue its own recovery, nor take
