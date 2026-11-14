@@ -1038,7 +1038,11 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				if store, ok := r.store.(interface {
 					readFrameBody(context.Context, string, slotFrame) ([]byte, error)
 				}); ok {
-					body, bodyErr = store.readFrameBody(ctx, id, frame)
+					bodyCtx := ctx
+					if r.isHead(seq) {
+						bodyCtx = context.WithValue(ctx, mediaHeadKey{}, true)
+					}
+					body, bodyErr = store.readFrameBody(bodyCtx, id, frame)
 				} else {
 					body, bodyErr = r.readBodyHedged(ctx, id, frame.size)
 				}

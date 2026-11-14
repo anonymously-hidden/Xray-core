@@ -45,13 +45,17 @@ var (
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
 	driveCooldown       = 2 * time.Second
-	driveSlotRead       = 18 * time.Second
-	driveSlotWrite      = 20 * time.Second
-	slotReadHedge       = 900 * time.Millisecond
-	tokenRefreshBackoff = 30 * time.Second
-	maxTokenBackoff     = 5 * time.Minute
-	driveMaxResponse    = 32 << 20
-	driveMaxAnnounce    = 1 << 20
+	// rate-limit answers do not use up attempts while a request is younger than
+	// this: the limit is per minute and a cooldown is only 1-2 s, so eight
+	// attempts could end inside a single window and fail a slot write.
+	driveRateLimitBudget = 45 * time.Second
+	driveSlotRead        = 18 * time.Second
+	driveSlotWrite       = 20 * time.Second
+	slotReadHedge        = 900 * time.Millisecond
+	tokenRefreshBackoff  = 30 * time.Second
+	maxTokenBackoff      = 5 * time.Minute
+	driveMaxResponse     = 32 << 20
+	driveMaxAnnounce     = 1 << 20
 )
 
 // maxBodyKey lets a caller tighten the response-body cap (announcements).
@@ -131,6 +135,9 @@ type driveStorage struct {
 	// far less often and must not leave the head frame's ranges without one.
 	mediaHedgeTokens int
 	mediaHedgeCount  int
+	// mediaNext rotates frames over mediaClients so a stalled connection does
+	// not carry every single-range frame.
+	mediaNext atomic.Uint32
 }
 
 // driveShared is what the sessions of a storage have in common
@@ -547,7 +554,9 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		kind = classifyDriveRequest(ctx, method, target, contentType, body)
 	}
 
-	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
+	firstTry := time.Now()
+	refunded := 0
+	for attempt := 0; attempt-refunded < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -763,6 +772,12 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				" bytes, body read ", strings.Contains(target, "alt=media"),
 				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
+			if time.Since(firstTry) < driveRateLimitBudget {
+				refunded++
+			} else if refunded > 0 {
+				// the budget is spent: give up now, not after eight more attempts
+				return 0, nil, lastErr
+			}
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
@@ -786,18 +801,23 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	return 0, nil, lastErr
 }
 
+// waitCool re-reads the deadline after every sleep: a cooldown extended while a
+// request was waiting must not release it into the limit again.
 func (s *driveStorage) waitCool(ctx context.Context) error {
-	s.coolMu.Lock()
-	until := s.coolUntil
-	s.coolMu.Unlock()
-	if d := time.Until(until); d > 0 {
+	for {
+		s.coolMu.Lock()
+		until := s.coolUntil
+		s.coolMu.Unlock()
+		d := time.Until(until)
+		if d <= 0 {
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(d):
 		}
 	}
-	return nil
 }
 
 func (s *driveStorage) cool() {

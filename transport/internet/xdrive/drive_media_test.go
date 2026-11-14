@@ -276,8 +276,15 @@ func TestDriveMediaParallelTransfer(t *testing.T) {
 			t.Fatal("baseline download failed")
 		}
 		baseline := time.Since(start)
+		// a frame nobody waits for costs one GET, the head frame is split
 		start = time.Now()
 		body, err := s.readFrameBody(context.Background(), "body", frame)
+		single := time.Since(start)
+		if err != nil || !bytes.Equal(body, payload) || single != baseline {
+			t.Fatalf("single=%v baseline=%v err=%v", single, baseline, err)
+		}
+		start = time.Now()
+		body, err = s.readFrameBody(context.WithValue(context.Background(), mediaHeadKey{}, true), "body", frame)
 		elapsed := time.Since(start)
 		if err != nil || !bytes.Equal(body, payload) || baseline != 8*time.Second || elapsed != 2*time.Second {
 			t.Fatalf("baseline=%v parallel=%v err=%v", baseline, elapsed, err)
@@ -398,7 +405,7 @@ func TestDriveMediaRangesLeaveInflightFree(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if body, err := s.readFrameBody(context.Background(), "body", frame); err != nil || !bytes.Equal(body, payload) {
+				if body, err := s.readFrameBody(context.WithValue(context.Background(), mediaHeadKey{}, true), "body", frame); err != nil || !bytes.Equal(body, payload) {
 					t.Errorf("range body: %v", err)
 				}
 			}()
@@ -432,5 +439,84 @@ func TestDriveMediaHedgeBudgetIsSeparate(t *testing.T) {
 	}
 	if !s.takeMediaHedgeToken() || !s.takeMediaHedgeToken() || s.takeMediaHedgeToken() || s.takeHedgeToken() {
 		t.Fatal("media ranges must accrue media tokens only")
+	}
+}
+
+// Frames nobody waits for take one GET each, spread over the connections in
+// turn, so the quota cost of a body is one unit and no connection carries all.
+func TestDriveMediaSingleRangeRotates(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		payload := randomPayload(defaultSegmentBytes)
+		frame := newSlotFrame(0, slotMedia, payload)
+		var gets atomic.Int32
+		s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+			gets.Add(1)
+			return mediaResponse(t, req, payload), nil
+		}))
+		for range driveMediaLanes {
+			c := &http.Client{Transport: s.client.Transport}
+			s.mediaClients = append(s.mediaClients, c)
+		}
+		for range 2 * driveMediaLanes {
+			if _, err := s.readFrameBody(context.Background(), "body", frame); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if gets.Load() != int32(2*driveMediaLanes) {
+			t.Fatalf("gets=%d, want one per frame", gets.Load())
+		}
+		first := s.mediaNext.Load()
+		if first != uint32(2*driveMediaLanes) {
+			t.Fatalf("rotation advanced %d times", first)
+		}
+	})
+}
+
+// A cooldown extended while a request sleeps must hold it again.
+func TestDriveWaitCoolRechecksDeadline(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		s := memoryDrive(nil)
+		s.coolMu.Lock()
+		s.coolUntil = time.Now().Add(time.Second)
+		s.coolMu.Unlock()
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			s.coolMu.Lock()
+			s.coolUntil = time.Now().Add(3 * time.Second)
+			s.coolMu.Unlock()
+		}()
+		start := time.Now()
+		if err := s.waitCool(context.Background()); err != nil || time.Since(start) != 3500*time.Millisecond {
+			t.Fatalf("released after %v err=%v", time.Since(start), err)
+		}
+	})
+}
+
+// Rate-limit answers do not use up attempts inside the budget, but a request
+// still gives up once the budget has passed.
+func TestDriveRateLimitBudget(t *testing.T) {
+	limited := `{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`
+	for _, tc := range []struct {
+		name  string
+		until time.Duration // answers 403 until this long after the start
+		fail  bool
+	}{{"recovers after more than eight 403s", 20 * time.Second, false}, {"gives up past the budget", time.Hour, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				start := time.Now()
+				var calls atomic.Int32
+				s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					if time.Since(start) < tc.until {
+						return memoryResponse(http.StatusForbidden, limited), nil
+					}
+					return memoryResponse(http.StatusOK, "{}"), nil
+				}))
+				_, _, err := s.do(context.Background(), http.MethodGet, "https://example.test/x", "", nil)
+				if (err != nil) != tc.fail || (!tc.fail && calls.Load() <= driveMaxAttempts) || time.Since(start) > driveRateLimitBudget+3*driveMaxBackoff {
+					t.Fatalf("err=%v calls=%d after %v", err, calls.Load(), time.Since(start))
+				}
+			})
+		})
 	}
 }

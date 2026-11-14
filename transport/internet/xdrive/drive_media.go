@@ -12,11 +12,16 @@ import (
 )
 
 const (
-	// A default 512 KiB slot takes four 128 KiB GETs. Separate pools prevent
-	// HTTP/2 streams from sharing the same stalled TCP connection. Larger
-	// configured segments still use at most four requests, not one per 128 KiB.
+	// Every alt=media GET costs the same flat 200 Drive quota units whatever
+	// its size, and body GETs were 90% of the units behind the per-user rate
+	// limit. A frame that is not blocking delivery therefore takes one GET per
+	// default segment (a 512 KiB slot is one range, a 2 MiB slot four). The head
+	// frame, which every later frame waits for, takes one 128 KiB GET per lane.
+	// Separate pools prevent HTTP/2 streams from sharing the same stalled TCP
+	// connection, and frames are spread over them in turn.
 	driveMediaLanes = 4
 	driveMediaPart  = 128 << 10
+	driveMediaSplit = defaultSegmentBytes
 	// Range GETs have a permit pool of their own so a sustained download
 	// (slotBodyAhead frames of driveMediaLanes ranges) cannot take the permits
 	// of slot writes and tail reads. It still covers every range of the
@@ -25,6 +30,9 @@ const (
 )
 
 type driveMediaKey struct{}
+
+// mediaHeadKey marks a body read for the frame the reader is delivering next.
+type mediaHeadKey struct{}
 
 type driveMediaRequest struct {
 	start, end, size int // end is exclusive
@@ -56,10 +64,16 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	ctx = context.WithValue(ctx, bodyKey{}, true)
 	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
 	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
-	parts := min((frame.size+driveMediaPart-1)/driveMediaPart, max(1, len(s.mediaClients)))
+	lanes := max(1, len(s.mediaClients))
+	unit := driveMediaSplit
+	if ctx.Value(mediaHeadKey{}) != nil {
+		unit = driveMediaPart
+	}
+	parts := min((frame.size+unit-1)/unit, lanes)
 	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
 		parts = 1
 	}
+	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
 	width := (frame.size + parts - 1) / parts
 	type result struct {
 		start int
@@ -70,7 +84,7 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	for i := range parts {
 		r := driveMediaRequest{start: i * width, end: min((i+1)*width, frame.size), size: frame.size}
 		if len(s.mediaClients) > 0 {
-			r.client = s.mediaClients[i]
+			r.client = s.mediaClients[int((first+uint32(i))%uint32(len(s.mediaClients)))]
 		}
 		go func() {
 			body, err := s.readMediaRange(ctx, target, r)
