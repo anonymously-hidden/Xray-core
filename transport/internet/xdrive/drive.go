@@ -127,6 +127,10 @@ type driveStorage struct {
 	readHedgeMu     sync.Mutex
 	readHedgeTokens int
 	readHedgeCount  int
+	// Media range hedges have a budget of their own: description hedges win
+	// far less often and must not leave the head frame's ranges without one.
+	mediaHedgeTokens int
+	mediaHedgeCount  int
 }
 
 // driveShared is what the sessions of a storage have in common
@@ -238,13 +242,14 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			cleanupRetryDelay: cleanupRetryDelay,
 			cleanupMaxRetries: cleanupMaxRetries,
 		},
-		client:          client,
-		inflight:        make(chan struct{}, driveMaxInflight),
-		reserved:        make(chan struct{}, driveReservedInflight),
-		mediaRescue:     make(chan struct{}, driveMediaLanes),
-		mediaRanges:     make(chan struct{}, driveMediaInflight),
-		readHedge:       slotReadHedge,
-		readHedgeTokens: 3,
+		client:           client,
+		inflight:         make(chan struct{}, driveMaxInflight),
+		reserved:         make(chan struct{}, driveReservedInflight),
+		mediaRescue:      make(chan struct{}, driveMediaLanes),
+		mediaRanges:      make(chan struct{}, driveMediaInflight),
+		readHedge:        slotReadHedge,
+		readHedgeTokens:  3,
+		mediaHedgeTokens: 3,
 	}
 	st.driveShared.owner = st
 	for i := range st.mediaConns {
@@ -266,15 +271,16 @@ func (s *driveStorage) session() Storage {
 	transport := &sessionTransport{pool: s.conns}
 	bulkTransport := &sessionTransport{pool: s.bulkConns}
 	st := &driveStorage{
-		driveShared:     s.driveShared,
-		client:          &http.Client{Transport: transport},
-		bulkClient:      &http.Client{Transport: bulkTransport},
-		inflight:        make(chan struct{}, driveMaxInflight),
-		reserved:        make(chan struct{}, driveReservedInflight),
-		mediaRescue:     make(chan struct{}, driveMediaLanes),
-		mediaRanges:     make(chan struct{}, driveMediaInflight),
-		readHedge:       s.readHedge,
-		readHedgeTokens: 3,
+		driveShared:      s.driveShared,
+		client:           &http.Client{Transport: transport},
+		bulkClient:       &http.Client{Transport: bulkTransport},
+		inflight:         make(chan struct{}, driveMaxInflight),
+		reserved:         make(chan struct{}, driveReservedInflight),
+		mediaRescue:      make(chan struct{}, driveMediaLanes),
+		mediaRanges:      make(chan struct{}, driveMediaInflight),
+		readHedge:        s.readHedge,
+		readHedgeTokens:  3,
+		mediaHedgeTokens: 3,
 	}
 	transports := []*sessionTransport{transport, bulkTransport}
 	for _, pool := range s.mediaConns {
@@ -1329,21 +1335,43 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 func (s *driveStorage) noteDescriptionRead() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
-	s.readHedgeCount++
-	if s.readHedgeCount >= 20 {
-		s.readHedgeCount = 0
-		if s.readHedgeTokens < 6 {
-			s.readHedgeTokens++
-		}
-	}
+	accrueHedgeToken(&s.readHedgeCount, &s.readHedgeTokens)
 }
 
 // takeHedgeToken spends one token when the hedge timer fires.
 func (s *driveStorage) takeHedgeToken() bool {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
-	if s.readHedgeTokens > 0 {
-		s.readHedgeTokens--
+	return spendHedgeToken(&s.readHedgeTokens)
+}
+
+// noteMediaRange and takeMediaHedgeToken keep the same budget rule for media
+// ranges: one token per twenty completed ranges, capped at six.
+func (s *driveStorage) noteMediaRange() {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	accrueHedgeToken(&s.mediaHedgeCount, &s.mediaHedgeTokens)
+}
+
+func (s *driveStorage) takeMediaHedgeToken() bool {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	return spendHedgeToken(&s.mediaHedgeTokens)
+}
+
+func accrueHedgeToken(count, tokens *int) {
+	*count++
+	if *count >= 20 {
+		*count = 0
+		if *tokens < 6 {
+			*tokens++
+		}
+	}
+}
+
+func spendHedgeToken(tokens *int) bool {
+	if *tokens > 0 {
+		*tokens--
 		return true
 	}
 	return false

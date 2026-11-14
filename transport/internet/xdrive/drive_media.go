@@ -140,7 +140,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	}
 	launch(false)
 	pending := 1
-	// The hedge delay and budget are those of slot body and description reads.
+	// The hedge delay is that of slot body reads; the budget is the media one.
 	var timer *time.Timer
 	var hedgeAt <-chan time.Time
 	if slotBodyHedge > 0 {
@@ -159,6 +159,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		case res := <-results:
 			pending--
 			if res.err == nil {
+				s.noteMediaRange()
 				won = res.hedge
 				return res.body, nil
 			}
@@ -176,7 +177,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				timer.Reset(remaining)
 				continue
 			}
-			if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeHedgeToken() {
+			if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeMediaHedgeToken() {
 				// The timer is spent; re-arm it so the hedge can still start
 				// once the cooldown ends or the budget has refilled.
 				timer.Reset(slotBodyHedge)

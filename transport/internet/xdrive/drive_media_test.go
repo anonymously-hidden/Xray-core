@@ -185,7 +185,7 @@ func TestDriveMediaMovingAndRateLimited(t *testing.T) {
 					return resp, nil
 				}))
 				s.mediaClients = []*http.Client{s.client}
-				s.readHedgeTokens = 3
+				s.mediaHedgeTokens = 3
 				s.bulkClient = &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
 					hedges.Add(1)
 					return mediaResponse(t, req, payload), nil
@@ -315,7 +315,7 @@ func TestDriveMediaRecoveryBypassesBusyPool(t *testing.T) {
 			return memoryResponse(http.StatusBadRequest, ""), nil
 		}))
 		s.mediaClients = []*http.Client{s.client}
-		s.readHedgeTokens = 1
+		s.mediaHedgeTokens = 1
 		s.inflight = make(chan struct{}, 1)
 		s.inflight <- struct{}{}
 		s.reserved <- struct{}{}
@@ -349,24 +349,24 @@ func TestDriveMediaHedgeRearmsAfterSkip(t *testing.T) {
 					hedges.Add(1)
 					return mediaResponse(t, req, payload), nil
 				})}
-				s.readHedgeTokens = 1
+				s.mediaHedgeTokens = 1
 				switch mode {
 				case "cooling":
 					s.coolMu.Lock()
 					s.coolUntil = time.Now().Add(3 * time.Second)
 					s.coolMu.Unlock()
 				case "budget":
-					s.readHedgeTokens = 0
+					s.mediaHedgeTokens = 0
 					time.AfterFunc(3*time.Second, func() {
 						s.readHedgeMu.Lock()
-						s.readHedgeTokens = 1
+						s.mediaHedgeTokens = 1
 						s.readHedgeMu.Unlock()
 					})
 				}
 				start := time.Now()
 				body, err := s.readFrameBody(context.Background(), "body", newSlotFrame(0, slotMedia, payload))
-				if err != nil || !bytes.Equal(body, payload) || hedges.Load() != 1 || time.Since(start) != 2*slotBodyHedge || s.readHedgeTokens != 0 {
-					t.Fatalf("err=%v hedges=%d elapsed=%v tokens=%d", err, hedges.Load(), time.Since(start), s.readHedgeTokens)
+				if err != nil || !bytes.Equal(body, payload) || hedges.Load() != 1 || time.Since(start) != 2*slotBodyHedge || s.mediaHedgeTokens != 0 {
+					t.Fatalf("err=%v hedges=%d elapsed=%v tokens=%d", err, hedges.Load(), time.Since(start), s.mediaHedgeTokens)
 				}
 			})
 		})
@@ -415,4 +415,22 @@ func TestDriveMediaRangesLeaveInflightFree(t *testing.T) {
 			t.Fatalf("elapsed=%v ranges=%d, want 2s", elapsed, len(s.mediaRanges))
 		}
 	})
+}
+
+// Description reads and media ranges accrue and spend separate hedge budgets.
+func TestDriveMediaHedgeBudgetIsSeparate(t *testing.T) {
+	s := memoryDrive(nil)
+	s.readHedgeTokens, s.mediaHedgeTokens = 0, 0
+	for range 40 {
+		s.noteDescriptionRead()
+	}
+	if s.takeMediaHedgeToken() || !s.takeHedgeToken() || !s.takeHedgeToken() || s.takeHedgeToken() {
+		t.Fatal("description reads must accrue description tokens only")
+	}
+	for range 40 {
+		s.noteMediaRange()
+	}
+	if !s.takeMediaHedgeToken() || !s.takeMediaHedgeToken() || s.takeMediaHedgeToken() || s.takeHedgeToken() {
+		t.Fatal("media ranges must accrue media tokens only")
+	}
 }
