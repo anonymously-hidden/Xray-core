@@ -176,10 +176,19 @@ func TestSlotFrame(t *testing.T) {
 		t.Fatalf("inline frame came back as %+v %v", f, ok)
 	}
 
-	body := randomPayload(100)
+	body := bytes.Repeat([]byte{7}, 100)
 	f, ok = decodeSlot(newSlotFrame(8, slotMedia, body).encode())
 	if !ok || f.seq != 8 || f.mode != slotMedia || f.data != nil || !f.holds(body) || f.holds(body[1:]) {
 		t.Fatalf("media frame came back as %+v %v", f, ok)
+	}
+
+	for _, mode := range []byte{slotEnd, slotErr} {
+		if f, ok := decodeSlot(newSlotFrame(0, mode, nil).encode()); !ok || f.seq != 0 || f.mode != mode {
+			t.Errorf("terminal mode %d rejected", mode)
+		}
+	}
+	if _, ok := decodeSlot((slotFrame{seq: 1, mode: slotMedia, size: maxSegmentBytes}).encode()); !ok {
+		t.Error("maximum media frame size rejected")
 	}
 
 	corrupt, _ := base64.StdEncoding.DecodeString(newSlotFrame(1, slotInline, data).encode())
@@ -187,6 +196,18 @@ func TestSlotFrame(t *testing.T) {
 	for _, broken := range []string{
 		"", "not base64", newSlotFrame(1, slotInline, data).encode()[:20], "WERSVlNMMDE=",
 		base64.StdEncoding.EncodeToString(corrupt),
+		newSlotFrame(1, 0, nil).encode(),
+		newSlotFrame(1, slotErr+1, nil).encode(),
+		newSlotFrame(-1, slotInline, data).encode(),
+		newSlotFrame(1, slotInline, nil).encode(),
+		newSlotFrame(1, slotMedia, nil).encode(),
+		(slotFrame{seq: 1, mode: slotMedia, size: maxSegmentBytes + 1}).encode(),
+		(slotFrame{seq: 1, mode: slotMedia, size: -1}).encode(),
+		(slotFrame{seq: 1, mode: slotMedia, size: len(body), data: data}).encode(),
+		newSlotFrame(1, slotEnd, data).encode(),
+		newSlotFrame(1, slotErr, data).encode(),
+		(slotFrame{seq: 1, mode: slotEnd, crc: 1}).encode(),
+		(slotFrame{seq: 1, mode: slotErr, data: data}).encode(),
 	} {
 		if _, ok := decodeSlot(broken); ok {
 			t.Errorf("%q decoded", broken)

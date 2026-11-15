@@ -130,11 +130,25 @@ func decodeSlot(description string) (slotFrame, bool) {
 		size: int(binary.BigEndian.Uint32(b[17:])),
 		crc:  binary.BigEndian.Uint32(b[21:]),
 	}
-	if f.mode == slotInline {
+	if f.seq < 0 || f.size < 0 || f.size > maxSegmentBytes {
+		return slotFrame{}, false
+	}
+	switch f.mode {
+	case slotInline:
 		f.data = b[slotHeaderLen:]
-		if !f.holds(f.data) {
+		if f.size == 0 || !f.holds(f.data) {
 			return slotFrame{}, false
 		}
+	case slotMedia:
+		if f.size == 0 || len(b) != slotHeaderLen {
+			return slotFrame{}, false
+		}
+	case slotEnd, slotErr:
+		if f.size != 0 || f.crc != 0 || len(b) != slotHeaderLen {
+			return slotFrame{}, false
+		}
+	default:
+		return slotFrame{}, false
 	}
 	return f, true
 }

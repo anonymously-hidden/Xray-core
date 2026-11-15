@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -236,6 +237,16 @@ func TestLocalNameEscape(t *testing.T) {
 	if _, err := os.Stat(root + "/escaped"); err != nil {
 		t.Fatalf("name was not clamped inside the root: %v", err)
 	}
+
+	invalid := []string{"", "folder/" + tempPrefix + "test"}
+	if filepath.Separator == '\\' {
+		invalid = append(invalid, `..\escaped`, `nested\..\..\escaped`, `C:\escaped`, "NUL", `nested\NUL`, `nested\`+tempPrefix+"test")
+	}
+	for _, name := range invalid {
+		if _, err := storage.resolve(name); err == nil {
+			t.Errorf("resolve(%q) accepted an invalid object name", name)
+		}
+	}
 }
 
 func TestLocalMissingObject(t *testing.T) {
@@ -300,12 +311,14 @@ func TestParamDefaults(t *testing.T) {
 		t.Fatalf("defaults not applied: %+v", p)
 	}
 
-	p = paramsFromConfig(&Config{SegmentBytes: 1 << 30, PollIntervalMs: 400, MaxPollIntervalMs: 100})
-	if p.segmentBytes != maxSegmentBytes {
-		t.Fatalf("segmentBytes is %d, want %d", p.segmentBytes, maxSegmentBytes)
-	}
-	if p.maxPollInterval < p.minPollInterval {
-		t.Fatalf("maxPollInterval %v below minPollInterval %v", p.maxPollInterval, p.minPollInterval)
+	for _, value := range []uint32{1 << 30, 1 << 31, ^uint32(0)} {
+		p = paramsFromConfig(&Config{SegmentBytes: value, Concurrency: value, PollIntervalMs: 400, MaxPollIntervalMs: 100})
+		if p.segmentBytes != maxSegmentBytes || p.concurrency != maxConcurrency {
+			t.Errorf("value %d: segmentBytes=%d concurrency=%d, want %d and %d", value, p.segmentBytes, p.concurrency, maxSegmentBytes, maxConcurrency)
+		}
+		if p.maxPollInterval < p.minPollInterval {
+			t.Fatalf("maxPollInterval %v below minPollInterval %v", p.maxPollInterval, p.minPollInterval)
+		}
 	}
 }
 
