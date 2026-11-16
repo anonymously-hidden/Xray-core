@@ -1127,7 +1127,7 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 			resp.Body.Close()
 		}
 		send()
-		time.Sleep(2 * time.Millisecond)
+		<-time.NewTimer(2 * time.Millisecond).C
 		transport.stalled(time.Now())
 		send()
 		if n := made.Load(); n != 2 {
@@ -1137,7 +1137,7 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 		transport.slowAt, transport.retiredAt = time.Time{}, time.Time{}
 		transport.mu.Unlock()
 		began := time.Now()
-		time.Sleep(2 * time.Millisecond)
+		<-time.NewTimer(2 * time.Millisecond).C
 		send()
 		transport.stalled(began)
 		send()
@@ -1145,7 +1145,7 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 			t.Fatalf("a stall with a success behind it made %d connections", n)
 		}
 		began = time.Now()
-		time.Sleep(2 * time.Millisecond)
+		<-time.NewTimer(2 * time.Millisecond).C
 		send()
 		transport.stalled(began)
 		send()

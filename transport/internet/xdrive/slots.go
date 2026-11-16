@@ -619,7 +619,14 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		" mode=", mode, " await=", awaited, " put=", time.Since(putAt))
 }
 
-func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
+func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
+	defer func() {
+		if err == nil && mode != slotErr {
+			w.ackMu.Lock()
+			w.progress = time.Now()
+			w.ackMu.Unlock()
+		}
+	}()
 	if err := w.ctx.Err(); err != nil {
 		return err
 	}
@@ -766,10 +773,10 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		w.ackMu.Lock()
 		still := time.Since(w.progress)
 		w.ackMu.Unlock()
-		if !completed && time.Since(start) >= slotStallTimeout {
+		if !closed && !completed && time.Since(start) >= slotStallTimeout {
 			return errors.New("the previous write to slot ", w.slotID(seq), " did not complete").Base(err)
 		}
-		if min(time.Since(start), still) > slotStallTimeout || closed && still > slotCloseGrace {
+		if !closed && min(time.Since(start), still) > slotStallTimeout || closed && still >= slotStallTimeout {
 			return errors.New("the reader took nothing from slot ", w.slotID(seq), " for ", still).Base(err)
 		}
 
@@ -794,19 +801,43 @@ func (w *slotWriter) fail(err error) {
 	}
 }
 
+func waitCloseProgress(done <-chan error, ctx context.Context, progress func() time.Time) error {
+	var canceled <-chan struct{}
+	if ctx != nil {
+		canceled = ctx.Done()
+	}
+	timer := time.NewTimer(max(0, slotStallTimeout-time.Since(progress())))
+	defer timer.Stop()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-canceled:
+			return ctx.Err()
+		case <-timer.C:
+			remaining := slotStallTimeout - time.Since(progress())
+			if remaining <= 0 {
+				return context.DeadlineExceeded
+			}
+			timer.Reset(remaining)
+		}
+	}
+}
+
+func (w *slotWriter) closeProgress() time.Time {
+	w.ackMu.Lock()
+	defer w.ackMu.Unlock()
+	return w.progress
+}
+
 func (w *slotWriter) Close() error {
 	w.closeOnce.Do(func() {
+		w.ackMu.Lock()
+		w.progress = time.Now()
+		w.ackMu.Unlock()
 		done := make(chan error, 1)
 		go func() { done <- w.closeOrdered() }()
-		timer := time.NewTimer(slotStallTimeout)
-		defer timer.Stop()
-		select {
-		case w.closeErr = <-done:
-		case <-w.ctx.Done():
-			w.closeErr = w.ctx.Err()
-		case <-timer.C:
-			w.closeErr = context.DeadlineExceeded
-		}
+		w.closeErr = waitCloseProgress(done, w.ctx, w.closeProgress)
 		if w.cancel != nil {
 			w.cancel()
 		}
@@ -816,10 +847,6 @@ func (w *slotWriter) Close() error {
 
 func (w *slotWriter) closeOrdered() error {
 	w.mu.Lock()
-	// Publish grace before uploads observe closed while the tail drains.
-	w.ackMu.Lock()
-	w.progress = time.Now()
-	w.ackMu.Unlock()
 	w.closed = true
 	close(w.flushStop)
 	var flushErr error
@@ -831,9 +858,6 @@ func (w *slotWriter) closeOrdered() error {
 	seq := w.seq
 	w.mu.Unlock()
 
-	w.ackMu.Lock()
-	w.progress = time.Now()
-	w.ackMu.Unlock()
 	<-w.flushDone
 	w.wg.Wait()
 

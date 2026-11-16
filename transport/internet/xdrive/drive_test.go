@@ -882,3 +882,68 @@ func TestDriveMediaHeadOnlySplitsRanges(t *testing.T) {
 		}
 	})
 }
+
+type gatedCloseBody struct {
+	io.Reader
+	closing chan struct{}
+	release <-chan struct{}
+}
+
+func (b gatedCloseBody) Close() error {
+	close(b.closing)
+	<-b.release
+	return nil
+}
+
+func TestDrivePermitHeldUntilBodyClose(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		closing, release := make(chan struct{}), make(chan struct{})
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			resp := memoryResponse(http.StatusOK, "")
+			resp.Body = gatedCloseBody{Reader: strings.NewReader("ok"), closing: closing, release: release}
+			return resp, nil
+		}))
+		done := make(chan error, 1)
+		go func() { _, _, err := s.do(context.Background(), http.MethodGet, s.filesURL, "", nil); done <- err }()
+		<-closing
+		if len(s.inflight) != 1 {
+			t.Fatal("permit released before body Close completed")
+		}
+		close(release)
+		if err := <-done; err != nil || len(s.inflight) != 0 {
+			t.Fatalf("permit after Close: %v", err)
+		}
+	})
+}
+
+func TestDriveMediaRangePoolLeavesSlotPermitsFree(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			if r.Header.Get("Range") != "" {
+				close(started)
+				<-release
+				resp := memoryResponse(http.StatusPartialContent, "x")
+				resp.Header.Set("Content-Range", "bytes 0-0/1")
+				return resp, nil
+			}
+			return memoryResponse(http.StatusOK, ""), nil
+		}))
+		s.mediaRanges = make(chan struct{}, 1)
+		ctx := context.WithValue(context.Background(), driveMediaKey{}, &driveMediaRequest{start: 0, end: 1, size: 1})
+		done := make(chan error, 1)
+		go func() { _, _, err := s.do(ctx, http.MethodGet, s.filesURL+"?alt=media", "", nil); done <- err }()
+		<-started
+		if len(s.mediaRanges) != cap(s.mediaRanges) || len(s.inflight) != 0 {
+			t.Fatal("media range consumed slot permits")
+		}
+		_, _, err := s.do(context.Background(), http.MethodPatch, s.filesURL, "application/json", []byte(`{"description":"slot"}`))
+		close(release)
+		if err != nil {
+			t.Fatalf("slot write behind full range pool: %v", err)
+		}
+		if err := <-done; err != nil || len(s.mediaRanges) != 0 {
+			t.Fatalf("range completion: %v", err)
+		}
+	})
+}

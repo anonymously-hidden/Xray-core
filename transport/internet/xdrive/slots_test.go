@@ -496,7 +496,7 @@ func TestTakeSpareSkipsStale(t *testing.T) {
 	}
 }
 
-func TestDropSpareDeletesSession(t *testing.T) {
+func TestDropSpareLeavesDataForServerCollection(t *testing.T) {
 	st, err := newLocalStorage(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1015,9 +1015,9 @@ func TestSlotHuntPreservesSiblingError(t *testing.T) {
 }
 
 func TestSlotAcknowledgedPredecessorHasCloseBound(t *testing.T) {
-	w := &slotWriter{ctx: context.Background(), table: slotTable{Slots: []string{"slot"}}, closed: true, acked: 0, progress: time.Now().Add(-slotCloseGrace - time.Second)}
+	w := &slotWriter{ctx: context.Background(), table: slotTable{Slots: []string{"slot"}}, closed: true, acked: 0, progress: time.Now().Add(-slotStallTimeout - time.Second)}
 	if err := w.awaitPrevious(1, &slotWriteResult{done: make(chan struct{})}); err == nil {
-		t.Fatal("unfinished acknowledged predecessor ignored close grace")
+		t.Fatal("unfinished acknowledged predecessor ignored close stall bound")
 	}
 }
 
@@ -1039,4 +1039,60 @@ func TestSlotCloseBoundsAdmittedWork(t *testing.T) {
 		}
 		w.wg.Done()
 	})
+}
+
+type closeDrainSlots struct {
+	*memSlots
+	stalled bool
+	ended   bool
+}
+
+func (s *closeDrainSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	frame, _ := decodeSlot(description)
+	if frame.mode == slotEnd {
+		s.ended = true
+	} else if s.stalled {
+		<-ctx.Done()
+		return ctx.Err()
+	} else {
+		timer := time.NewTimer(slotStallTimeout / 2)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotCloseUsesDrainProgress(t *testing.T) {
+	for _, stalled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(stalled), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				store := &closeDrainSlots{memSlots: newMemSlots(), stalled: stalled}
+				store.descs["slot"] = ""
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				w := newSlotWriter(ctx, store, slotTable{Slots: []string{"slot"}}, paramsFromConfig(&Config{SegmentBytes: slotInlineLimit, Concurrency: 1}))
+				w.mu.Lock()
+				w.buf = make([]byte, 3*slotInlineLimit)
+				w.mu.Unlock()
+				w.ackMu.Lock()
+				w.acked = 100
+				w.ackMu.Unlock()
+				c := &Conn{ctx: ctx, cancel: cancel, writer: w, closing: make(chan struct{}), readDeadline: newPipeDeadline(), writeDeadline: newPipeDeadline()}
+				started := time.Now()
+				err := c.Close()
+				synctest.Wait()
+				if stalled {
+					if err == nil || time.Since(started) != slotStallTimeout || store.ended {
+						t.Fatalf("stalled drain: elapsed=%v ended=%v err=%v", time.Since(started), store.ended, err)
+					}
+				} else if err != nil || time.Since(started) <= slotStallTimeout || !store.ended || store.updates != 4 {
+					t.Fatalf("advancing drain: elapsed=%v writes=%d ended=%v err=%v", time.Since(started), store.updates, store.ended, err)
+				}
+			})
+		})
+	}
 }

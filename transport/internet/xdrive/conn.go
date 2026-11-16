@@ -178,21 +178,23 @@ func (c *Conn) Close() error {
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
 		done := make(chan error, 1)
-		go func() { done <- c.closeOrdered() }()
-		timer := time.NewTimer(slotStallTimeout)
-		defer timer.Stop()
-		select {
-		case c.closeErr = <-done:
-		case <-timer.C:
-			c.closeErr = context.DeadlineExceeded
+		started := time.Now()
+		progress := func() time.Time { return started }
+		if writer, ok := c.writer.(*slotWriter); ok {
+			// The writer owns the drain bound; teardown uses its remaining budget.
+			err := writer.Close()
+			progress = writer.closeProgress
+			go func() { done <- c.closeOrdered(err) }()
+		} else {
+			go func() { done <- c.closeOrdered(c.writer.Close()) }()
 		}
+		c.closeErr = waitCloseProgress(done, nil, progress)
 		c.cancel()
 	})
 	return c.closeErr
 }
 
-func (c *Conn) closeOrdered() error {
-	err := c.writer.Close()
+func (c *Conn) closeOrdered(err error) error {
 	c.publishWG.Wait()
 	if err == nil {
 		if writer, ok := c.writer.(interface{ Err() error }); ok {
