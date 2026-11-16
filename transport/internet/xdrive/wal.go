@@ -454,7 +454,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		}
 
 		chunks, err := r.fetch(batch)
-		if err != nil {
+		if err != nil && (err != errNotFound || len(chunks) == 0) {
 			if err == errNotFound {
 				return advanced, false, r.pendingError(true)
 			}
@@ -475,6 +475,9 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			if requiresWALCommit(r.storage) {
 				r.queueDiscard(objectName(r.prefix, seq, commitSuffix))
 			}
+		}
+		if err == errNotFound {
+			return advanced, false, r.pendingError(true)
 		}
 	}
 }
@@ -559,10 +562,10 @@ func (r *walReader) fetch(batch []Entry) ([][]byte, error) {
 	}
 	for i, err := range failures {
 		if err != nil || len(chunks[i]) == 0 {
-			return nil, errNotFound
+			return chunks[:i], errNotFound
 		}
 		if requiresWALCommit(r.storage) && (commitFailures[i] != nil || !validWALCommit(commits[i], chunks[i])) {
-			return nil, errNotFound
+			return chunks[:i], errNotFound
 		}
 	}
 	return chunks, nil

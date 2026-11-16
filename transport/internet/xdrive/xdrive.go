@@ -104,29 +104,39 @@ type spareBox struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	timer  *time.Timer
-	config *Config
+	key    spareKey
+}
+
+type spareKey struct {
+	config  *Config
+	profile string
 }
 
 var spareBoxes sync.Map
 
-func spareBoxFor(config *Config) *spareBox {
+func spareBoxFor(config *Config, settings ...*internet.MemoryStreamConfig) *spareBox {
+	var streamSettings *internet.MemoryStreamConfig
+	if len(settings) > 0 {
+		streamSettings = settings[0]
+	}
+	key := spareKey{config: config, profile: shareKey(streamSettings, config)}
 	for {
-		if b, ok := spareBoxes.Load(config); ok {
+		if b, ok := spareBoxes.Load(key); ok {
 			box := b.(*spareBox)
 			if !box.closed.Load() {
 				return box
 			}
-			spareBoxes.CompareAndDelete(config, box)
+			spareBoxes.CompareAndDelete(key, box)
 			continue
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		box := &spareBox{
 			ch: make(chan spareRing, spareCount), wake: make(chan struct{}, 1), done: make(chan struct{}),
-			ctx: ctx, cancel: cancel, config: config,
+			ctx: ctx, cancel: cancel, key: key,
 		}
 		box.last.Store(time.Now().UnixNano())
 		box.ttl.Store(int64(defaultSessionTTL))
-		if _, loaded := spareBoxes.LoadOrStore(config, box); loaded {
+		if _, loaded := spareBoxes.LoadOrStore(key, box); loaded {
 			cancel()
 			continue
 		}
@@ -201,14 +211,17 @@ func (box *spareBox) close() {
 		return
 	}
 	box.stop.Store(true)
-	spareBoxes.CompareAndDelete(box.config, box)
+	spareBoxes.CompareAndDelete(box.key, box)
 	box.signal()
 }
 
 func stopSpares(config *Config) {
-	if box, ok := spareBoxes.LoadAndDelete(config); ok {
-		box.(*spareBox).close()
-	}
+	spareBoxes.Range(func(key, value any) bool {
+		if key.(spareKey).config == config && spareBoxes.CompareAndDelete(key, value) {
+			value.(*spareBox).close()
+		}
+		return true
+	})
 }
 
 func stopAllSpares() {
@@ -220,8 +233,8 @@ func stopAllSpares() {
 	})
 }
 
-func takeSpare(config *Config, p params) (spareRing, bool) {
-	box := spareBoxFor(config)
+func takeSpare(config *Config, p params, settings ...*internet.MemoryStreamConfig) (spareRing, bool) {
+	box := spareBoxFor(config, settings...)
 	box.mu.Lock()
 	defer box.mu.Unlock()
 	if box.stop.Load() {
@@ -244,7 +257,7 @@ func takeSpare(config *Config, p params) (spareRing, bool) {
 }
 
 func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	box := spareBoxFor(config)
+	box := spareBoxFor(config, streamSettings)
 	box.last.Store(time.Now().UnixNano())
 	box.ttl.Store(int64(p.sessionTTL))
 	box.signal()
@@ -252,7 +265,7 @@ func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p p
 }
 
 func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	fillSparesBox(spareBoxFor(config), streamSettings, config, p)
+	fillSparesBox(spareBoxFor(config, streamSettings), streamSettings, config, p)
 }
 
 func fillSparesBox(box *spareBox, streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
@@ -368,7 +381,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	var spare spareRing
 	var warm bool
 	if streamSettings.FinalMask == nil {
-		spare, warm = takeSpare(config, p)
+		spare, warm = takeSpare(config, p, streamSettings)
 	}
 	storage, session, r := spare.storage, spare.session, spare.ring
 	if !warm {

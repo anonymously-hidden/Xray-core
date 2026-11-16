@@ -1043,6 +1043,95 @@ type spareCloseCounter struct {
 
 func (s *spareCloseCounter) Close() error { s.closes.Add(1); return nil }
 
+func TestSpareProfilesStayIsolated(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := &Config{}
+		p := paramsFromConfig(cfg)
+		destA := net.Destination{Address: net.DomainAddress("a.invalid"), Port: 443, Network: net.Network_TCP}
+		destB := net.Destination{Address: net.DomainAddress("b.invalid"), Port: 443, Network: net.Network_TCP}
+		a := &internet.MemoryStreamConfig{ProtocolSettings: cfg, Destination: &destA}
+		b := &internet.MemoryStreamConfig{ProtocolSettings: cfg, Destination: &destB}
+		boxes := []*spareBox{spareBoxFor(cfg, a), spareBoxFor(cfg, b)}
+		if boxes[0] == boxes[1] {
+			t.Fatal("profiles share a spare box")
+		}
+		defer stopSpares(cfg)
+		stores := []*spareCloseCounter{{}, {}}
+		for i, box := range boxes {
+			box.mu.Lock()
+			box.ch <- spareRing{storage: stores[i], at: time.Now()}
+			box.mu.Unlock()
+		}
+		for i, settings := range []*internet.MemoryStreamConfig{a, b} {
+			spare, ok := takeSpare(cfg, p, settings)
+			if !ok || spare.storage != stores[i] || stores[i].closes.Load() != 0 {
+				t.Fatal("profile reused or discarded another profile's spare")
+			}
+			spare.storage.Close()
+			boxes[i].mu.Lock()
+			boxes[i].ch <- spareRing{storage: &spareCloseCounter{}, at: time.Now()}
+			boxes[i].mu.Unlock()
+		}
+		stopSpares(cfg)
+		for _, box := range boxes {
+			<-box.done
+			if !box.closed.Load() || len(box.ch) != 0 {
+				t.Fatal("config-only shutdown left a profile running")
+			}
+		}
+	})
+}
+
+type prefixBatchStorage struct {
+	Storage
+	committed, invalid bool
+	prefixReads        atomic.Int32
+}
+
+func (s *prefixBatchStorage) requiresWALCommit() bool { return s.committed }
+func (s *prefixBatchStorage) List(context.Context, string) ([]Entry, error) {
+	return []Entry{{Name: "000000000.seg"}, {Name: "000000001.seg"}}, nil
+}
+func (s *prefixBatchStorage) Get(_ context.Context, name string) ([]byte, error) {
+	if strings.HasSuffix(name, "000000000.seg") {
+		s.prefixReads.Add(1)
+		return []byte("prefix"), nil
+	}
+	if s.committed && strings.HasSuffix(name, "000000000.commit") {
+		if s.invalid {
+			return []byte("invalid"), nil
+		}
+		return encodeWALCommit([]byte("prefix")), nil
+	}
+	if s.committed && strings.HasSuffix(name, "000000001.seg") {
+		return []byte("suffix"), nil
+	}
+	return nil, errNotFound
+}
+
+func TestWALDeliversValidatedPrefixBeforeMissingSuffix(t *testing.T) {
+	for _, tc := range []struct{ committed, invalid bool }{{}, {committed: true}, {committed: true, invalid: true}} {
+		store := &prefixBatchStorage{committed: tc.committed, invalid: tc.invalid}
+		r := &walReader{ctx: context.Background(), storage: store, prefix: "session", params: paramsFromConfig(&Config{Concurrency: 2}), ch: make(chan []byte, 2)}
+		advanced, eof, err := r.poll()
+		if err != nil || eof || advanced == tc.invalid {
+			t.Fatalf("invalid=%v advanced=%v eof=%v err=%v", tc.invalid, advanced, eof, err)
+		}
+		if tc.invalid {
+			if r.seq != 0 || len(r.ch) != 0 {
+				t.Fatal("invalid prefix was delivered")
+			}
+			continue
+		}
+		if r.seq != 1 || string(<-r.ch) != "prefix" {
+			t.Fatal("validated prefix was lost")
+		}
+		if advanced, _, err = r.poll(); advanced || err != nil || store.prefixReads.Load() != 1 {
+			t.Fatalf("prefix refetched: reads=%d err=%v", store.prefixReads.Load(), err)
+		}
+	}
+}
+
 func TestSpareStopSignalsReaper(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, busy := range []bool{false, true} {
