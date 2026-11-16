@@ -177,22 +177,36 @@ func (c *Conn) Close() error {
 		close(c.closing)
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
-		c.closeErr = c.writer.Close()
-		c.publishWG.Wait()
-		if c.closeErr == nil {
-			if writer, ok := c.writer.(interface{ Err() error }); ok {
-				c.closeErr = writer.Err()
-			}
+		done := make(chan error, 1)
+		go func() { done <- c.closeOrdered() }()
+		timer := time.NewTimer(slotStallTimeout)
+		defer timer.Stop()
+		select {
+		case c.closeErr = <-done:
+		case <-timer.C:
+			c.closeErr = context.DeadlineExceeded
 		}
 		c.cancel()
-		if reader, ok := c.reader.(interface{ wait() }); ok {
-			reader.wait()
-		}
-		if c.onClose != nil {
-			c.onClose()
-		}
 	})
 	return c.closeErr
+}
+
+func (c *Conn) closeOrdered() error {
+	err := c.writer.Close()
+	c.publishWG.Wait()
+	if err == nil {
+		if writer, ok := c.writer.(interface{ Err() error }); ok {
+			err = writer.Err()
+		}
+	}
+	c.cancel()
+	if reader, ok := c.reader.(interface{ wait() }); ok {
+		reader.wait()
+	}
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return err
 }
 
 func (c *Conn) Interrupt() {

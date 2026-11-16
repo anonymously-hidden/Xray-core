@@ -1271,3 +1271,52 @@ func TestSlotZeroUploadPrecedesReuse(t *testing.T) {
 		}
 	}
 }
+
+func TestSlotHuntPreservesSiblingError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		want := errors.New("description failed")
+		for _, matching := range []bool{false, true} {
+			r := &slotReader{params: params{eagerWindow: time.Hour}, head: 2, activeAt: time.Now(), huntCeiling: time.Hour, stallTimeout: time.Hour}
+			pending := slotDescriptionHunt{results: make(chan slotDescriptionResult, 3), outstanding: 3}
+			pending.results <- slotDescriptionResult{err: want}
+			pending.results <- slotDescriptionResult{description: newSlotFrame(1, slotInline, []byte("old")).encode()}
+			seq := int64(1)
+			if matching {
+				seq = 2
+			}
+			desc := newSlotFrame(seq, slotInline, []byte("frame")).encode()
+			pending.results <- slotDescriptionResult{description: desc}
+			got, err := r.huntSlotDescription(context.Background(), "slot", 2, nil, &pending)
+			if matching && (got != desc || err != nil) || !matching && err != want {
+				t.Fatalf("matching=%v: sibling error lost: %v", matching, err)
+			}
+		}
+	})
+}
+
+func TestSlotAcknowledgedPredecessorHasCloseBound(t *testing.T) {
+	w := &slotWriter{ctx: context.Background(), table: slotTable{Slots: []string{"slot"}}, closed: true, acked: 0, progress: time.Now().Add(-slotCloseGrace - time.Second)}
+	if err := w.awaitPrevious(1, &slotWriteResult{done: make(chan struct{})}); err == nil {
+		t.Fatal("unfinished acknowledged predecessor ignored close grace")
+	}
+}
+
+func TestSlotCloseBoundsAdmittedWork(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		w := &slotWriter{ctx: ctx, cancel: cancel, flushStop: make(chan struct{}), flushDone: make(chan struct{})}
+		close(w.flushDone)
+		w.wg.Add(1)
+		cancel()
+		results := make(chan error, 2)
+		for range 2 {
+			go func() { results <- w.Close() }()
+		}
+		for range 2 {
+			if err := <-results; err != context.Canceled {
+				t.Fatalf("Close: %v", err)
+			}
+		}
+		w.wg.Done()
+	})
+}

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -1171,4 +1172,34 @@ func TestPoolConnAcquireRefusesAClosingConnection(t *testing.T) {
 	if c.acquire() {
 		t.Fatal("a closed connection took a request")
 	}
+}
+
+type closeTestWriter struct{ connWriter }
+
+func (closeTestWriter) Close() error { return nil }
+
+type closeTestReader struct {
+	chunkReader
+	release <-chan struct{}
+}
+
+func (r closeTestReader) wait() { <-r.release }
+
+func TestConnCloseBoundsReaderShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		release, cleaned := make(chan struct{}), make(chan struct{})
+		c := &Conn{ctx: ctx, cancel: cancel, closing: make(chan struct{}), writer: closeTestWriter{}, reader: closeTestReader{release: release}, onClose: func() { close(cleaned) }}
+		results := make(chan error, 2)
+		for range 2 {
+			go func() { results <- c.Close() }()
+		}
+		for range 2 {
+			if err := <-results; err != context.DeadlineExceeded {
+				t.Fatalf("Close: %v", err)
+			}
+		}
+		close(release)
+		<-cleaned
+	})
 }

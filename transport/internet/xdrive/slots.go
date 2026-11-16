@@ -268,9 +268,10 @@ type slotWriteResult struct {
 }
 
 type slotWriter struct {
-	ctx   context.Context
-	store slotStore
-	table slotTable
+	ctx    context.Context
+	cancel context.CancelFunc
+	store  slotStore
+	table  slotTable
 	params
 	// slots has a token for each segment on its way, at most one for each slot
 	slots     chan struct{}
@@ -312,8 +313,10 @@ type slotWriter struct {
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
+	ctx, cancel := context.WithCancel(ctx)
 	w := &slotWriter{
 		ctx:       ctx,
+		cancel:    cancel,
 		store:     store,
 		table:     table,
 		params:    p,
@@ -720,7 +723,7 @@ func (w *slotWriter) await(seq int64) error {
 }
 
 // Reuse needs both cumulative acknowledgement and completion of the previous
-// physical write. Once acknowledged, storage I/O is not a reader stall.
+// physical write, including when the acknowledgement arrives first.
 func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 	start := time.Now()
 	wait := w.ackRetry
@@ -728,26 +731,20 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		if err := w.ctx.Err(); err != nil {
 			return err
 		}
+		completed := prev == nil
 		if prev != nil {
 			select {
 			case <-prev.done:
 				if prev.err != nil {
 					return prev.err
 				}
+				completed = true
 			default:
 			}
 		}
 		ok, err := w.drained(seq)
-		if ok {
-			if prev == nil {
-				return nil
-			}
-			select {
-			case <-prev.done:
-				return prev.err
-			case <-w.ctx.Done():
-				return w.ctx.Err()
-			}
+		if ok && completed {
+			return nil
 		}
 		if time.Since(start) >= ackDelay {
 			w.mu.Lock()
@@ -769,6 +766,9 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		w.ackMu.Lock()
 		still := time.Since(w.progress)
 		w.ackMu.Unlock()
+		if !completed && time.Since(start) >= slotStallTimeout {
+			return errors.New("the previous write to slot ", w.slotID(seq), " did not complete").Base(err)
+		}
 		if min(time.Since(start), still) > slotStallTimeout || closed && still > slotCloseGrace {
 			return errors.New("the reader took nothing from slot ", w.slotID(seq), " for ", still).Base(err)
 		}
@@ -796,43 +796,60 @@ func (w *slotWriter) fail(err error) {
 
 func (w *slotWriter) Close() error {
 	w.closeOnce.Do(func() {
-		w.mu.Lock()
-		// Publish a fresh grace period before uploads can observe closed while
-		// Close is still waiting for tokens to flush the buffered tail.
-		w.ackMu.Lock()
-		w.progress = time.Now()
-		w.ackMu.Unlock()
-		w.closed = true
-		close(w.flushStop)
-		var flushErr error
-		for len(w.buf) > 0 && w.err == nil {
-			if flushErr = w.flushAdmittedLocked(nil, nil, true); flushErr != nil {
-				break
-			}
+		done := make(chan error, 1)
+		go func() { done <- w.closeOrdered() }()
+		timer := time.NewTimer(slotStallTimeout)
+		defer timer.Stop()
+		select {
+		case w.closeErr = <-done:
+		case <-w.ctx.Done():
+			w.closeErr = w.ctx.Err()
+		case <-timer.C:
+			w.closeErr = context.DeadlineExceeded
 		}
-		seq := w.seq
-		w.mu.Unlock()
-
-		w.ackMu.Lock()
-		w.progress = time.Now()
-		w.ackMu.Unlock()
-
-		<-w.flushDone
-		w.wg.Wait()
-
-		if err := w.Err(); err != nil {
-			w.closeErr = err
-		} else if flushErr != nil {
-			w.closeErr = flushErr
-		} else if err := w.ctx.Err(); err != nil {
-			w.closeErr = err
-		} else if err := w.await(seq); err != nil {
-			w.closeErr = err
-		} else {
-			w.closeErr = w.write(seq, slotEnd, nil)
+		if w.cancel != nil {
+			w.cancel()
 		}
 	})
 	return w.closeErr
+}
+
+func (w *slotWriter) closeOrdered() error {
+	w.mu.Lock()
+	// Publish grace before uploads observe closed while the tail drains.
+	w.ackMu.Lock()
+	w.progress = time.Now()
+	w.ackMu.Unlock()
+	w.closed = true
+	close(w.flushStop)
+	var flushErr error
+	for len(w.buf) > 0 && w.err == nil {
+		if flushErr = w.flushAdmittedLocked(nil, nil, true); flushErr != nil {
+			break
+		}
+	}
+	seq := w.seq
+	w.mu.Unlock()
+
+	w.ackMu.Lock()
+	w.progress = time.Now()
+	w.ackMu.Unlock()
+	<-w.flushDone
+	w.wg.Wait()
+
+	if err := w.Err(); err != nil {
+		return err
+	}
+	if flushErr != nil {
+		return flushErr
+	}
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	if err := w.await(seq); err != nil {
+		return err
+	}
+	return w.write(seq, slotEnd, nil)
 }
 
 func (w *slotWriter) Err() error {
@@ -1272,6 +1289,7 @@ type slotDescriptionHunt struct {
 	outstanding int
 	last        slotDescriptionResult
 	seen        bool
+	err         error
 }
 
 func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
@@ -1335,19 +1353,23 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		select {
 		case res := <-pending.results:
 			pending.outstanding--
-			if !head || res.err != nil {
-				pending.last, pending.seen = res, true
-				if head && pending.outstanding > 0 {
-					// Give a pending sibling a chance to supply a valid frame
-					// before yielding this error to the outer retry path.
-					continue
-				}
+			if !head {
 				return res.description, res.err
 			}
-			if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
+			pending.last, pending.seen = res, true
+			if res.err != nil {
+				if pending.err == nil || isAuthError(res.err) {
+					pending.err = res.err
+				}
+			} else if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
+				pending.err = nil
 				return res.description, nil
 			}
-			pending.last, pending.seen = res, true
+			if pending.outstanding == 0 && pending.err != nil {
+				err := pending.err
+				pending.err = nil
+				return "", err
+			}
 		case <-promoted:
 			// Keep the pending tail read in the head's overlap budget rather
 			// than waiting for it to finish before starting the head hunt.
@@ -1358,7 +1380,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			r.mu.Unlock()
 			switch {
 			case pending.seen && idle:
-				return pending.last.description, pending.last.err
+				err := pending.err
+				pending.err = nil
+				return pending.last.description, err
 			case !idle && pending.outstanding < 3:
 				launch()
 			}
@@ -1368,7 +1392,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			}
 		case <-observationTimer.C:
 			if pending.seen {
-				return pending.last.description, pending.last.err
+				err := pending.err
+				pending.err = nil
+				return pending.last.description, err
 			}
 			r.mu.Lock()
 			progressPastHead := r.head == seq && r.frontier > seq
