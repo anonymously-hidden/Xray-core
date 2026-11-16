@@ -1155,6 +1155,37 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 	})
 }
 
+func TestSessionFailedBodyDoesNotCountAsService(t *testing.T) {
+	transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+		return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+			resp := memoryResponse(http.StatusOK, "")
+			resp.Body = failingDriveBody{}
+			return resp, nil
+		})}
+	})}
+	defer transport.pool.Close()
+	defer transport.Close()
+	req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/files/item", nil)
+	began := time.Now()
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != io.ErrUnexpectedEOF || !transport.servedAt.IsZero() {
+		t.Fatal("failed response body counted as healthy service")
+	}
+	transport.mu.Lock()
+	transport.takenAt = time.Now().Add(-2 * stalledGrace)
+	conn := transport.client.XmuxConn.(*poolConn)
+	transport.mu.Unlock()
+	transport.stalled(began, conn)
+	if !conn.IsClosed() {
+		t.Fatal("isolated body stall did not retire connection")
+	}
+}
+
 func TestSessionStallTracksSelectedConnection(t *testing.T) {
 	transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
 		return &http.Client{Transport: okConn{}}

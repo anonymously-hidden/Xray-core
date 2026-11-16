@@ -165,7 +165,6 @@ type driveShared struct {
 	token         string
 	tokenExpiry   time.Time
 	tokenLifetime time.Duration
-	refreshing    bool
 	authErr       error
 	flight        *tokenFlight
 	tokenRetryAt  time.Time
@@ -376,10 +375,11 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
-		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && !s.refreshing && time.Now().After(s.tokenRetryAt) {
+		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && s.flight == nil && time.Now().After(s.tokenRetryAt) {
 			if refreshCtx, finish, ok := s.beginWork(30 * time.Second); ok {
-				s.refreshing = true
-				go func() { defer finish(); s.refreshTokenBackground(refreshCtx) }()
+				f := &tokenFlight{done: make(chan struct{})}
+				s.flight = f
+				go func() { defer finish(); s.refreshTokenBackground(refreshCtx, f) }()
 			}
 		}
 		token := s.token
@@ -476,12 +476,14 @@ func (s *driveStorage) storeToken(token string, lifetime time.Duration) {
 	s.tokenExpiry = time.Now().Add(expiry)
 }
 
-func (s *driveStorage) refreshTokenBackground(ctx context.Context) {
+func (s *driveStorage) refreshTokenBackground(ctx context.Context, f *tokenFlight) {
 	token, lifetime, err := s.fetchToken(ctx)
 
 	s.tokenMu.Lock()
 	defer s.tokenMu.Unlock()
-	s.refreshing = false
+	defer close(f.done)
+	s.flight = nil
+	f.token, f.lifetime, f.err = token, lifetime, err
 	if err != nil {
 		if isAuthError(err) && s.authErr == nil {
 			s.authErr = err
@@ -551,6 +553,9 @@ func (s *driveStorage) fetchToken(ctx context.Context) (string, time.Duration, e
 	if parsed.AccessToken == "" {
 		return "", 0, errors.New("the token endpoint returned no access token")
 	}
+	if parsed.ExpiresIn <= 0 || parsed.ExpiresIn > int64(time.Duration(1<<63-1)/time.Second) {
+		return "", 0, errors.New("the token endpoint returned an invalid lifetime")
+	}
 	return parsed.AccessToken, time.Duration(parsed.ExpiresIn) * time.Second, nil
 }
 
@@ -596,6 +601,16 @@ func driveQuotaRetry(elapsed time.Duration, refunded int) (refund, stop bool) {
 	return elapsed < driveRateLimitBudget, elapsed >= driveRateLimitBudget && refunded > 0
 }
 
+type createOnceKey struct{}
+
+type createAmbiguityError struct{ err error }
+
+func (e createAmbiguityError) Error() string {
+	return "Drive creation outcome is unknown; refusing to replay: " + e.err.Error()
+}
+
+func (e createAmbiguityError) Unwrap() error { return e.err }
+
 func (s *driveStorage) do(parent context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
 	ctx, finish, ok := s.beginRequest(parent)
 	if !ok {
@@ -603,6 +618,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	}
 	defer finish()
 	defer s.noteRequest(ctx)
+	createOnce := method == http.MethodPost && ctx.Value(createOnceKey{}) != nil
 	backoff := s.backoff
 	var lastErr error
 	kind := -1
@@ -692,12 +708,17 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
 		if d, ok := ctx.Value(attemptKey{}).(time.Duration); ok {
 			attemptCtx, cancel = context.WithTimeout(ctx, d)
+		} else if createOnce {
+			attemptCtx, cancel = context.WithCancel(ctx)
 		}
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
 			cancel()
 			releasePermit()
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
+		}
+		if createOnce {
+			req.GetBody = nil
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		if media != nil {
@@ -714,12 +735,23 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			reused, gotConn                                    bool
 			dispatchWait                                       time.Duration
 		}
+		var dispatched, admissionFailed atomic.Bool
 		admit := func(dispatchCtx context.Context) error {
 			start := time.Now()
 			err := s.waitDispatch(dispatchCtx, cleanupPool != nil && method == http.MethodDelete)
 			tr.mu.Lock()
 			tr.dispatchWait += time.Since(start)
 			tr.mu.Unlock()
+			if err != nil {
+				admissionFailed.Store(true)
+			}
+			if err == nil {
+				previous := dispatched.Swap(true)
+				if createOnce && previous {
+					cancel()
+					return createAmbiguityError{err: errors.New("transport attempted a second creation dispatch")}
+				}
+			}
 			if err == nil && s.timing != nil {
 				s.timing.request(kind)
 			}
@@ -783,7 +815,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		resp, err := dispatchClient.Do(req)
 		respAt := time.Now()
 		noteTimeout := func() {
-			if ctx.Err() == nil && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
+			if ctx.Err() == nil && dispatched.Load() && !admissionFailed.Load() && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
 				s.throttle.Add(1)
 				s.coolMu.Lock()
 				s.lastThrottle = time.Now()
@@ -803,6 +835,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			lastErr = errors.New("Drive request failed").Base(err)
 			if errors.Cause(err) == errSessionClosed {
 				return 0, nil, lastErr
+			}
+			if createOnce {
+				return 0, nil, createAmbiguityError{err: lastErr}
 			}
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
@@ -829,10 +864,19 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("failed to read the Drive response").Base(err)
-			continue
+			if !createOnce {
+				continue
+			}
+			if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests {
+				return 0, nil, createAmbiguityError{err: lastErr}
+			}
 		}
 		if int64(len(payload)) > limit {
-			return 0, nil, errors.New("Drive response exceeds the ", limit, " byte cap")
+			err := errors.New("Drive response exceeds the ", limit, " byte cap")
+			if createOnce {
+				return 0, nil, createAmbiguityError{err: err}
+			}
+			return 0, nil, err
 		}
 		tr.mu.Lock()
 		sample := timingSample{
@@ -840,7 +884,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			waitCool:  waitCoolDur + tr.dispatchWait,
 			waitPool:  waitPoolDur,
 			waitToken: waitTokenDur,
-			waitConn:  tr.connAt.Sub(began),
+			waitConn:  max(0, tr.connAt.Sub(began)-tr.dispatchWait),
 			dialTLS:   dialEnd(tr.tlsDone, tr.connDone).Sub(tr.connStart),
 			server:    tr.first.Sub(tr.wrote),
 			body:      bodyEnd.Sub(maxTime(tr.first, respAt)),
@@ -878,6 +922,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		if retryableStatus(resp.StatusCode) {
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
+			if createOnce {
+				return 0, nil, createAmbiguityError{err: lastErr}
+			}
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
 			continue
@@ -1192,6 +1239,7 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 		return "", errors.New("failed to build the inline metadata").Base(err)
 	}
 
+	ctx = context.WithValue(ctx, createOnceKey{}, true)
 	status, payload, err := s.do(ctx, http.MethodPost, s.filesURL+"?fields=id&supportsAllDrives=true",
 		"application/json; charset=UTF-8", body)
 	if err != nil {
@@ -1206,10 +1254,10 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
-		return "", errors.New("failed to parse the Drive upload response").Base(err)
+		return "", createAmbiguityError{err: errors.New("failed to parse the Drive upload response").Base(err)}
 	}
 	if parsed.ID == "" {
-		return "", errors.New("Drive returned no id for ", name)
+		return "", createAmbiguityError{err: errors.New("Drive returned no id for ", name)}
 	}
 	s.rememberID(flat, parsed.ID, nil)
 	return parsed.ID, nil
@@ -1249,6 +1297,7 @@ func withAllDrives(target string) string {
 
 func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) error {
 	ctx = context.WithValue(ctx, bodyKey{}, true)
+	ctx = context.WithValue(ctx, createOnceKey{}, true)
 	flat := flatten(name)
 
 	metadata, err := json.Marshal(map[string]interface{}{
@@ -1272,10 +1321,10 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 		ID string `json:"id"`
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
-		return errors.New("failed to parse the Drive upload response").Base(err)
+		return createAmbiguityError{err: errors.New("failed to parse the Drive upload response").Base(err)}
 	}
 	if parsed.ID == "" {
-		return errors.New("Drive returned no id for ", name)
+		return createAmbiguityError{err: errors.New("Drive returned no id for ", name)}
 	}
 	s.rememberID(flat, parsed.ID, nil)
 	return nil
@@ -1288,14 +1337,18 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, err
 	}
 
-	payload, err := s.readBody(ctx, id)
-	if err == errNotFound {
-		s.retireID(flat, id)
+	known := s.cachedFiles(flat, false)[flat]
+	for _, candidate := range append([]string{id}, known.extra...) {
+		payload, err := s.readBody(ctx, candidate)
+		if err == nil && len(payload) == 0 {
+			payload, err = s.getInline(ctx, candidate)
+		}
+		if err != errNotFound {
+			return payload, err
+		}
+		s.retireID(flat, candidate)
 	}
-	if err != nil || len(payload) > 0 {
-		return payload, err
-	}
-	return s.getInline(ctx, id)
+	return nil, errNotFound
 }
 
 func (s *driveStorage) getInline(ctx context.Context, id string) ([]byte, error) {
@@ -1484,7 +1537,7 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 
 	found, err := s.query(ctx, "name contains '"+quoteDriveValue(flat)+"'")
 
-	seen := make(map[string]bool, len(found))
+	seen := make(map[string]int, len(found))
 	entries := make([]Entry, 0, len(found))
 	for name, file := range found {
 		if !strings.HasPrefix(name, flat) {
@@ -1499,18 +1552,18 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 			rest = rest[:cut]
 			direct = false
 		}
-		if seen[rest] {
-			continue
+		index, exists := seen[rest]
+		if !exists {
+			index = len(entries)
+			seen[rest] = index
+			entries = append(entries, Entry{Name: rest})
 		}
-		seen[rest] = true
-
-		entry := Entry{Name: rest}
+		entry := &entries[index]
 		if direct && file.description != "" {
 			if data, err := base64.StdEncoding.DecodeString(file.description); err == nil {
 				entry.Inline = data
 			}
 		}
-		entries = append(entries, entry)
 	}
 	return entries, err
 }
@@ -1683,7 +1736,15 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 	var last res
 	won := false
 	for i := 0; i < 2; i++ {
-		r := <-ch
+		var r res
+		select {
+		case r = <-ch:
+		case <-ctx.Done():
+			if s.timing != nil {
+				s.timing.noteHedge(kind, false)
+			}
+			return 0, nil, ctx.Err()
+		}
 		if r.err == nil && (r.status == http.StatusOK || r.status == http.StatusNotFound) {
 			won = r.hedge
 			last = r

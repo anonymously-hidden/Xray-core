@@ -1,12 +1,15 @@
 package xdrive
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
+	stdnet "net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -795,6 +798,324 @@ func memoryDrive(rt http.RoundTripper) *driveStorage {
 			folder: "fake-folder", backoff: time.Millisecond, ids: make(map[string]string),
 		},
 		client: client, inflight: make(chan struct{}, 64), reserved: make(chan struct{}, 8),
+	}
+}
+
+type failingDriveBody struct{}
+
+func (failingDriveBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
+func (failingDriveBody) Close() error             { return nil }
+
+func TestDriveUnkeyedCreateDoesNotReplayAmbiguity(t *testing.T) {
+	for _, media := range []bool{false, true} {
+		for _, outcome := range []string{"transport", "body", "server", "invalid", "missing", "replay", "quota"} {
+			synctest.Test(t, func(t *testing.T) {
+				calls := 0
+				s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.GetBody != nil {
+						t.Fatal("unkeyed creation retained a replayable body")
+					}
+					switch outcome {
+					case "transport":
+						return nil, io.ErrUnexpectedEOF
+					case "body":
+						resp := memoryResponse(http.StatusOK, "")
+						resp.Body = failingDriveBody{}
+						return resp, nil
+					case "server":
+						return memoryResponse(http.StatusServiceUnavailable, ""), nil
+					case "invalid":
+						return memoryResponse(http.StatusOK, "{"), nil
+					case "missing":
+						return memoryResponse(http.StatusOK, `{}`), nil
+					case "replay":
+						admit := r.Context().Value(dispatchKey{}).(func(context.Context) error)
+						return nil, admit(r.Context())
+					case "quota":
+						if calls == 1 {
+							resp := memoryResponse(http.StatusTooManyRequests, "")
+							resp.Body = failingDriveBody{}
+							return resp, nil
+						}
+					}
+					return memoryResponse(http.StatusOK, `{"id":"created"}`), nil
+				}))
+				data := []byte("inline")
+				if media {
+					data = make([]byte, driveInlineLimit+1)
+				}
+				err := s.Put(context.Background(), "sessions/new", data)
+				if outcome == "quota" {
+					if err != nil || calls != 2 {
+						t.Fatalf("known rejection was not retried: %v", err)
+					}
+				} else {
+					var ambiguity createAmbiguityError
+					if !errors.As(err, &ambiguity) || calls != 1 {
+						t.Fatalf("ambiguous %s creation replayed or lost classification: %v", outcome, err)
+					}
+				}
+				if len(s.inflight)+len(s.reserved) != 0 {
+					t.Fatal("creation leaked admission permits")
+				}
+			})
+		}
+	}
+}
+
+func TestDriveColdIDsBatchDemandAndSurplus(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		calls := 0
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if r.URL.Query().Get("count") != "390" {
+				t.Fatal("cold allocation did not include bounded surplus")
+			}
+			close(entered)
+			<-release
+			ids := make([]string, 390)
+			for i := range ids {
+				ids[i] = fmt.Sprint(i)
+			}
+			body, _ := json.Marshal(map[string]any{"ids": ids})
+			return memoryResponse(http.StatusOK, string(body)), nil
+		}))
+		s.owner = s
+		type result struct {
+			ids []string
+			err error
+		}
+		done := make(chan result, 2)
+		take := func() { ids, err := s.takeIDs(context.Background(), 65, 65); done <- result{ids, err} }
+		go take()
+		<-entered
+		go take()
+		synctest.Wait()
+		close(release)
+		seen := make(map[string]bool)
+		for range 2 {
+			r := <-done
+			if r.err != nil || len(r.ids) != 65 {
+				t.Fatalf("allocation failed: %v", r.err)
+			}
+			for _, id := range r.ids {
+				if seen[id] {
+					t.Fatal("IDs handed to both callers")
+				}
+				seen[id] = true
+			}
+		}
+		synctest.Wait()
+		s.poolMu.Lock()
+		pooled := len(s.idPool)
+		s.poolMu.Unlock()
+		if calls != 1 || pooled != 260 {
+			t.Fatalf("cold allocation requested twice or lost surplus: calls=%d pooled=%d", calls, pooled)
+		}
+		s.Close()
+	})
+}
+
+func TestDriveIDWaiterIgnoresWrappedCallerCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected allocation"); return nil, io.EOF }))
+		f := &idPoolFlight{done: make(chan struct{})}
+		s.poolFlight = f
+		done := make(chan error, 1)
+		go func() { _, err := s.takeIDs(context.Background(), 1, 1); done <- err }()
+		synctest.Wait()
+		s.poolMu.Lock()
+		s.idPool = append(s.idPool, idPoolEntry{id: "available", at: time.Now()})
+		s.coolUntil = time.Now().Add(time.Hour)
+		s.finishPoolFlightLocked(f, fmt.Errorf("wrapped: %w", context.Canceled))
+		s.poolMu.Unlock()
+		if err := <-done; err != nil || s.poolErr != nil || !s.poolRetryAt.IsZero() {
+			t.Fatalf("caller cancellation poisoned another allocation: %v", err)
+		}
+	})
+}
+
+func TestDriveKeepWarmChecksEachProbe(t *testing.T) {
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.Context().Value(bodyKey{}) != nil {
+			return memoryResponse(http.StatusOK, ""), nil
+		}
+		return memoryResponse(http.StatusNotFound, ""), nil
+	}))
+	primary := s.keepWarmConnection(context.Background(), "http://drive.invalid/files/folder")
+	bulk := s.keepWarmConnection(context.WithValue(context.Background(), bodyKey{}, true), "http://drive.invalid/files/folder")
+	if primary == nil || bulk != nil {
+		t.Fatalf("probe status lost: primary=%v bulk=%v", primary, bulk)
+	}
+}
+
+func TestDriveTimingSnapshotOwnsSamplesAndWaits(t *testing.T) {
+	a := newTimingAggregator()
+	a.started = true
+	a.request(kindBodyRead)
+	a.record(kindBodyRead, timingSample{waitCool: time.Second, waitToken: 2 * time.Second, newConn: true})
+	batch := a.snapshot()[kindBodyRead]
+	a.request(kindBodyRead)
+	a.record(kindBodyRead, timingSample{body: time.Second})
+	next := a.snapshot()[kindBodyRead]
+	if batch.requests != 1 || batch.conns != 1 || len(batch.samples) != 1 || batch.samples[0].waitCool != time.Second || batch.samples[0].waitToken != 2*time.Second || next.requests != 1 || next.conns != 0 || next.samples[0].body != time.Second {
+		t.Fatal("snapshot retained mutable samples or lost wait accounting")
+	}
+}
+
+func TestDriveBackgroundTokenRefreshSharesForegroundFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		calls := 0
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			calls++
+			close(entered)
+			<-release
+			return memoryResponse(http.StatusOK, `{"access_token":"new","expires_in":3600}`), nil
+		}))
+		s.tokenLifetime, s.tokenExpiry = time.Hour, time.Now().Add(time.Second)
+		if token, err := s.accessToken(context.Background()); token != "fake" || err != nil {
+			t.Fatal("usable token blocked on refresh")
+		}
+		<-entered
+		s.invalidateToken("fake")
+		done := make(chan error, 1)
+		go func() {
+			token, err := s.accessToken(context.Background())
+			if err == nil && token != "new" {
+				err = fmt.Errorf("wrong token")
+			}
+			done <- err
+		}()
+		synctest.Wait()
+		close(release)
+		if err := <-done; err != nil || calls != 1 {
+			t.Fatalf("competing token refresh: %v calls=%d", err, calls)
+		}
+	})
+}
+
+func TestDriveRejectsInvalidTokenLifetime(t *testing.T) {
+	for _, lifetime := range []string{"0", "-1", "9223372036854775807"} {
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			return memoryResponse(http.StatusOK, `{"access_token":"new","expires_in":`+lifetime+`}`), nil
+		}))
+		if _, _, err := s.fetchToken(context.Background()); err == nil {
+			t.Fatal("invalid lifetime accepted")
+		}
+	}
+}
+
+func TestDriveAdmissionTimeoutDoesNotThrottleConnection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := memoryDrive(nil)
+		transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			client, server := stdnet.Pipe()
+			s.coolMu.Lock()
+			s.coolUntil = time.Now().Add(time.Hour)
+			s.coolMu.Unlock()
+			go func() { defer server.Close(); io.Copy(io.Discard, server) }()
+			return client, nil
+		}}
+		defer transport.CloseIdleConnections()
+		s.client.Transport = transport
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		ctx = context.WithValue(ctx, attemptKey{}, time.Millisecond)
+		if _, _, err := s.do(ctx, http.MethodGet, "http://drive.invalid/files/item", "", nil); err == nil || s.throttle.Load() != 0 {
+			t.Fatal("undispatched timeout counted as connection stall")
+		}
+	})
+}
+
+func TestDriveTimingDoesNotDoubleCountDispatchWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := memoryDrive(nil)
+		s.timing = newTimingAggregator()
+		s.timing.started = true
+		transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			client, server := stdnet.Pipe()
+			s.coolMu.Lock()
+			s.coolUntil = time.Now().Add(time.Second)
+			s.coolMu.Unlock()
+			go func() {
+				defer server.Close()
+				if _, err := http.ReadRequest(bufio.NewReader(server)); err == nil {
+					io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+				}
+			}()
+			return client, nil
+		}}
+		defer transport.CloseIdleConnections()
+		s.client.Transport = transport
+		if _, _, err := s.do(context.Background(), http.MethodGet, "http://drive.invalid/files/item", "", nil); err != nil {
+			t.Fatal(err)
+		}
+		sample := s.timing.snapshot()[kindOtherRead].samples[0]
+		if sample.waitCool != time.Second || sample.waitConn != 0 {
+			t.Fatalf("dispatch wait counted twice: cool=%v conn=%v", sample.waitCool, sample.waitConn)
+		}
+	})
+}
+
+func TestDriveDescriptionHedgeCancellationDoesNotJoinRPCs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		entered := make(chan struct{}, 2)
+		release := make(chan struct{})
+		rt := roundTrip(func(r *http.Request) (*http.Response, error) {
+			entered <- struct{}{}
+			<-r.Context().Done()
+			<-release
+			return nil, r.Context().Err()
+		})
+		s := memoryDrive(rt)
+		s.bulkClient = &http.Client{Transport: rt}
+		s.readHedge, s.readHedgeTokens = time.Millisecond, 1
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { _, _, err := s.readDescHedged(ctx, "http://drive.invalid/files/item"); done <- err }()
+		<-entered
+		<-entered
+		cancel()
+		if err := <-done; err != context.Canceled {
+			t.Fatalf("cancellation waited for child teardown: %v", err)
+		}
+		close(release)
+		synctest.Wait()
+	})
+}
+
+func TestDriveListPreservesDirectInlineWithDescendants(t *testing.T) {
+	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+		return memoryResponse(http.StatusOK, `{"files":[{"id":"child","name":"sessions~one~child"},{"id":"direct","name":"sessions~one","description":"aW5saW5l"}]}`), nil
+	}))
+	for range 32 {
+		entries, err := s.List(context.Background(), "sessions")
+		if err != nil || len(entries) != 1 || string(entries[0].Inline) != "inline" {
+			t.Fatalf("direct metadata lost: %v", err)
+		}
+	}
+}
+
+func TestDriveGetRetriesCachedDuplicateAfterEitherStage404(t *testing.T) {
+	for _, inline := range []bool{false, true} {
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/gone") {
+				if inline && r.URL.Query().Get("alt") == "media" {
+					return memoryResponse(http.StatusOK, ""), nil
+				}
+				return memoryResponse(http.StatusNotFound, ""), nil
+			}
+			return memoryResponse(http.StatusOK, "payload"), nil
+		}))
+		s.rememberID(flatten("sessions/item"), "gone", []string{"kept"})
+		body, err := s.Get(context.Background(), "sessions/item")
+		id, _ := s.cachedID(flatten("sessions/item"))
+		if err != nil || string(body) != "payload" || id != "kept" {
+			t.Fatalf("readable duplicate lost: %v", err)
+		}
 	}
 }
 

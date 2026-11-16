@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -720,13 +721,39 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	resp, err := conn.roundTrip(r)
 	if err == nil {
-		t.mu.Lock()
-		if t.client == client {
-			t.servedAt = time.Now()
-		}
-		t.mu.Unlock()
+		resp.Body = &servedBody{ReadCloser: resp.Body, served: sync.OnceFunc(func() {
+			t.mu.Lock()
+			if t.client == client {
+				t.servedAt = time.Now()
+			}
+			t.mu.Unlock()
+		})}
 	}
 	return resp, err
+}
+
+type servedBody struct {
+	io.ReadCloser
+	served func()
+	failed atomic.Bool
+}
+
+func (b *servedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.served()
+	} else if err != nil {
+		b.failed.Store(true)
+	}
+	return n, err
+}
+
+func (b *servedBody) Close() error {
+	err := b.ReadCloser.Close()
+	if err == nil && !b.failed.Load() {
+		b.served()
+	}
+	return err
 }
 
 func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {

@@ -97,6 +97,14 @@ func (s *driveShared) keeperStorage() *driveStorage {
 	return warm
 }
 
+func (s *driveStorage) keepWarmConnection(ctx context.Context, target string) error {
+	status, _, err := s.do(ctx, http.MethodGet, target, "", nil)
+	if err == nil && status != http.StatusOK {
+		err = errors.New("Drive keep-warm answered ", status)
+	}
+	return err
+}
+
 func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
 	t := time.NewTicker(s.keepWarmEvery)
 	defer t.Stop()
@@ -166,13 +174,14 @@ func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
 		if idle && ctx.Err() == nil && (flight == nil || flight.err == nil) {
 			target := s.filesURL + "/" + url.PathEscape(s.folder) + "?fields=id&supportsAllDrives=true"
 			if s.conns != nil && flight == nil {
-				_, _, err = warm.do(ctx, http.MethodGet, target, "", nil)
+				if err := warm.keepWarmConnection(ctx, target); err != nil {
+					errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
+				}
 			}
 			if s.bulkConns != nil && ctx.Err() == nil {
-				_, _, err = warm.do(context.WithValue(ctx, bodyKey{}, true), http.MethodGet, target, "", nil)
-			}
-			if err != nil {
-				errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
+				if err := warm.keepWarmConnection(context.WithValue(ctx, bodyKey{}, true), target); err != nil {
+					errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
+				}
 			}
 		}
 		cancel()

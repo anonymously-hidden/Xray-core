@@ -3,6 +3,7 @@ package xdrive
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"net/http"
 	"strconv"
 	"sync"
@@ -69,7 +70,7 @@ func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]stri
 				case <-f.done:
 					// A cold allocation belongs to its caller. Its cancellation
 					// must not cancel other sessions waiting for IDs.
-					if f.err != nil && f.err != context.Canceled && f.err != context.DeadlineExceeded {
+					if f.err != nil && !stderrors.Is(f.err, context.Canceled) && !stderrors.Is(f.err, context.DeadlineExceeded) {
 						return nil, f.err
 					}
 				}
@@ -93,26 +94,32 @@ func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]stri
 			s.poolMu.Unlock()
 			return out, nil
 		}
+		shortfall := n - take
+		batch := max(shortfall, min(3*s.poolRing, 1000))
 		f := &idPoolFlight{done: make(chan struct{})}
 		s.poolFlight = f
 		s.poolMu.Unlock()
 
 		var ids []string
 		var err error
-		shortfall := n - take
 		if shortfall > 1000 {
 			err = errors.New("Drive id shortfall exceeds 1000")
 		} else {
-			ids, err = s.generateIDs(ctx, shortfall)
-			if err == nil && len(ids) != shortfall {
-				err = errors.New("Drive returned ", len(ids), " ids, want ", shortfall)
+			ids, err = s.generateIDs(ctx, batch)
+			if err == nil && len(ids) != batch {
+				err = errors.New("Drive returned ", len(ids), " ids, want ", batch)
 			}
 		}
 		s.poolMu.Lock()
 		if err != nil {
 			s.idPool = append(s.idPool, taken...)
-			s.prunePoolLocked()
+		} else {
+			now := time.Now()
+			for _, id := range ids[shortfall:] {
+				s.idPool = append(s.idPool, idPoolEntry{id: id, at: now})
+			}
 		}
+		s.prunePoolLocked()
 		s.finishPoolFlightLocked(f, err)
 		if err == nil {
 			s.refillPoolLocked()
@@ -121,7 +128,7 @@ func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]stri
 		if err != nil {
 			return nil, err
 		}
-		return append(out, ids...), nil
+		return append(out, ids[:shortfall]...), nil
 	}
 }
 
@@ -180,7 +187,7 @@ func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
 func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
 	f.err = err
 	s.poolErr = err
-	if err == context.Canceled || err == context.DeadlineExceeded {
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
 		s.poolErr = nil
 		s.poolRetryAt = time.Time{}
 	} else if err != nil {

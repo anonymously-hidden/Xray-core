@@ -182,24 +182,44 @@ func (s *driveStorage) recordTiming(kind int, sample timingSample) {
 	s.timing.record(kind, sample)
 }
 
-func (a *timingAggregator) flush() {
+type timingBatch struct {
+	samples                      []timingSample
+	requests, conns, hedges, won int
+}
+
+func (a *timingAggregator) snapshot() [kindCount]timingBatch {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	for k := 0; k < kindCount; k++ {
-		n := a.n[k]
-		if n == 0 && a.requests[k] == 0 && a.hedges[k] == 0 {
+	var batches [kindCount]timingBatch
+	for k := range batches {
+		batches[k] = timingBatch{
+			samples:  append([]timingSample(nil), a.ring[k][:a.n[k]]...),
+			requests: a.requests[k], conns: a.conns[k], hedges: a.hedges[k], won: a.won[k],
+		}
+		a.n[k], a.pos[k], a.conns[k], a.hedges[k], a.won[k], a.requests[k] = 0, 0, 0, 0, 0, 0
+	}
+	return batches
+}
+
+func (a *timingAggregator) flush() {
+	for k, batch := range a.snapshot() {
+		n := len(batch.samples)
+		if n == 0 && batch.requests == 0 && batch.hedges == 0 {
 			continue
 		}
 		total := make([]time.Duration, 0, n)
 		pool := make([]time.Duration, 0, n)
+		cool := make([]time.Duration, 0, n)
+		token := make([]time.Duration, 0, n)
 		conn := make([]time.Duration, 0, n)
 		dial := make([]time.Duration, 0, n)
 		server := make([]time.Duration, 0, n)
 		body := make([]time.Duration, 0, n)
-		for i := 0; i < n; i++ {
-			s := a.ring[k][i]
+		for _, s := range batch.samples {
 			total = append(total, s.total)
 			pool = append(pool, s.waitPool)
+			cool = append(cool, s.waitCool)
+			token = append(token, s.waitToken)
 			if s.hasConn {
 				conn = append(conn, s.waitConn)
 			}
@@ -213,26 +233,24 @@ func (a *timingAggregator) flush() {
 		}
 		sort.Slice(total, func(i, j int) bool { return total[i] < total[j] })
 		sort.Slice(pool, func(i, j int) bool { return pool[i] < pool[j] })
+		sort.Slice(cool, func(i, j int) bool { return cool[i] < cool[j] })
+		sort.Slice(token, func(i, j int) bool { return token[i] < token[j] })
 		sort.Slice(conn, func(i, j int) bool { return conn[i] < conn[j] })
 		sort.Slice(dial, func(i, j int) bool { return dial[i] < dial[j] })
 		sort.Slice(server, func(i, j int) bool { return server[i] < server[j] })
 		sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
 		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
 			" n=", n,
-			" requests=", a.requests[k], " units=", a.requests[k]*driveQuotaCost(k),
+			" requests=", batch.requests, " units=", batch.requests*driveQuotaCost(k),
 			" total p50/p95/max ", percentile(total, .5), "/", percentile(total, .95), "/", percentile(total, 1),
 			" wait-pool p50 ", percentile(pool, .5),
+			" wait-cool p50 ", percentile(cool, .5),
+			" wait-token p50 ", percentile(token, .5),
 			" wait-conn p50 ", percentile(conn, .5),
 			" dial+tls p50 ", percentile(dial, .5),
 			" server p50 ", percentile(server, .5),
 			" body p50 ", percentile(body, .5),
-			" newconns=", a.conns[k], " hedges=", a.hedges[k], " won=", a.won[k])
-		a.n[k] = 0
-		a.pos[k] = 0
-		a.conns[k] = 0
-		a.hedges[k] = 0
-		a.won[k] = 0
-		a.requests[k] = 0
+			" newconns=", batch.conns, " hedges=", batch.hedges, " won=", batch.won)
 	}
 }
 
