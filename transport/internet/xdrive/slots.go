@@ -526,6 +526,11 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	if err := w.admissionErrorLocked(deadline, closing, allowClosed); err != nil {
 		return err
 	}
+	if len(w.slots) == 0 {
+		w.ackMu.Lock()
+		w.progress = time.Now()
+		w.ackMu.Unlock()
+	}
 	w.slots <- struct{}{}
 	if w.err != nil || len(w.buf) == 0 {
 		w.releaseSlotLocked()
@@ -832,9 +837,13 @@ func (w *slotWriter) closeProgress() time.Time {
 
 func (w *slotWriter) Close() error {
 	w.closeOnce.Do(func() {
-		w.ackMu.Lock()
-		w.progress = time.Now()
-		w.ackMu.Unlock()
+		w.mu.Lock()
+		if len(w.slots) == 0 {
+			w.ackMu.Lock()
+			w.progress = time.Now()
+			w.ackMu.Unlock()
+		}
+		w.mu.Unlock()
 		done := make(chan error, 1)
 		go func() { done <- w.closeOrdered() }()
 		w.closeErr = waitCloseProgress(done, w.ctx, w.closeProgress)
@@ -1146,9 +1155,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	defer cancelDescription()
 	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
-	var goneSince, warnedAt, visibleSince, missingSince time.Time
+	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
 	for {
+		observations := hunt.observations
 		description, err := r.huntSlotDescription(descriptionCtx, id, seq, f.promoted, &hunt)
+		if hunt.observations != observations {
+			failedSince = time.Time{}
+		}
 		frame, ok := decodeSlot(description)
 		missing := err != nil || !ok || frame.seq != seq
 		r.mu.Lock()
@@ -1265,6 +1278,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				f.err = err
 				return
 			}
+			if failedSince.IsZero() {
+				failedSince = time.Now()
+			}
+			if time.Since(failedSince) >= r.stallTimeout {
+				f.err = errors.New("failed to read segment ", seq, " for ", r.stallTimeout).Base(err)
+				return
+			}
 			goneSince = time.Time{}
 			if ctx.Err() == nil && time.Since(warnedAt) > 10*time.Second {
 				warnedAt = time.Now()
@@ -1309,11 +1329,12 @@ type slotDescriptionResult struct {
 }
 
 type slotDescriptionHunt struct {
-	results     chan slotDescriptionResult
-	outstanding int
-	last        slotDescriptionResult
-	seen        bool
-	err         error
+	results      chan slotDescriptionResult
+	outstanding  int
+	last         slotDescriptionResult
+	seen         bool
+	err          error
+	observations uint64
 }
 
 func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
@@ -1377,6 +1398,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		select {
 		case res := <-pending.results:
 			pending.outstanding--
+			if res.err == nil || res.err == errNotFound {
+				pending.observations++
+			}
 			if !head {
 				return res.description, res.err
 			}
@@ -1577,7 +1601,7 @@ func (r *slotReader) hold(ctx context.Context, d time.Duration, a, b <-chan stru
 // moved more than once meanwhile
 func (r *slotReader) ackLoop() {
 	acked := int64(-1)
-	var oldest time.Time
+	var oldest, failedSince, warnedAt time.Time
 	depth := int64(len(r.table.Slots))
 	// Writes run one at a time and each takes most of a second: a larger
 	// batch holds back the writer's credit, a smaller one only keeps writes
@@ -1589,7 +1613,7 @@ func (r *slotReader) ackLoop() {
 	wait := r.ackRetry
 	timer := time.NewTimer(r.ackDelay)
 	defer timer.Stop()
-	writeWM := func(want int64) bool {
+	writeWM := func(want int64) error {
 		var err error
 		ctx := context.WithValue(r.ctx, laneKey{}, true)
 		if r.lazy {
@@ -1609,7 +1633,7 @@ func (r *slotReader) ackLoop() {
 		} else {
 			err = r.store.setSlot(ctx, r.table.Watermark, strconv.FormatInt(want, 10), nil)
 		}
-		return err == nil
+		return err
 	}
 	for {
 		r.mu.Lock()
@@ -1623,9 +1647,27 @@ func (r *slotReader) ackLoop() {
 			oldest = time.Time{}
 		}
 		if want > acked && (want-acked >= batch || (!oldest.IsZero() && time.Since(oldest) >= r.ackDelay) || idle) {
-			if writeWM(want) {
-				acked, wait, oldest = want, r.ackRetry, time.Time{}
+			if err := writeWM(want); err == nil {
+				acked, wait, oldest, failedSince = want, r.ackRetry, time.Time{}, time.Time{}
 			} else {
+				if r.ctx.Err() != nil {
+					return
+				}
+				if failedSince.IsZero() {
+					failedSince = time.Now()
+				}
+				if isAuthError(err) {
+					r.setErr(err)
+					return
+				}
+				if time.Since(failedSince) >= r.stallTimeout {
+					r.setErr(errors.New("failed to acknowledge segment ", want).Base(err))
+					return
+				}
+				if time.Since(warnedAt) > 10*time.Second {
+					warnedAt = time.Now()
+					errors.LogWarningInner(r.ctx, err, "failed to write session watermark")
+				}
 				wait = min(2*wait, 5*time.Second)
 				select {
 				case <-r.ctx.Done():

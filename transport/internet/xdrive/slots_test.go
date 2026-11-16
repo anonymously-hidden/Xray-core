@@ -1066,6 +1066,84 @@ func (s *closeDrainSlots) setSlot(ctx context.Context, id, description string, b
 	return s.memSlots.setSlot(ctx, id, description, body)
 }
 
+type failedObservationSlots struct {
+	*memSlots
+	err error
+}
+
+func (s *failedObservationSlots) readDescription(context.Context, string) (string, error) {
+	return "", s.err
+}
+
+func (s *failedObservationSlots) setSlot(context.Context, string, string, []byte) error {
+	return s.err
+}
+
+func TestSlotDescriptionErrorsStopReader(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store := &failedObservationSlots{memSlots: newMemSlots(), err: io.ErrUnexpectedEOF}
+		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), ch: make(chan []byte, 1), wake: make(chan struct{}, 1), acks: make(chan struct{}, 1), grow: make(chan struct{}, 1), active: make(chan struct{}), stop: cancel, huntCeiling: slotHuntCeiling, huntFloor: slotHuntFloor, activeAt: time.Now(), frontier: -1}
+		r.run()
+		r.wait()
+		if _, ok := <-r.ch; ok || !errors.Is(r.Err(), io.ErrUnexpectedEOF) {
+			t.Fatalf("reader did not close with the description error: %v", r.Err())
+		}
+	})
+}
+
+func TestSlotAcknowledgmentErrorsStopReader(t *testing.T) {
+	for _, err := range []error{authError{code: "invalid_grant"}, io.ErrUnexpectedEOF} {
+		driveClock(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			r := &slotReader{ctx: ctx, stop: cancel, store: &failedObservationSlots{memSlots: newMemSlots(), err: err}, table: slotTable{Slots: []string{"slot"}, Watermark: "watermark"}, head: 1, ackRetry: slotAckRetry, ackDelay: ackDelay, acks: make(chan struct{}, 1)}
+			r.ackLoop()
+			if ctx.Err() == nil || !errors.Is(r.Err(), err) {
+				t.Fatalf("acknowledgment error was lost: %v", r.Err())
+			}
+		})
+	}
+}
+
+func TestSlotClosePreservesPendingProgress(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		driveClock(t, func(t *testing.T) {
+			store := &closeDrainSlots{memSlots: newMemSlots(), stalled: pending}
+			store.descs["slot"] = ""
+			w := newSlotWriter(context.Background(), store, slotTable{Slots: []string{"slot"}}, paramsFromConfig(&Config{SegmentBytes: slotInlineLimit, Concurrency: 1}))
+			w.ackMu.Lock()
+			w.progress = time.Now().Add(-slotStallTimeout)
+			w.ackMu.Unlock()
+			if pending {
+				if _, err := w.Write(make([]byte, slotInlineLimit)); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+			}
+			w.ackMu.Lock()
+			if pending && time.Since(w.progress) != 0 {
+				t.Fatal("admission failed to initialize progress")
+			}
+			w.progress = time.Now().Add(-slotStallTimeout)
+			w.ackMu.Unlock()
+			started := time.Now()
+			err := w.Close()
+			<-w.flushDone
+			w.wg.Wait()
+			synctest.Wait()
+			if pending {
+				if err != context.DeadlineExceeded || time.Now() != started {
+					t.Fatalf("stalled pending drain received a new budget: %v", err)
+				}
+			} else if err != nil || !store.ended {
+				t.Fatalf("idle terminal write had no fresh budget: %v", err)
+			}
+		})
+	}
+}
+
 func TestSlotCloseUsesDrainProgress(t *testing.T) {
 	for _, stalled := range []bool{false, true} {
 		t.Run(strconv.FormatBool(stalled), func(t *testing.T) {
