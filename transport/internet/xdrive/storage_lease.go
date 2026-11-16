@@ -157,6 +157,7 @@ func transferSessionStorage(storage Storage) (Storage, error) {
 func closeStorageRoot(storage Storage) error {
 	switch s := storage.(type) {
 	case *templateStorage:
+		s.closeTokenWorkers()
 		closeStoragePool(s.conns)
 		if s.client != nil {
 			s.client.CloseIdleConnections()

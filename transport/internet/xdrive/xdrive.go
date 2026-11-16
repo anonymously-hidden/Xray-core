@@ -28,9 +28,8 @@ const (
 )
 
 const (
-	spareCount            = 2
-	spareIdleStop         = 10 * time.Minute
-	spareStopPollInterval = 10 * time.Millisecond
+	spareCount    = 2
+	spareIdleStop = 10 * time.Minute
 )
 
 func init() {
@@ -138,11 +137,8 @@ func spareBoxFor(config *Config) *spareBox {
 
 func (box *spareBox) reap() {
 	defer close(box.done)
-	poll := time.NewTicker(spareStopPollInterval)
-	defer poll.Stop()
 	for {
 		if box.stop.Load() {
-			poll.Stop()
 			box.cancel()
 			box.mu.Lock()
 			if box.timer != nil {
@@ -179,17 +175,10 @@ func (box *spareBox) reap() {
 			continue
 		}
 		timer := time.NewTimer(next)
-		for {
-			select {
-			case <-box.ctx.Done():
-			case <-box.wake:
-			case <-timer.C:
-			case <-poll.C:
-				if !box.stop.Load() {
-					continue
-				}
-			}
-			break
+		select {
+		case <-box.ctx.Done():
+		case <-box.wake:
+		case <-timer.C:
 		}
 		timer.Stop()
 	}
@@ -206,14 +195,14 @@ func dropSpare(_ context.Context, s spareRing) {
 	s.storage.Close()
 }
 
-// Only atomics and the map may be touched across clock bubbles. The owning
-// reaper polls stop, cancels refill, and drains after admitted work exits.
+// Wake the reaper to cancel refill and drain after admitted work exits.
 func (box *spareBox) close() {
 	if !box.closed.CompareAndSwap(false, true) {
 		return
 	}
 	box.stop.Store(true)
 	spareBoxes.CompareAndDelete(box.config, box)
+	box.signal()
 }
 
 func stopSpares(config *Config) {

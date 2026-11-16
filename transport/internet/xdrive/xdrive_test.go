@@ -1237,3 +1237,81 @@ func TestStorageKeyProfilesAndStability(t *testing.T) {
 		t.Fatal("parameter/pool setup mutated the config or key")
 	}
 }
+
+type spareCloseCounter struct {
+	Storage
+	closes atomic.Int32
+}
+
+func (s *spareCloseCounter) Close() error { s.closes.Add(1); return nil }
+
+func TestSpareStopSignalsReaper(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, busy := range []bool{false, true} {
+			box := spareBoxFor(&Config{})
+			storage := &spareCloseCounter{}
+			box.mu.Lock()
+			box.busy.Store(busy)
+			box.ch <- spareRing{storage: storage, at: time.Now()}
+			box.mu.Unlock()
+			synctest.Wait()
+			started := time.Now()
+			box.close()
+			synctest.Wait()
+			if busy {
+				select {
+				case <-box.done:
+					t.Fatal("closed during refill")
+				default:
+				}
+				box.mu.Lock()
+				box.busy.Store(false)
+				box.mu.Unlock()
+				box.signal()
+			}
+			<-box.done
+			if time.Now() != started || storage.closes.Load() != 1 {
+				t.Fatal("stop waited for a poll or failed to close storage once")
+			}
+		}
+	})
+}
+
+func TestTemplateRootCloseJoinsDetachedFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		s := &templateStorage{templateShared: &templateShared{
+			tmpl: &storageTemplate{Auth: authTemplate{Type: "oauth2", TokenURL: "http://auth.invalid/token"}},
+			tokenClient: &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+				close(started)
+				<-r.Context().Done()
+				<-release
+				return nil, r.Context().Err()
+			})},
+		}}
+		lease := ownedStorage(s)
+		ctx, cancel := context.WithCancel(context.Background())
+		caller := make(chan error, 1)
+		go func() { _, err := s.accessToken(ctx); caller <- err }()
+		<-started
+		cancel()
+		if err := <-caller; err != context.Canceled {
+			t.Fatalf("waiter: %v", err)
+		}
+		closed := make(chan error, 1)
+		go func() { closed <- lease.Close() }()
+		synctest.Wait()
+		select {
+		case <-closed:
+			t.Fatal("root Close abandoned auth worker")
+		default:
+		}
+		close(release)
+		if err := <-closed; err != nil {
+			t.Fatalf("root Close: %v", err)
+		}
+		if _, err := s.accessToken(context.Background()); err != context.Canceled {
+			t.Fatal("closed root admitted token work")
+		}
+	})
+}

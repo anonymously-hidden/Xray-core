@@ -84,6 +84,8 @@ type templateShared struct {
 	secrets     []string
 
 	tokenMu     sync.Mutex
+	tokenWG     sync.WaitGroup
+	tokenClosed bool
 	token       string
 	tokenExpiry time.Time
 	tokenFlight *templateTokenFlight
@@ -277,6 +279,10 @@ func (s *templateStorage) accessToken(ctx context.Context) (string, error) {
 		return "", err
 	}
 	s.tokenMu.Lock()
+	if s.tokenClosed {
+		s.tokenMu.Unlock()
+		return "", context.Canceled
+	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
 		token := s.token
 		s.tokenMu.Unlock()
@@ -287,7 +293,9 @@ func (s *templateStorage) accessToken(ctx context.Context) (string, error) {
 		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), driveTimeout)
 		f = &templateTokenFlight{done: make(chan struct{}), cancel: cancel}
 		s.tokenFlight = f
+		s.tokenWG.Add(1)
 		go func() {
+			defer s.tokenWG.Done()
 			token, lifetime, err := s.fetchTemplateToken(fetchCtx)
 			cancel()
 			s.tokenMu.Lock()
@@ -323,6 +331,17 @@ func (s *templateStorage) accessToken(ctx context.Context) (string, error) {
 		}
 		return f.token, f.err
 	}
+}
+
+func (s *templateStorage) closeTokenWorkers() {
+	s.tokenMu.Lock()
+	s.tokenClosed = true
+	if f := s.tokenFlight; f != nil {
+		s.tokenFlight = nil
+		f.cancel()
+	}
+	s.tokenMu.Unlock()
+	s.tokenWG.Wait()
 }
 
 func (s *templateStorage) fetchTemplateToken(ctx context.Context) (string, time.Duration, error) {
