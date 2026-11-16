@@ -775,6 +775,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if testDriveIO != nil {
 			testDriveIO(method, target, body)
 		}
+		var selected atomic.Pointer[poolConn]
+		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, selected.Store))
 		began := time.Now()
 		dispatchClient := *httpc
 		dispatchClient.Transport = dispatchTransport{next: httpc.Transport}
@@ -787,7 +789,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				s.lastThrottle = time.Now()
 				s.coolMu.Unlock()
 				if t, ok := httpc.Transport.(*sessionTransport); ok {
-					t.stalled(began)
+					t.stalled(began, selected.Load())
 				}
 			}
 		}
@@ -1655,14 +1657,18 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 	}()
 	timer := time.NewTimer(s.readHedge)
 	defer timer.Stop()
-	select {
-	case r := <-ch:
-		return r.status, r.payload, r.err
-	case <-timer.C:
-	}
-	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeHedgeToken() {
-		r := <-ch
-		return r.status, r.payload, r.err
+	for {
+		select {
+		case r := <-ch:
+			return r.status, r.payload, r.err
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		case <-timer.C:
+		}
+		if !s.cooling() && time.Since(s.lastRateLimitAt()) > 5*time.Second && s.takeHedgeToken() {
+			break
+		}
+		timer.Reset(s.readHedge)
 	}
 	kind := kindOtherRead
 	if ctx.Value(laneKey{}) != nil {

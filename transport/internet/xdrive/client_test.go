@@ -1155,6 +1155,46 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 	})
 }
 
+func TestSessionStallTracksSelectedConnection(t *testing.T) {
+	transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+		return &http.Client{Transport: okConn{}}
+	})}
+	defer transport.pool.Close()
+	defer transport.Close()
+	send := func() *poolConn {
+		var selected *poolConn
+		ctx := context.WithValue(context.Background(), poolConnKey{}, func(conn *poolConn) { selected = conn })
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://drive.invalid/files", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return selected
+	}
+	a := send()
+	transport.mu.Lock()
+	transport.client.LeftRequests.Store(0)
+	transport.mu.Unlock()
+	began := time.Now().Add(-time.Second)
+	b := send()
+	if a == b || !began.Before(transport.movedAt) {
+		t.Fatal("request did not select a replacement")
+	}
+	transport.mu.Lock()
+	transport.takenAt = time.Now().Add(-2 * stalledGrace)
+	transport.servedAt = time.Time{}
+	transport.mu.Unlock()
+	transport.stalled(began, a)
+	if b.IsClosed() {
+		t.Fatal("late old-connection failure retired replacement")
+	}
+	transport.stalled(began, b)
+	if !b.IsClosed() {
+		t.Fatal("replacement's own failure was ignored")
+	}
+}
+
 type closeTestWriter struct{ connWriter }
 
 func (closeTestWriter) Close() error { return nil }

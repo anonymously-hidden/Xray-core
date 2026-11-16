@@ -644,6 +644,8 @@ func (b *doneBody) Close() error {
 // timeouts retire it, so that a dial or handshake is not cut short again
 var stalledGrace = 12 * time.Second
 
+type poolConnKey struct{}
+
 // sessionTransport sends the requests of one session over a connection of
 // XMUX, and over another once that one has no requests or time left
 type sessionTransport struct {
@@ -713,6 +715,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 	t.mu.Unlock()
+	if selected, ok := r.Context().Value(poolConnKey{}).(func(*poolConn)); ok {
+		selected(conn)
+	}
 	resp, err := conn.roundTrip(r)
 	if err == nil {
 		t.mu.Lock()
@@ -724,10 +729,14 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-func (t *sessionTransport) stalled(began time.Time) {
+func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if began.Before(t.movedAt) {
+	if len(selected) > 0 {
+		if selected[0] == nil || t.client == nil || t.client.XmuxConn != selected[0] {
+			return
+		}
+	} else if began.Before(t.movedAt) {
 		return
 	}
 	now := time.Now()

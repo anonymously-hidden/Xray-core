@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -799,16 +798,6 @@ func memoryDrive(rt http.RoundTripper) *driveStorage {
 	}
 }
 
-func generatedResponse(r *http.Request) *http.Response {
-	n, _ := strconv.Atoi(r.URL.Query().Get("count"))
-	ids := make([]string, n)
-	for i := range ids {
-		ids[i] = fmt.Sprintf("generated-%d", i)
-	}
-	body, _ := json.Marshal(map[string]any{"ids": ids})
-	return memoryResponse(http.StatusOK, string(body))
-}
-
 func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
@@ -845,6 +834,48 @@ func TestDriveQuotaRetryBudget(t *testing.T) {
 			t.Fatalf("cleanup quota response %d cooled or succeeded", status)
 		}
 	}
+}
+
+func TestDriveDescriptionRescueRearms(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var hedges atomic.Int32
+		primaryDone := make(chan struct{})
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			<-r.Context().Done()
+			close(primaryDone)
+			return nil, r.Context().Err()
+		}))
+		s.readHedge = time.Second
+		s.bulkClient = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+			hedges.Add(1)
+			return memoryResponse(http.StatusOK, "rescued"), nil
+		})}
+		done := make(chan error, 1)
+		go func() {
+			status, body, err := s.readDescHedged(context.Background(), "http://drive.invalid/files/item")
+			if err == nil && (status != http.StatusOK || string(body) != "rescued") {
+				err = fmt.Errorf("unexpected rescue result")
+			}
+			done <- err
+		}()
+		synctest.Wait()
+		<-time.NewTimer(2 * s.readHedge).C
+		synctest.Wait()
+		if hedges.Load() != 0 {
+			t.Fatal("hedged without a token")
+		}
+		s.readHedgeMu.Lock()
+		s.readHedgeTokens = 1
+		s.readHedgeMu.Unlock()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		<-primaryDone
+		synctest.Wait()
+		if hedges.Load() != 1 || len(s.inflight) != 0 || len(s.reserved) != 0 {
+			t.Fatal("rescue duplicated or leaked a permit")
+		}
+	})
 }
 
 func TestDriveMediaHeadOnlySplitsRanges(t *testing.T) {
