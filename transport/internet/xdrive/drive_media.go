@@ -21,7 +21,6 @@ const (
 	// connection, and frames are spread over them in turn.
 	driveMediaLanes = 4
 	driveMediaPart  = 128 << 10
-	driveMediaSplit = defaultSegmentBytes
 	// Range GETs have a permit pool of their own so a sustained download
 	// (slotBodyAhead frames of driveMediaLanes ranges) cannot take the permits
 	// of slot writes and tail reads. It still covers every range of the
@@ -65,11 +64,10 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
 	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
 	lanes := max(1, len(s.mediaClients))
-	unit := driveMediaSplit
+	parts := 1
 	if ctx.Value(mediaHeadKey{}) != nil {
-		unit = driveMediaPart
+		parts = min((frame.size+driveMediaPart-1)/driveMediaPart, lanes)
 	}
-	parts := min((frame.size+unit-1)/unit, lanes)
 	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
 		parts = 1
 	}

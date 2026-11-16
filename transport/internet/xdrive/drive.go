@@ -353,7 +353,7 @@ func (s *driveStorage) accessToken(parent context.Context) (string, error) {
 		if s.isWorkClosed() {
 			return "", context.Canceled
 		}
-		if err == nil || isAuthError(err) {
+		if err == nil || isAuthError(err) || ctx.Value(laneKey{}) != nil {
 			return token, err
 		}
 		last = err
@@ -399,6 +399,11 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 		return f.token, nil
 	}
 	if time.Now().Before(s.tokenRetryAt) && s.lastTokenErr != nil {
+		if ctx.Value(laneKey{}) != nil {
+			err := s.lastTokenErr
+			s.tokenMu.Unlock()
+			return "", err
+		}
 		wait := time.Until(s.tokenRetryAt)
 		s.tokenMu.Unlock()
 		timer := time.NewTimer(wait)
@@ -585,6 +590,10 @@ func retryableStatus(status int) bool {
 		return true
 	}
 	return false
+}
+
+func driveQuotaRetry(elapsed time.Duration, refunded int) (refund, stop bool) {
+	return elapsed < driveRateLimitBudget, elapsed >= driveRateLimitBudget && refunded > 0
 }
 
 func (s *driveStorage) do(parent context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
@@ -847,7 +856,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			lastErr = errors.New("Drive rejected the access token")
 			continue
 		}
-		if resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
 			if ctx.Value(cleanupKey{}) != nil {
 				return 0, nil, cleanupRateLimited{detail: string(payload)}
 			}
@@ -857,24 +866,18 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				" bytes, body read ", strings.Contains(target, "alt=media"),
 				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
-			if time.Since(firstTry) < driveRateLimitBudget {
+			if refund, stop := driveQuotaRetry(time.Since(firstTry), refunded); refund {
 				refunded++
-			} else if refunded > 0 {
+			} else if stop {
 				// the budget is spent: give up now, not after eight more attempts
 				return 0, nil, lastErr
 			}
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
-			if resp.StatusCode == http.StatusTooManyRequests && ctx.Value(cleanupKey{}) != nil {
-				return 0, nil, cleanupRateLimited{detail: string(payload)}
-			}
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
-			if resp.StatusCode == http.StatusTooManyRequests {
-				s.cool()
-			}
 			continue
 		}
 		if media != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {

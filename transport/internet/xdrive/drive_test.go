@@ -1298,3 +1298,75 @@ func TestDriveRetriedRequestKeepsOneTimingKind(t *testing.T) {
 		t.Fatalf("attempts split over kinds: requests=%v samples=%v", s.timing.requests, s.timing.n)
 	})
 }
+
+func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { calls++; return nil, fmt.Errorf("unexpected OAuth call") }))
+		s.token = ""
+		s.lastTokenErr = fmt.Errorf("token unavailable")
+		s.tokenRetryAt = time.Now().Add(time.Hour)
+		started := time.Now()
+		if _, err := s.accessToken(context.WithValue(context.Background(), laneKey{}, true)); err != s.lastTokenErr || time.Now() != started || calls != 0 {
+			t.Fatalf("reserved request waited or replaced cached error: %v", err)
+		}
+	})
+}
+
+func TestDriveQuotaRetryBudget(t *testing.T) {
+	for _, tc := range []struct {
+		elapsed      time.Duration
+		refunded     int
+		refund, stop bool
+	}{
+		{driveRateLimitBudget - time.Nanosecond, 0, true, false},
+		{driveRateLimitBudget, 0, false, false},
+		{driveRateLimitBudget, 1, false, true},
+	} {
+		if refund, stop := driveQuotaRetry(tc.elapsed, tc.refunded); refund != tc.refund || stop != tc.stop {
+			t.Fatalf("quota policy at %v: refund=%v stop=%v", tc.elapsed, refund, stop)
+		}
+	}
+	for _, status := range []int{http.StatusForbidden, http.StatusTooManyRequests} {
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			return memoryResponse(status, `{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}`), nil
+		}))
+		if _, _, err := s.do(context.WithValue(context.Background(), cleanupKey{}, true), http.MethodDelete, "http://drive.invalid/files/item", "", nil); err == nil || s.cooling() {
+			t.Fatalf("cleanup quota response %d cooled or succeeded", status)
+		}
+	}
+}
+
+func TestDriveMediaHeadOnlySplitsRanges(t *testing.T) {
+	body := strings.Repeat("x", 2<<20)
+	frame := newSlotFrame(1, slotMedia, []byte(body))
+	for _, tc := range []struct {
+		head, cool bool
+		calls      int
+	}{{false, false, 1}, {true, false, 4}, {true, true, 1}} {
+		var calls atomic.Int32
+		rt := roundTrip(func(r *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			var start, end int
+			if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil {
+				return nil, err
+			}
+			resp := memoryResponse(http.StatusPartialContent, body[start:end+1])
+			resp.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+			return resp, nil
+		})
+		s := memoryDrive(rt)
+		s.mediaClients = []*http.Client{{Transport: rt}, {Transport: rt}, {Transport: rt}, {Transport: rt}}
+		if tc.cool {
+			s.cool()
+		}
+		ctx := context.Background()
+		if tc.head {
+			ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+		}
+		got, err := s.readFrameBody(ctx, "item", frame)
+		if err != nil || string(got) != body || int(calls.Load()) != tc.calls {
+			t.Fatalf("head=%v cool=%v: ranges=%d err=%v", tc.head, tc.cool, calls.Load(), err)
+		}
+	}
+}
