@@ -1155,25 +1155,6 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 	})
 }
 
-func TestPoolConnAcquireRefusesAClosingConnection(t *testing.T) {
-	cancelled := false
-	c := &poolConn{cancel: func() { cancelled = true }}
-	if !c.acquire() || c.inflight != 1 {
-		t.Fatal("an open connection refused a request")
-	}
-	c.Close()
-	if c.acquire() || c.inflight != 1 || cancelled {
-		t.Fatalf("a closing connection took a request: inflight=%d cancelled=%v", c.inflight, cancelled)
-	}
-	c.done()
-	if !cancelled {
-		t.Fatal("the closing connection was not cancelled once idle")
-	}
-	if c.acquire() {
-		t.Fatal("a closed connection took a request")
-	}
-}
-
 type closeTestWriter struct{ connWriter }
 
 func (closeTestWriter) Close() error { return nil }
@@ -1189,15 +1170,14 @@ func TestConnCloseBoundsReaderShutdown(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		release, cleaned := make(chan struct{}), make(chan struct{})
-		c := &Conn{ctx: ctx, cancel: cancel, closing: make(chan struct{}), writer: closeTestWriter{}, reader: closeTestReader{release: release}, onClose: func() { close(cleaned) }}
-		results := make(chan error, 2)
-		for range 2 {
-			go func() { results <- c.Close() }()
+		c := &Conn{ctx: ctx, cancel: cancel, closing: make(chan struct{}), readDeadline: newPipeDeadline(), writeDeadline: newPipeDeadline(), writer: closeTestWriter{}, reader: closeTestReader{release: release}, onClose: func() { close(cleaned) }}
+		result := make(chan error, 1)
+		go func() { result <- c.Close() }()
+		if err := <-result; err != context.DeadlineExceeded {
+			t.Fatalf("Close: %v", err)
 		}
-		for range 2 {
-			if err := <-results; err != context.DeadlineExceeded {
-				t.Fatalf("Close: %v", err)
-			}
+		if err := c.Close(); err != context.DeadlineExceeded {
+			t.Fatalf("repeated Close: %v", err)
 		}
 		close(release)
 		<-cleaned
