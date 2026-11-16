@@ -3,6 +3,7 @@ package xdrive
 import (
 	"context"
 	"encoding/json"
+	"mime"
 	"sort"
 	"strings"
 	"sync"
@@ -243,7 +244,8 @@ func classifyDriveRequest(ctx context.Context, method, target, contentType strin
 	case "POST":
 		return kindCreate
 	case "PATCH":
-		if contentType == "multipart/related; boundary="+driveBoundary {
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && mediaType == "multipart/related" {
 			return kindSlotMedia
 		}
 		if isWatermarkBody(body) {

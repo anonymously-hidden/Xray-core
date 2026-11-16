@@ -45,12 +45,18 @@ func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
 		return nil, err
 	}
 	if f := testStorageFactory.Load(); f != nil {
-		return (*f)(config)
+		return sharedStorage(streamSettings, config, func() (Storage, error) {
+			return (*f)(config)
+		})
 	}
 
 	switch config.Service {
 	case "local":
-		return newLocalStorage(config.RemoteFolder)
+		storage, err := newLocalStorage(config.RemoteFolder)
+		if err != nil {
+			return nil, err
+		}
+		return ownedStorage(storage), nil
 	case "google-drive", "Google Drive":
 		return sharedStorage(streamSettings, config, func() (Storage, error) {
 			return newDriveStorage(streamSettings, config)
@@ -68,10 +74,16 @@ func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
 	}
 }
 
-// sessionStorage returns the storage of one session, which takes connections
-// of XMUX until Close, with the token and cache of storage. Local storage has
-// no connections
+// sessionStorage clones a session lease without consuming its parent.
 func sessionStorage(storage Storage) Storage {
+	session, err := acquireSessionStorage(storage)
+	if err != nil {
+		return nil
+	}
+	return session
+}
+
+func rawSessionStorage(storage Storage) Storage {
 	switch s := storage.(type) {
 	case *driveStorage:
 		return s.session()
@@ -85,7 +97,7 @@ func sessionStorage(storage Storage) Storage {
 
 var (
 	sharedMu sync.Mutex
-	shared   = make(map[string]Storage)
+	shared   = make(map[string]*storageOwner)
 )
 
 func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) string {
@@ -100,7 +112,6 @@ func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) strin
 		Socket                                               *internet.SocketConfig
 		QUIC                                                 *internet.QuicParams
 		XMUX                                                 *splithttp.XmuxConfig
-		HasFinalMask                                         bool
 	}{
 		Service: config.Service, Folder: config.RemoteFolder, Secrets: config.Secrets,
 		Template: config.Template, XMUX: config.Xmux,
@@ -115,9 +126,6 @@ func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) strin
 		profile.SecurityType = streamSettings.SecurityType
 		profile.TLS = tls.ConfigFromStreamSettings(streamSettings)
 		profile.Socket, profile.QUIC = streamSettings.SocketSettings, streamSettings.QuicParams
-		// Different non-nil masks remain unresolved: FinalMask exposes neither
-		// stable configuration nor its wrappers. Never hash runtime pointers.
-		profile.HasFinalMask = streamSettings.FinalMask != nil
 		if streamSettings.Destination != nil {
 			profile.Destination = streamSettings.Destination.String()
 		}
@@ -131,26 +139,40 @@ func resetSharedStorage() {
 	stopAllSpares()
 	sharedMu.Lock()
 	old := shared
-	shared = make(map[string]Storage)
+	shared = make(map[string]*storageOwner)
+	for _, owner := range old {
+		owner.closed = true
+	}
 	sharedMu.Unlock()
-	for _, storage := range old {
-		storage.Close()
+	for _, owner := range old {
+		owner.close()
 	}
 }
 
 func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, build func() (Storage, error)) (Storage, error) {
+	// Opaque masks have no immutable configuration identity. Isolate their
+	// owners rather than accidentally routing one profile through another.
+	if streamSettings != nil && streamSettings.FinalMask != nil {
+		storage, err := build()
+		if err != nil {
+			return nil, err
+		}
+		return ownedStorage(storage), nil
+	}
 	key := shareKey(streamSettings, config)
 
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 
-	if storage, ok := shared[key]; ok {
-		return storage, nil
+	if owner, ok := shared[key]; ok && !owner.closed {
+		owner.refs++
+		return wrapStorageLease(owner, owner.root, false), nil
 	}
 	storage, err := build()
 	if err != nil {
 		return nil, err
 	}
-	shared[key] = storage
-	return storage, nil
+	owner := &storageOwner{root: storage, key: key, refs: 1}
+	shared[key] = owner
+	return wrapStorageLease(owner, storage, false), nil
 }

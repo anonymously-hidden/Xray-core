@@ -28,13 +28,34 @@ func (s *driveShared) beginWork(timeout time.Duration) (context.Context, func(),
 	return ctx, func() { cancel(); s.workWG.Done() }, true
 }
 
-func (s *driveShared) closeWork() {
+// beginRequest keeps caller values/deadlines while binding foreground work to
+// the terminal owner lifetime. Queued token, cooldown and permit waits count too.
+func (s *driveShared) beginRequest(parent context.Context) (context.Context, func(), bool) {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.workClosed {
+		return nil, nil, false
+	}
+	if s.workCtx == nil {
+		s.workCtx, s.workCancel = context.WithCancel(context.Background())
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.workCtx, cancel)
+	s.workWG.Add(1)
+	return ctx, func() { stop(); cancel(); s.workWG.Done() }, true
+}
+
+func (s *driveShared) cancelWork() {
 	s.workMu.Lock()
 	s.workClosed = true
 	if s.workCancel != nil {
 		s.workCancel()
 	}
 	s.workMu.Unlock()
+}
+
+func (s *driveShared) closeWork() {
+	s.cancelWork()
 	s.workWG.Wait()
 }
 

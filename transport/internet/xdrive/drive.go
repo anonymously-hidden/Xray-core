@@ -3,8 +3,10 @@ package xdrive
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +30,6 @@ var testDriveIO func(method, target string, body []byte)
 const (
 	flatSeparator = "~"
 
-	driveBoundary         = "xdrive-boundary"
 	drivePageSize         = 1000
 	driveMaxAttempts      = 8
 	driveMaxInflight      = 64
@@ -56,6 +57,11 @@ var (
 	maxTokenBackoff      = 5 * time.Minute
 	driveMaxResponse     = 32 << 20
 	driveMaxAnnounce     = 1 << 20
+)
+
+const (
+	driveAuthMaxAttempts = 3
+	driveAuthBudget      = 2 * time.Minute
 )
 
 // maxBodyKey lets a caller tighten the response-body cap (announcements).
@@ -187,6 +193,7 @@ type driveShared struct {
 	cleanupParallel   int
 	cleanupRetryDelay time.Duration
 	cleanupMaxRetries int
+	cleanupInflight   chan struct{}
 
 	// keep-warm keeper; intervals are instance fields so tests never mutate
 	// package-level values other goroutines read.
@@ -207,6 +214,7 @@ type driveShared struct {
 	workCancel context.CancelFunc
 	workWG     sync.WaitGroup
 	workClosed bool
+	closeOnce  sync.Once
 }
 
 func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
@@ -223,7 +231,8 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	}
 
 	h1Hosts := new(sync.Map)
-	client := newServiceClient(context.Background(), h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
+	workCtx, workCancel := context.WithCancel(context.Background())
+	client := newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 	st := &driveStorage{
 		driveShared: &driveShared{
 			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
@@ -241,6 +250,8 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			filesURL:     driveFilesURL,
 			uploadURL:    driveUploadURL,
 			backoff:      driveInitialBackoff,
+			workCtx:      workCtx,
+			workCancel:   workCancel,
 			ids:          make(map[string]string),
 			timing:       newTimingAggregator(),
 
@@ -325,7 +336,32 @@ func isAuthError(err error) bool {
 	return ok
 }
 
-func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
+func (s *driveStorage) accessToken(parent context.Context) (string, error) {
+	ctx, finish, ok := s.beginRequest(parent)
+	if !ok {
+		return "", context.Canceled
+	}
+	defer finish()
+	ctx, cancel := context.WithTimeout(ctx, driveAuthBudget)
+	defer cancel()
+	var last error
+	for attempt := 0; attempt < driveAuthMaxAttempts; attempt++ {
+		token, err := s.accessTokenOnce(ctx)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if s.isWorkClosed() {
+			return "", context.Canceled
+		}
+		if err == nil || isAuthError(err) {
+			return token, err
+		}
+		last = err
+	}
+	return "", errors.New("Drive authentication failed after ", driveAuthMaxAttempts, " tries").Base(last)
+}
+
+func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -363,9 +399,16 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 		return f.token, nil
 	}
 	if time.Now().Before(s.tokenRetryAt) && s.lastTokenErr != nil {
-		err := s.lastTokenErr
+		wait := time.Until(s.tokenRetryAt)
 		s.tokenMu.Unlock()
-		return "", err
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+			return s.accessTokenOnce(ctx)
+		}
 	}
 	f := &tokenFlight{done: make(chan struct{})}
 	fetchCtx, finish, ok := s.beginWork(30 * time.Second)
@@ -544,7 +587,12 @@ func retryableStatus(status int) bool {
 	return false
 }
 
-func (s *driveStorage) do(ctx context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+func (s *driveStorage) do(parent context.Context, method, target, contentType string, body []byte) (int, []byte, error) {
+	ctx, finish, ok := s.beginRequest(parent)
+	if !ok {
+		return 0, nil, context.Canceled
+	}
+	defer finish()
 	defer s.noteRequest(ctx)
 	backoff := s.backoff
 	var lastErr error
@@ -568,24 +616,17 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 				backoff = driveMaxBackoff
 			}
 		}
-		coolStart := time.Now()
+		attemptStart := time.Now()
+		coolStart := attemptStart
 		if err := s.waitCool(ctx); err != nil {
 			return 0, nil, err
 		}
 		waitCoolDur := time.Since(coolStart)
-		if testDriveIO != nil {
-			testDriveIO(method, target, body)
-		}
-
 		tokenStart := time.Now()
 		token, err := s.accessToken(ctx)
 		waitTokenDur := time.Since(tokenStart)
 		if err != nil {
-			if isAuthError(err) || s.isWorkClosed() {
-				return 0, nil, err
-			}
-			lastErr = err
-			continue
+			return 0, nil, err
 		}
 
 		media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
@@ -604,12 +645,36 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			pool = s.mediaRescue
 		}
 		poolStart := time.Now()
+		var cleanupPool chan struct{}
+		if ctx.Value(cleanupKey{}) != nil {
+			cleanupPool = s.cleanupPool()
+			select {
+			case cleanupPool <- struct{}{}:
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+		}
 		select {
 		case pool <- struct{}{}:
 		case <-ctx.Done():
+			if cleanupPool != nil {
+				<-cleanupPool
+			}
 			return 0, nil, ctx.Err()
 		}
+		releasePermit := func() {
+			<-pool
+			if cleanupPool != nil {
+				<-cleanupPool
+			}
+		}
 		waitPoolDur := time.Since(poolStart)
+		coolStart = time.Now()
+		if err := s.waitCool(ctx); err != nil {
+			releasePermit()
+			return 0, nil, err
+		}
+		waitCoolDur += time.Since(coolStart)
 
 		var reader io.Reader
 		if body != nil {
@@ -622,7 +687,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
 		if err != nil {
 			cancel()
-			<-pool
+			releasePermit()
 			return 0, nil, errors.New("failed to build a Drive request").Base(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -638,7 +703,20 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			mu                                                 sync.Mutex
 			connAt, connStart, connDone, tlsDone, wrote, first time.Time
 			reused, gotConn                                    bool
+			dispatchWait                                       time.Duration
 		}
+		admit := func(dispatchCtx context.Context) error {
+			start := time.Now()
+			err := s.waitDispatch(dispatchCtx, cleanupPool != nil && method == http.MethodDelete)
+			tr.mu.Lock()
+			tr.dispatchWait += time.Since(start)
+			tr.mu.Unlock()
+			if err == nil && s.timing != nil {
+				s.timing.request(kind)
+			}
+			return err
+		}
+		req = req.WithContext(context.WithValue(req.Context(), dispatchKey{}, admit))
 		trace := &httptrace.ClientTrace{
 			GotConn: func(i httptrace.GotConnInfo) {
 				tr.mu.Lock()
@@ -680,11 +758,18 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		if media != nil && media.client != nil {
 			httpc = media.client
 		}
-		began := time.Now()
-		if s.timing != nil {
-			s.timing.request(kind)
+		if err := ctx.Err(); err != nil {
+			cancel()
+			releasePermit()
+			return 0, nil, err
 		}
-		resp, err := httpc.Do(req)
+		if testDriveIO != nil {
+			testDriveIO(method, target, body)
+		}
+		began := time.Now()
+		dispatchClient := *httpc
+		dispatchClient.Transport = dispatchTransport{next: httpc.Transport}
+		resp, err := dispatchClient.Do(req)
 		respAt := time.Now()
 		noteTimeout := func() {
 			if ctx.Err() == nil && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
@@ -698,7 +783,7 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 			}
 		}
 		if err != nil {
-			<-pool
+			releasePermit()
 			noteTimeout()
 			cancel()
 			if ctx.Err() != nil {
@@ -725,8 +810,8 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 		resp.Body.Close()
 		cancel()
-		// Keep the permit until EOF/Close, including media response bodies.
-		<-pool
+		// Keep the permits until EOF/Close, including media response bodies.
+		releasePermit()
 		bodyEnd := time.Now()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -740,8 +825,8 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 		}
 		tr.mu.Lock()
 		sample := timingSample{
-			total:     bodyEnd.Sub(poolStart) + waitCoolDur + waitTokenDur,
-			waitCool:  waitCoolDur,
+			total:     bodyEnd.Sub(attemptStart),
+			waitCool:  waitCoolDur + tr.dispatchWait,
 			waitPool:  waitPoolDur,
 			waitToken: waitTokenDur,
 			waitConn:  tr.connAt.Sub(began),
@@ -801,10 +886,29 @@ func (s *driveStorage) do(ctx context.Context, method, target, contentType strin
 	return 0, nil, lastErr
 }
 
+func (s *driveStorage) waitDispatch(ctx context.Context, cleanupDelete bool) error {
+	for {
+		if err := s.waitCool(ctx); err != nil {
+			return err
+		}
+		if cleanupDelete {
+			if err := s.waitCleanupSlot(ctx); err != nil {
+				return err
+			}
+		}
+		if !s.cooling() {
+			return ctx.Err()
+		}
+	}
+}
+
 // waitCool re-reads the deadline after every sleep: a cooldown extended while a
 // request was waiting must not release it into the limit again.
 func (s *driveStorage) waitCool(ctx context.Context) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s.coolMu.Lock()
 		until := s.coolUntil
 		s.coolMu.Unlock()
@@ -868,10 +972,16 @@ func (s *driveStorage) invalidateToken(used string) {
 
 const idCacheMax = 4096
 
-// rememberID caches the id of name, and those of any further objects that
-// share it, so that Delete can remove them all
+// rememberID merges confirmed identities; a partial or lagging listing must
+// not erase an object that a create or an earlier page already confirmed.
 func (s *driveStorage) rememberID(name, id string, extra []string) {
+	if id == "" {
+		return
+	}
 	s.idMu.Lock()
+	if s.ids == nil {
+		s.ids = make(map[string]string)
+	}
 	if _, ok := s.ids[name]; !ok && len(s.ids) >= idCacheMax {
 		for victim := range s.ids {
 			delete(s.ids, victim)
@@ -881,14 +991,22 @@ func (s *driveStorage) rememberID(name, id string, extra []string) {
 			}
 		}
 	}
+	if primary := s.ids[name]; primary != "" {
+		extra = append(append([]string{id}, extra...), s.dupIDs[name]...)
+		id = primary
+	}
 	s.ids[name] = id
-	if len(extra) > 0 {
+	var duplicates []string
+	for _, candidate := range extra {
+		if candidate != "" && candidate != id && !slices.Contains(duplicates, candidate) {
+			duplicates = append(duplicates, candidate)
+		}
+	}
+	if len(duplicates) > 0 {
 		if s.dupIDs == nil {
 			s.dupIDs = make(map[string][]string)
 		}
-		s.dupIDs[name] = extra
-	} else {
-		delete(s.dupIDs, name)
+		s.dupIDs[name] = duplicates
 	}
 	s.idMu.Unlock()
 }
@@ -898,6 +1016,55 @@ func (s *driveStorage) forgetID(name string) {
 	delete(s.ids, name)
 	delete(s.dupIDs, name)
 	s.idMu.Unlock()
+}
+
+func (s *driveStorage) retireID(name, id string) {
+	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	known := append([]string{s.ids[name]}, s.dupIDs[name]...)
+	kept := known[:0]
+	for _, candidate := range known {
+		if candidate != "" && candidate != id {
+			kept = append(kept, candidate)
+		}
+	}
+	if len(kept) == 0 {
+		delete(s.ids, name)
+		delete(s.dupIDs, name)
+		return
+	}
+	s.ids[name] = kept[0]
+	if len(kept) > 1 {
+		s.dupIDs[name] = append([]string(nil), kept[1:]...)
+	} else {
+		delete(s.dupIDs, name)
+	}
+}
+
+func (s *driveStorage) cachedFiles(flat string, descendants bool) map[string]driveFile {
+	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	found := make(map[string]driveFile)
+	for name, id := range s.ids {
+		if name == flat || descendants && strings.HasPrefix(name, flat+flatSeparator) {
+			found[name] = driveFile{id: id, extra: append([]string(nil), s.dupIDs[name]...)}
+		}
+	}
+	return found
+}
+
+func mergeDriveFile(first, next driveFile) driveFile {
+	if first.id == "" {
+		first = next
+		first.extra = append([]string(nil), next.extra...)
+		return first
+	}
+	for _, id := range append([]string{next.id}, next.extra...) {
+		if id != "" && id != first.id && !slices.Contains(first.extra, id) {
+			first.extra = append(first.extra, id)
+		}
+	}
+	return first
 }
 
 func (s *driveStorage) cachedID(name string) (string, bool) {
@@ -935,10 +1102,10 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 
 		status, payload, err := s.do(ctx, http.MethodGet, s.filesURL+"?"+params.Encode(), "", nil)
 		if err != nil {
-			return nil, err
+			return found, err
 		}
 		if status != http.StatusOK {
-			return nil, errors.New("Drive listing answered ", status, ": ", string(payload))
+			return found, errors.New("Drive listing answered ", status, ": ", string(payload))
 		}
 
 		var parsed struct {
@@ -950,23 +1117,19 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 			} `json:"files"`
 		}
 		if err := json.Unmarshal(payload, &parsed); err != nil {
-			return nil, errors.New("failed to parse the Drive listing").Base(err)
+			return found, errors.New("failed to parse the Drive listing").Base(err)
 		}
 
 		for _, file := range parsed.Files {
-			if prev, ok := found[file.Name]; ok {
-				prev.extra = append(prev.extra, file.ID)
-				found[file.Name] = prev
+			if file.ID == "" {
 				continue
 			}
-			found[file.Name] = driveFile{id: file.ID, description: file.Description}
+			found[file.Name] = mergeDriveFile(found[file.Name], driveFile{id: file.ID, description: file.Description})
+			s.rememberID(file.Name, file.ID, nil)
 		}
 
 		pageToken = parsed.NextPageToken
 		if pageToken == "" {
-			for name, file := range found {
-				s.rememberID(name, file.id, file.extra)
-			}
 			return found, nil
 		}
 	}
@@ -975,11 +1138,12 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 // resolveIDs is every id under the exact name
 func (s *driveStorage) resolveIDs(ctx context.Context, flat string) ([]string, error) {
 	found, err := s.query(context.WithValue(ctx, namesOnlyKey{}, true), "name = '"+quoteDriveValue(flat)+"'")
+	file := mergeDriveFile(s.cachedFiles(flat, false)[flat], found[flat])
+	if file.id != "" {
+		return append([]string{file.id}, file.extra...), err
+	}
 	if err != nil {
 		return nil, err
-	}
-	if file, ok := found[flat]; ok {
-		return append([]string{file.id}, file.extra...), nil
 	}
 	return nil, errNotFound
 }
@@ -1023,7 +1187,7 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 		return "", errors.New("failed to build the inline metadata").Base(err)
 	}
 
-	status, payload, err := s.do(ctx, http.MethodPost, s.filesURL+"?fields=id",
+	status, payload, err := s.do(ctx, http.MethodPost, s.filesURL+"?fields=id&supportsAllDrives=true",
 		"application/json; charset=UTF-8", body)
 	if err != nil {
 		return "", err
@@ -1039,18 +1203,43 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return "", errors.New("failed to parse the Drive upload response").Base(err)
 	}
+	if parsed.ID == "" {
+		return "", errors.New("Drive returned no id for ", name)
+	}
+	s.rememberID(flat, parsed.ID, nil)
 	return parsed.ID, nil
 }
 
-// multipartBody is a body of an upload with metadata and data
-func multipartBody(metadata, data []byte) []byte {
+// multipartBody chooses a fresh boundary absent from both parts, including
+// arbitrary binary payloads, and returns its matching Content-Type.
+func multipartBody(metadata, data []byte) ([]byte, string) {
+	var boundary string
+	for {
+		var entropy [24]byte
+		rand.Read(entropy[:])
+		boundary = "xdrive-" + hex.EncodeToString(entropy[:])
+		if !bytes.Contains(metadata, []byte(boundary)) && !bytes.Contains(data, []byte(boundary)) {
+			break
+		}
+	}
 	var body bytes.Buffer
-	fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", driveBoundary)
+	fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", boundary)
 	body.Write(metadata)
-	fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", driveBoundary)
+	fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", boundary)
 	body.Write(data)
-	fmt.Fprintf(&body, "\r\n--%s--\r\n", driveBoundary)
-	return body.Bytes()
+	fmt.Fprintf(&body, "\r\n--%s--\r\n", boundary)
+	return body.Bytes(), "multipart/related; boundary=" + boundary
+}
+
+func withAllDrives(target string) string {
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return target
+	}
+	params := parsed.Query()
+	params.Set("supportsAllDrives", "true")
+	parsed.RawQuery = params.Encode()
+	return parsed.String()
 }
 
 func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) error {
@@ -1065,8 +1254,8 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 		return errors.New("failed to build the upload metadata").Base(err)
 	}
 
-	status, payload, err := s.do(ctx, http.MethodPost, s.uploadURL,
-		"multipart/related; boundary="+driveBoundary, multipartBody(metadata, data))
+	body, contentType := multipartBody(metadata, data)
+	status, payload, err := s.do(ctx, http.MethodPost, withAllDrives(s.uploadURL), contentType, body)
 	if err != nil {
 		return err
 	}
@@ -1080,6 +1269,10 @@ func (s *driveStorage) putMedia(ctx context.Context, name string, data []byte) e
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return errors.New("failed to parse the Drive upload response").Base(err)
 	}
+	if parsed.ID == "" {
+		return errors.New("Drive returned no id for ", name)
+	}
+	s.rememberID(flat, parsed.ID, nil)
 	return nil
 }
 
@@ -1092,7 +1285,7 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 
 	payload, err := s.readBody(ctx, id)
 	if err == errNotFound {
-		s.forgetID(flat)
+		s.retireID(flat, id)
 	}
 	if err != nil || len(payload) > 0 {
 		return payload, err
@@ -1118,13 +1311,26 @@ func (s *driveStorage) deleteID(ctx context.Context, flat, id string) error {
 	if err != nil {
 		return err
 	}
-	s.forgetID(flat)
 	switch status {
 	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
+		s.retireID(flat, id)
 		return nil
 	default:
 		return errors.New("Drive deletion of ", flat, " answered ", status, ": ", string(payload))
 	}
+}
+
+func (s *driveShared) cleanupPool() chan struct{} {
+	s.cleanupMu.Lock()
+	defer s.cleanupMu.Unlock()
+	if s.cleanupInflight == nil {
+		parallel := s.cleanupParallel
+		if parallel <= 0 {
+			parallel = cleanupParallel
+		}
+		s.cleanupInflight = make(chan struct{}, parallel)
+	}
+	return s.cleanupInflight
 }
 
 // waitCleanupSlot is a token bucket capping cleanup deletes at cleanupRate per
@@ -1136,6 +1342,9 @@ func (s *driveStorage) waitCleanupSlot(ctx context.Context) error {
 		rate = cleanupRatePerSec
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s.cleanupMu.Lock()
 		now := time.Now()
 		if s.cleanupAt.IsZero() {
@@ -1163,6 +1372,7 @@ func (s *driveStorage) waitCleanupSlot(ctx context.Context) error {
 // retried after a jittered delay, up to cleanupMaxRetries tries in total, then
 // reported as an ordinary error. Non-rate-limit errors are returned at once.
 func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
+	ctx = context.WithValue(ctx, cleanupKey{}, true)
 	delay := s.cleanupRetryDelay
 	if delay <= 0 {
 		delay = cleanupRetryDelay
@@ -1180,9 +1390,6 @@ func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
 			case <-time.After(delay + jitter(delay)):
 			}
 		}
-		if err := s.waitCleanupSlot(ctx); err != nil {
-			return err
-		}
 		err := s.deleteID(ctx, name, id)
 		if err == nil {
 			return nil
@@ -1195,7 +1402,12 @@ func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
 	return errors.New("Drive cleanup deletion of ", name, " failed after ", tries, " tries").Base(last)
 }
 
-func (s *driveStorage) Delete(ctx context.Context, name string) error {
+func (s *driveStorage) Delete(parent context.Context, name string) error {
+	ctx, finish, ok := s.beginRequest(parent)
+	if !ok {
+		return context.Canceled
+	}
+	defer finish()
 	flat := flatten(name)
 	remove := s.deleteID
 	if ctx.Value(cleanupKey{}) != nil {
@@ -1204,31 +1416,23 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 
 	cleanupCtx := context.WithValue(ctx, cleanupKey{}, true)
 	cleanupCtx = context.WithValue(cleanupCtx, namesOnlyKey{}, true)
-	// A cached name is not an exhaustive listing: retries can create duplicates
-	// after it was cached. Discover exact and descendant IDs in one paginated
-	// listing, retaining cached IDs as well for objects not yet list-visible.
-	s.idMu.Lock()
-	var exact []string
-	if id, ok := s.ids[flat]; ok {
-		exact = append([]string{id}, s.dupIDs[flat]...)
+	children := s.cachedFiles(flat, true)
+	listed, listErr := s.query(cleanupCtx, "(name = '"+quoteDriveValue(flat)+"' or name contains '"+quoteDriveValue(flat+flatSeparator)+"')")
+	for childName, file := range listed {
+		if childName == flat || strings.HasPrefix(childName, flat+flatSeparator) {
+			children[childName] = mergeDriveFile(children[childName], file)
+		}
 	}
-	s.idMu.Unlock()
-	children, err := s.query(cleanupCtx, "(name = '"+quoteDriveValue(flat)+"' or name contains '"+quoteDriveValue(flat+flatSeparator)+"')")
-	if err != nil {
-		return err
+	for childName, file := range s.cachedFiles(flat, true) {
+		children[childName] = mergeDriveFile(children[childName], file)
 	}
 	if file, ok := children[flat]; ok {
 		for _, id := range append([]string{file.id}, file.extra...) {
-			if !slices.Contains(exact, id) {
-				exact = append(exact, id)
+			if err := remove(ctx, flat, id); err != nil {
+				return err
 			}
 		}
 		delete(children, flat)
-	}
-	for _, id := range exact {
-		if err := remove(ctx, flat, id); err != nil {
-			return err
-		}
 	}
 	parallel := s.cleanupParallel
 	if parallel <= 0 {
@@ -1237,10 +1441,18 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var first error
+	first := listErr
+	launching := true
 	for childName, file := range children {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			launching = false
+		}
+		if !launching {
+			break
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(name string, ids []string) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -1256,6 +1468,9 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		}(childName, append([]string{file.id}, file.extra...))
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	return first
 }
 
@@ -1263,13 +1478,13 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 	flat := flatten(prefix) + flatSeparator
 
 	found, err := s.query(ctx, "name contains '"+quoteDriveValue(flat)+"'")
-	if err != nil {
-		return nil, err
-	}
 
 	seen := make(map[string]bool, len(found))
 	entries := make([]Entry, 0, len(found))
 	for name, file := range found {
+		if !strings.HasPrefix(name, flat) {
+			continue
+		}
 		rest := strings.TrimPrefix(name, flat)
 		if rest == "" {
 			continue
@@ -1292,19 +1507,32 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 		}
 		entries = append(entries, entry)
 	}
-	return entries, nil
+	return entries, err
 }
 
 func (s *driveStorage) Close() error {
 	if s.release != nil {
 		s.release()
-	} else {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		s.cancelWork()
+		s.conns.Close()
+		s.bulkConns.Close()
+		for _, pool := range s.mediaConns {
+			pool.Close()
+		}
+		for _, client := range append([]*http.Client{s.client, s.bulkClient, s.tokenClient}, s.mediaClients...) {
+			if client != nil {
+				client.CloseIdleConnections()
+			}
+		}
 		s.closeWork()
 		s.stopKeeper()
 		if s.timing != nil {
 			s.timing.stop()
 		}
-	}
+	})
 	return nil
 }
 
@@ -1333,8 +1561,7 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	if body != nil {
 		upload, _, _ := strings.Cut(s.uploadURL, "?")
 		target = upload + "/" + url.PathEscape(id) + "?uploadType=multipart&fields=id&supportsAllDrives=true"
-		contentType = "multipart/related; boundary=" + driveBoundary
-		metadata = multipartBody(metadata, body)
+		metadata, contentType = multipartBody(metadata, body)
 	}
 
 	status, payload, err := s.do(ctx, http.MethodPatch, target, contentType, metadata)

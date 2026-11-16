@@ -5,6 +5,7 @@ import (
 	gotls "crypto/tls"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"reflect"
 	"runtime"
 	"slices"
@@ -35,6 +36,61 @@ type serviceTransport struct {
 	stall  time.Duration
 }
 
+type (
+	dispatchKey      struct{}
+	dispatchStallKey struct{}
+)
+
+type dispatchTransport struct{ next http.RoundTripper }
+
+func (t dispatchTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return dispatchRoundTrip(t.next, r)
+}
+
+// The installed H1/H2/H3 transports call GotConn synchronously before each
+// dispatch, including internal replays. Wrappers defer admission to that hook.
+func dispatchRoundTrip(next http.RoundTripper, r *http.Request) (*http.Response, error) {
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	admit, ok := r.Context().Value(dispatchKey{}).(func(context.Context) error)
+	if !ok {
+		return next.RoundTrip(r)
+	}
+	switch next.(type) {
+	case *serviceTransport, *secureTransport, *sessionTransport:
+		return next.RoundTrip(r)
+	case *http.Transport, *http3.Transport:
+		ctx := r.Context()
+		trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+			resume := func() {}
+			if pause, ok := ctx.Value(dispatchStallKey{}).(func() func()); ok {
+				resume = pause()
+			}
+			err := admit(ctx)
+			resume()
+			if err != nil {
+				// H1 can enqueue its write even after a canceled GotConn returns.
+				// Its reserved socket is not shared; close it before returning.
+				// H2 checks context before HEADERS, H3 before opening a stream.
+				if _, h1or2 := next.(*http.Transport); h1or2 {
+					state, tlsConn := i.Conn.(interface{ ConnectionState() gotls.ConnectionState })
+					if !tlsConn || state.ConnectionState().NegotiatedProtocol != "h2" {
+						i.Conn.Close()
+					}
+				}
+			}
+		}}
+		r = r.WithContext(httptrace.WithClientTrace(ctx, trace))
+	default:
+		// Non-replaying in-memory transports have no connection trace.
+		if err := admit(r.Context()); err != nil {
+			return nil, err
+		}
+	}
+	return next.RoundTrip(r)
+}
+
 // RoundTrip ends a request that stands still for t.stall, with no answer that
 // long after its body went out or no byte of either body, but not one that just
 // runs long: a large object on a slow link takes minutes and is fine as long as
@@ -46,12 +102,47 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 
 	ctx, cancel := context.WithCancelCause(r.Context())
-	timer := time.AfterFunc(t.stall, func() { cancel(errStalled) })
-	alive := func() { timer.Reset(t.stall) }
-	end := func() {
+	var timerMu sync.Mutex
+	paused, ended := 0, false
+	deadline := time.Now().Add(t.stall)
+	timer := time.AfterFunc(t.stall, func() {
+		timerMu.Lock()
+		defer timerMu.Unlock()
+		if !ended && paused == 0 && !time.Now().Before(deadline) {
+			cancel(errStalled)
+		}
+	})
+	alive := func() {
+		timerMu.Lock()
+		defer timerMu.Unlock()
+		if !ended && paused == 0 {
+			deadline = time.Now().Add(t.stall)
+			timer.Reset(t.stall)
+		}
+	}
+	pause := func() func() {
+		timerMu.Lock()
+		paused++
 		timer.Stop()
+		timerMu.Unlock()
+		return sync.OnceFunc(func() {
+			timerMu.Lock()
+			defer timerMu.Unlock()
+			paused--
+			if !ended && paused == 0 {
+				deadline = time.Now().Add(t.stall)
+				timer.Reset(t.stall)
+			}
+		})
+	}
+	end := func() {
+		timerMu.Lock()
+		ended = true
+		timer.Stop()
+		timerMu.Unlock()
 		cancel(nil)
 	}
+	ctx = context.WithValue(ctx, dispatchStallKey{}, pause)
 	r = r.WithContext(ctx)
 	// the headers of chrome as with XHTTP and DoH, net/http and http3 would send
 	// their own user agent after a hello of chrome
@@ -72,7 +163,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		}
 	}
 
-	resp, err := next.RoundTrip(r)
+	resp, err := dispatchRoundTrip(next, r)
 	if err != nil {
 		err = stalled(ctx, err)
 		end()
@@ -81,6 +172,17 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	alive()
 	resp.Body = &progressBody{ReadCloser: resp.Body, alive: alive, end: end, ctx: ctx}
 	return resp, nil
+}
+
+func (t *serviceTransport) CloseIdleConnections() {
+	closeIdleTransport(t.plain)
+	closeIdleTransport(t.secure)
+}
+
+func closeIdleTransport(t http.RoundTripper) {
+	if closer, ok := t.(interface{ CloseIdleConnections() }); ok {
+		closer.CloseIdleConnections()
+	}
 }
 
 // stalled returns errStalled for an error that the stall gave, which http2 reports
@@ -155,6 +257,13 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	// fronting takes only the address and port, the network stays that of the
 	// dial, which is UDP for h3 though the destination is built as TCP
 	dial := func(ctx context.Context, network, addr string) (net.Conn, net.Destination, error) {
+		ctx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(connCtx, cancel)
+		defer stop()
+		defer cancel()
+		if connCtx.Err() != nil {
+			cancel()
+		}
 		host, err := net.ParseDestination(network + ":" + addr)
 		if err != nil {
 			return nil, host, errors.New("bad address: ", addr).Base(err)
@@ -192,8 +301,8 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		}
 		// CloseIdleConnections leaves an h2 connection open while a stream just
 		// canceled has not left it yet
-		stop := context.AfterFunc(connCtx, func() { conn.Close() })
-		return &ctxConn{Conn: conn, stop: stop}, host, nil
+		stopConn := context.AfterFunc(connCtx, func() { conn.Close() })
+		return &ctxConn{Conn: conn, stop: stopConn}, host, nil
 	}
 
 	dialPlain := func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -266,6 +375,13 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		https = &http3.Transport{
 			QUICConfig: quicConfig,
 			Dial: func(ctx context.Context, addr string, _ *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				ctx, cancel := context.WithCancel(ctx)
+				stop := context.AfterFunc(connCtx, cancel)
+				defer stop()
+				defer cancel()
+				if connCtx.Err() != nil {
+					cancel()
+				}
 				switch quicParams.Congestion {
 				case "", "bbr", "reno":
 				default:
@@ -307,8 +423,8 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 					pktConn.Close()
 					return nil, err
 				}
-				stop := context.AfterFunc(connCtx, func() { qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "") })
-				context.AfterFunc(qconn.Context(), func() { stop(); tr.Close(); pktConn.Close() })
+				stopConn := context.AfterFunc(connCtx, func() { qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "") })
+				context.AfterFunc(qconn.Context(), func() { stopConn(); tr.Close(); pktConn.Close() })
 				if quicParams.Congestion != "reno" {
 					congestion.UseBBR(qconn, bbr.Profile(quicParams.BbrProfile))
 				}
@@ -354,13 +470,18 @@ type secureTransport struct {
 
 func (t *secureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if _, ok := t.h1Hosts.Load(r.URL.Host); ok {
-		return t.h1.RoundTrip(r)
+		return dispatchRoundTrip(t.h1, r)
 	}
-	resp, err := t.h2.RoundTrip(r)
+	resp, err := dispatchRoundTrip(t.h2, r)
 	if err == nil && resp.ProtoMajor == 1 {
 		t.h1Hosts.Store(r.URL.Host, true)
 	}
 	return resp, err
+}
+
+func (t *secureTransport) CloseIdleConnections() {
+	closeIdleTransport(t.h2)
+	closeIdleTransport(t.h1)
 }
 
 var errSessionClosed = errors.New("the session is closed")
@@ -368,15 +489,23 @@ var errSessionClosed = errors.New("the session is closed")
 // connPool hands the sessions of a storage the connections of XMUX, each a
 // client of its own made by newClient
 type connPool struct {
-	mu   sync.Mutex
-	xmux *splithttp.XmuxManager
+	mu     sync.Mutex
+	xmux   *splithttp.XmuxManager
+	ctx    context.Context
+	cancel context.CancelFunc
+	closed bool
+
+	connMu sync.Mutex
+	conns  map[*poolConn]struct{}
 }
 
 func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Context) *http.Client) *connPool {
 	if config == nil {
 		config = &splithttp.XmuxConfig{}
 	}
-	return &connPool{xmux: splithttp.NewXmuxManager(splithttp.XmuxConfig{
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := &connPool{ctx: ctx, cancel: cancel, conns: make(map[*poolConn]struct{})}
+	pool.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
 		MaxConcurrency:   config.MaxConcurrency,
 		MaxConnections:   config.MaxConnections,
 		CMaxReuseTimes:   config.CMaxReuseTimes,
@@ -384,15 +513,48 @@ func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Co
 		HMaxReusableSecs: config.HMaxReusableSecs,
 		HKeepAlivePeriod: config.HKeepAlivePeriod,
 	}, func() splithttp.XmuxConn {
-		ctx, cancel := context.WithCancel(context.Background())
-		return &poolConn{next: newClient(ctx).Transport, cancel: cancel}
-	})}
+		ctx, cancel := context.WithCancel(pool.ctx)
+		conn := &poolConn{next: newClient(ctx).Transport, ctx: ctx}
+		conn.cancel = sync.OnceFunc(func() {
+			cancel()
+			closeIdleTransport(conn.next)
+			pool.connMu.Lock()
+			delete(pool.conns, conn)
+			pool.connMu.Unlock()
+		})
+		pool.connMu.Lock()
+		pool.conns[conn] = struct{}{}
+		pool.connMu.Unlock()
+		return conn
+	})
+	return pool
+}
+
+// Close is terminal; ordinary session release leaves the pool reusable.
+func (p *connPool) Close() {
+	if p == nil {
+		return
+	}
+	p.cancel()
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.connMu.Lock()
+	conns := make([]*poolConn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	p.connMu.Unlock()
+	for _, conn := range conns {
+		conn.forceClose()
+	}
 }
 
 // poolConn is a connection of XMUX, which closes once XMUX drops it and the
 // requests on it end
 type poolConn struct {
 	next   http.RoundTripper
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu       sync.Mutex
@@ -420,31 +582,50 @@ func (c *poolConn) acquire() bool {
 
 func (c *poolConn) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.closing = true
-	if c.inflight == 0 {
+	idle := c.inflight == 0
+	c.mu.Unlock()
+	if idle {
 		c.cancel()
 	}
 	return nil
 }
 
+func (c *poolConn) forceClose() {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
+	c.cancel()
+}
+
 func (c *poolConn) done() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.inflight--
-	if c.closing && c.inflight == 0 {
+	idle := c.closing && c.inflight == 0
+	c.mu.Unlock()
+	if idle {
 		c.cancel()
 	}
 }
 
 // roundTrip sends a request counted in inflight by the caller
 func (c *poolConn) roundTrip(r *http.Request) (*http.Response, error) {
-	resp, err := c.next.RoundTrip(r)
-	if err != nil {
-		c.done()
+	ctx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(c.ctx, cancel)
+	if c.ctx.Err() != nil {
+		cancel()
+	}
+	finish := sync.OnceFunc(func() { stop(); cancel(); c.done() })
+	if err := ctx.Err(); err != nil {
+		finish()
 		return nil, err
 	}
-	resp.Body = &doneBody{ReadCloser: resp.Body, done: sync.OnceFunc(c.done)}
+	resp, err := dispatchRoundTrip(c.next, r.WithContext(ctx))
+	if err != nil {
+		finish()
+		return nil, err
+	}
+	resp.Body = &doneBody{ReadCloser: resp.Body, done: finish}
 	return resp, nil
 }
 
@@ -479,9 +660,13 @@ type sessionTransport struct {
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t.mu.Lock()
-	if t.closed {
+	if t.closed || t.pool.ctx.Err() != nil {
 		t.mu.Unlock()
 		return nil, errSessionClosed
+	}
+	if err := r.Context().Err(); err != nil {
+		t.mu.Unlock()
+		return nil, err
 	}
 	client := t.client
 	var conn *poolConn
@@ -496,6 +681,14 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	for try := 0; conn == nil; try++ {
 		t.pool.mu.Lock()
+		if t.pool.closed || r.Context().Err() != nil {
+			t.pool.mu.Unlock()
+			t.mu.Unlock()
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+			return nil, errSessionClosed
+		}
 		next := t.pool.xmux.GetXmuxClient(r.Context())
 		t.pool.mu.Unlock()
 		next.AddRunning()

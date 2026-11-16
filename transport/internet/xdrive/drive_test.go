@@ -359,14 +359,28 @@ func setDriveEndpoints(s *driveStorage, token, files, upload string) {
 	s.tokenURL, s.filesURL, s.uploadURL = token, files, upload
 }
 
-// Configure the cached owner before Dial or Listener starts any shared work.
+// Configure owners before Dial or Listener starts any shared work.
 func prepareDrive(t *testing.T, settings *internet.MemoryStreamConfig, token, files, upload string) {
 	t.Helper()
+	if settings.FinalMask != nil {
+		factory := func(config *Config) (Storage, error) {
+			s, err := newDriveStorage(settings, config)
+			if err != nil {
+				return nil, err
+			}
+			setDriveEndpoints(s, token, files, upload)
+			return s, nil
+		}
+		old := testStorageFactory.Swap(&factory)
+		t.Cleanup(func() { testStorageFactory.Store(old) })
+		return
+	}
 	s, err := newStorage(settings)
 	if err != nil {
 		t.Fatal(err)
 	}
-	setDriveEndpoints(s.(*driveStorage), token, files, upload)
+	setDriveEndpoints(s.(*leasedDriveStorage).driveStorage, token, files, upload)
+	t.Cleanup(func() { s.Close() })
 }
 
 func (d *fakeDrive) settings(t *testing.T) *internet.MemoryStreamConfig {
@@ -611,14 +625,20 @@ func TestDriveSharedClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStorage: %v", err)
 	}
-	if first != second {
-		t.Fatal("same settings did not share one storage")
+	defer first.Close()
+	defer second.Close()
+	if first == second || first.(*leasedDriveStorage).lease.owner != second.(*leasedDriveStorage).lease.owner {
+		t.Fatal("same settings must share an owner, not an acquisition lease")
 	}
 	// a session has an inflight of its own, as large
-	session := sessionStorage(first).(*driveStorage)
+	session := sessionStorage(first).(*leasedDriveStorage)
 	defer session.Close()
-	if session.inflight == first.(*driveStorage).inflight || cap(session.inflight) != driveMaxInflight {
+	if session.inflight == first.(*leasedDriveStorage).inflight || cap(session.inflight) != driveMaxInflight {
 		t.Fatalf("a session shares inflight or has cap %d", cap(session.inflight))
+	}
+	first.Close()
+	if session.isWorkClosed() || second.(*leasedDriveStorage).isWorkClosed() {
+		t.Fatal("closing one acquisition terminated its sibling or child")
 	}
 }
 

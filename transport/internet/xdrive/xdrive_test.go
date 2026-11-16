@@ -715,8 +715,8 @@ func sessionEnd(r *http.Request) string {
 
 // with "maxConcurrency" 1 every end of a session has a connection of its own,
 // with "maxConnections" the ends share that many, and the sessions after them
-// take the same ones again. The listener and the token use none of them, and
-// the sessions get the token once
+// take the same ones again while an owner lease remains. The listener and the
+// token use none of them, and the sessions get the token once
 func TestXmuxConnections(t *testing.T) {
 	const n = 3
 	for _, c := range []struct {
@@ -756,6 +756,11 @@ func TestXmuxConnections(t *testing.T) {
 			}, []string{"refresh"})
 			settings.SecuritySettings = server.settings(&tls.Config{}).SecuritySettings
 			settings.ProtocolSettings.(*Config).Xmux = c.xmux
+			storage, err := newStorage(settings)
+			if err != nil {
+				t.Fatalf("newStorage: %v", err)
+			}
+			defer storage.Close()
 
 			runSessions(t, settings, n)
 			mu.Lock()
@@ -941,7 +946,7 @@ func TestXmuxRequestLimit(t *testing.T) {
 }
 
 // a session that fails to announce itself lets go of its connection, which the
-// next one takes with "maxConcurrency" 1
+// next one takes with "maxConcurrency" 1 while an owner lease remains
 func TestFailedDialReleasesConnection(t *testing.T) {
 	resetSharedStorage()
 	t.Cleanup(resetSharedStorage)
@@ -960,6 +965,11 @@ func TestFailedDialReleasesConnection(t *testing.T) {
 	settings := templateSettings(store, map[string]interface{}{"type": "none"}, nil)
 	settings.SecuritySettings = server.settings(&tls.Config{}).SecuritySettings
 	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{MaxConcurrency: &splithttp.RangeConfig{From: 1, To: 1}}
+	storage, err := newStorage(settings)
+	if err != nil {
+		t.Fatalf("newStorage: %v", err)
+	}
+	defer storage.Close()
 
 	if _, err := Dial(context.Background(), net.Destination{}, settings); err == nil {
 		t.Fatal("Dial announced a session that the service refused")

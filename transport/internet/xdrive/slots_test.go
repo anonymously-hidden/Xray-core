@@ -1241,12 +1241,30 @@ func TestSlotZeroUploadPrecedesReuse(t *testing.T) {
 					default:
 					}
 					close(s.release)
-					<-s.reused
 					w.wg.Wait()
 					desc, err := s.readDescription(ctx, table.Slots[0])
 					frame, ok := decodeSlot(desc)
+					if fail {
+						select {
+						case <-s.reused:
+							t.Fatal("slot 0 was reused after its predecessor failed")
+						default:
+						}
+						if err != nil || !ok || frame.seq != 0 || frame.mode != slotErr {
+							t.Fatalf("failed predecessor marker lost: seq=%d mode=%d err=%v", frame.seq, frame.mode, err)
+						}
+						if err := w.Close(); err == nil {
+							t.Fatal("Close lost the predecessor upload failure")
+						}
+						return
+					}
+					select {
+					case <-s.reused:
+					default:
+						t.Fatal("slot 0 was not reused after upload completion and ACK")
+					}
 					if err != nil || !ok || frame.seq != 2 || s.overlap.Load() {
-						t.Fatalf("slot reuse after upload success/failure: seq=%d overlap=%v err=%v", frame.seq, s.overlap.Load(), err)
+						t.Fatalf("slot reuse after upload success: seq=%d overlap=%v err=%v", frame.seq, s.overlap.Load(), err)
 					}
 				})
 			})

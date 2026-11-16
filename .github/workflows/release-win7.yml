@@ -2,11 +2,6 @@ name: Build and Release for Windows 7
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
-  push:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 jobs:
   check-assets:
@@ -113,6 +108,10 @@ jobs:
         run: |
           mkdir -p build_assets
           COMMID=$(git describe --tags --always --dirty)
+          echo "Build identity: ${COMMID}"
+          git rev-parse HEAD
+          go version
+          go env -json GOVERSION GOOS GOARCH CGO_ENABLED GOAMD64 GO386 GOARM GOARM64 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOEXPERIMENT GOFLAGS GOWORK GOENV GOTOOLCHAIN GOFIPS140
           echo 'Building Xray for Windows 7...'
           go build -o build_assets/xray.exe -trimpath -buildvcs=false -gcflags="all=-l=4" -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" -v ./main
           # The line below is for without running conhost.exe version. Commented for not being used. Provided for reference.

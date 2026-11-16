@@ -15,6 +15,7 @@ var placeholderAddr = &net.TCPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0}
 // Conn is a session in segments, walWriter and walReader, or in slots,
 // slotWriter and slotReader
 type Conn struct {
+	ctx     context.Context
 	cancel  context.CancelFunc
 	writer  connWriter
 	reader  chunkReader
@@ -27,6 +28,7 @@ type Conn struct {
 	writeDeadline *pipeDeadline
 	closing       chan struct{}
 
+	publishWG sync.WaitGroup // registered before Dial exposes the connection
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -48,6 +50,7 @@ type chunkReader interface {
 func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, discard bool, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Conn{
+		ctx:     ctx,
 		cancel:  cancel,
 		writer:  newWALWriter(ctx, storage, writePrefix, p),
 		reader:  newWALReader(ctx, storage, readPrefix, p, discard),
@@ -62,6 +65,7 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, first []byte, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
 	return &Conn{
+		ctx:     ctx,
 		cancel:  cancel,
 		writer:  newSlotWriter(ctx, store, write, p),
 		reader:  newSlotReader(ctx, store, read, p, first),
@@ -174,12 +178,26 @@ func (c *Conn) Close() error {
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
 		c.closeErr = c.writer.Close()
+		c.publishWG.Wait()
+		if c.closeErr == nil {
+			if writer, ok := c.writer.(interface{ Err() error }); ok {
+				c.closeErr = writer.Err()
+			}
+		}
 		c.cancel()
+		if reader, ok := c.reader.(interface{ wait() }); ok {
+			reader.wait()
+		}
 		if c.onClose != nil {
 			c.onClose()
 		}
 	})
 	return c.closeErr
+}
+
+func (c *Conn) Interrupt() {
+	c.cancel()
+	c.Close()
 }
 
 func (c *Conn) LocalAddr() net.Addr {

@@ -41,7 +41,12 @@ func (s *driveStorage) generateIDs(ctx context.Context, n int) ([]string, error)
 	return parsed.IDs, nil
 }
 
-func (s *driveStorage) takeIDs(ctx context.Context, n, ringWorth int) ([]string, error) {
+func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]string, error) {
+	ctx, finish, ok := s.beginRequest(parent)
+	if !ok {
+		return nil, context.Canceled
+	}
+	defer finish()
 	if n <= 0 {
 		return nil, nil
 	}
@@ -232,14 +237,13 @@ func (s *driveStorage) createWithID(ctx context.Context, metadata map[string]int
 	if err != nil {
 		return errors.New("failed to build the create metadata").Base(err)
 	}
-	target := s.filesURL + "?fields=id"
+	target := s.filesURL + "?fields=id&supportsAllDrives=true"
 	contentType := "application/json; charset=UTF-8"
 	payload := md
 	if body != nil {
 		ctx = context.WithValue(ctx, bodyKey{}, true)
-		target = s.uploadURL
-		contentType = "multipart/related; boundary=" + driveBoundary
-		payload = multipartBody(md, body)
+		target = withAllDrives(s.uploadURL)
+		payload, contentType = multipartBody(md, body)
 	}
 	status, reply, err := s.do(ctx, http.MethodPost, target, contentType, payload)
 	if err != nil {
@@ -247,6 +251,15 @@ func (s *driveStorage) createWithID(ctx context.Context, metadata map[string]int
 	}
 	if status != http.StatusOK {
 		return createError{status: status, payload: reply}
+	}
+	name, _ := metadata["name"].(string)
+	id, _ := metadata["id"].(string)
+	s.rememberID(name, id, nil)
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(reply, &parsed) == nil {
+		s.rememberID(name, parsed.ID, nil)
 	}
 	return nil
 }
@@ -272,7 +285,11 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 			s.fallbackLogOnce.Do(func() {
 				errors.LogInfo(ctx, "xdrive: create with pre-generated id fell back to update")
 			})
-			return s.setSlot(ctx, id, description, body)
+			if err := s.setSlot(ctx, id, description, body); err != nil {
+				return err
+			}
+			s.rememberID(flat, id, nil)
+			return nil
 		}
 	}
 	return err

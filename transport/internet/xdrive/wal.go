@@ -46,8 +46,12 @@ type walWriter struct {
 	storage Storage
 	prefix  string
 	params
-	sem chan struct{}
-	wg  sync.WaitGroup
+	sem       chan struct{}
+	wg        sync.WaitGroup
+	flushDone chan struct{}
+	stop      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 
 	mu       sync.Mutex
 	buf      []byte
@@ -60,11 +64,13 @@ type walWriter struct {
 
 func newWALWriter(ctx context.Context, storage Storage, prefix string, p params) *walWriter {
 	w := &walWriter{
-		ctx:     ctx,
-		storage: storage,
-		prefix:  prefix,
-		params:  p,
-		sem:     make(chan struct{}, p.concurrency),
+		ctx:       ctx,
+		storage:   storage,
+		prefix:    prefix,
+		params:    p,
+		sem:       make(chan struct{}, p.concurrency),
+		flushDone: make(chan struct{}),
+		stop:      make(chan struct{}),
 	}
 	go w.flushLoop()
 	return w
@@ -83,8 +89,11 @@ func (w *walWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int
 	if w.err != nil {
 		return 0, w.err
 	}
-	if w.closed {
+	if w.closed || w.ctx.Err() != nil {
 		return 0, io.ErrClosedPipe
+	}
+	if isClosedChan(deadline) || isClosedChan(closing) {
+		return 0, errWriteStopped
 	}
 
 	accepted := 0
@@ -92,8 +101,11 @@ func (w *walWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int
 		if w.err != nil {
 			return accepted, w.err
 		}
-		if w.closed {
+		if w.closed || w.ctx.Err() != nil {
 			return accepted, io.ErrClosedPipe
+		}
+		if isClosedChan(deadline) || isClosedChan(closing) {
+			return accepted, errWriteStopped
 		}
 		n := min(len(p), w.segmentBytes-len(w.buf))
 		w.buf = append(w.buf, p[:n]...)
@@ -109,6 +121,7 @@ func (w *walWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int
 }
 
 func (w *walWriter) flushLoop() {
+	defer close(w.flushDone)
 	ticker := time.NewTicker(w.flushInterval)
 	defer ticker.Stop()
 
@@ -116,10 +129,12 @@ func (w *walWriter) flushLoop() {
 		select {
 		case <-w.ctx.Done():
 			return
+		case <-w.stop:
+			return
 		case <-ticker.C:
 			w.mu.Lock()
 			if !w.closed && w.err == nil && len(w.buf) > 0 && w.readyToFlush() {
-				w.flushLocked(nil, nil)
+				w.flushLocked(nil, w.stop)
 			}
 			done := w.closed || w.err != nil
 			w.mu.Unlock()
@@ -147,6 +162,16 @@ func (w *walWriter) readyToFlush() bool {
 // goroutines and chunks. Either stop channel, when closed, ends the wait with
 // errWriteStopped
 func (w *walWriter) flushLocked(deadline, closing <-chan struct{}) error {
+	return w.flushLockedMode(deadline, closing, false)
+}
+
+func (w *walWriter) flushLockedMode(deadline, closing <-chan struct{}, draining bool) error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
+	if w.closed && !draining {
+		return io.ErrClosedPipe
+	}
 	if len(w.buf) == 0 {
 		return nil
 	}
@@ -174,6 +199,18 @@ func (w *walWriter) flushLocked(deadline, closing <-chan struct{}) error {
 		return errWriteStopped
 	}
 	w.mu.Lock()
+	if err := w.ctx.Err(); err != nil {
+		<-w.sem
+		return err
+	}
+	if w.closed && !draining {
+		<-w.sem
+		return io.ErrClosedPipe
+	}
+	if isClosedChan(deadline) || isClosedChan(closing) {
+		<-w.sem
+		return errWriteStopped
+	}
 	if w.err != nil || len(w.buf) == 0 {
 		<-w.sem
 		return w.err
@@ -205,8 +242,15 @@ func (w *walWriter) flushLocked(deadline, closing <-chan struct{}) error {
 func (w *walWriter) upload(seq int64, chunk []byte) {
 	defer w.wg.Done()
 	defer func() { <-w.sem }()
+	if w.ctx.Err() != nil {
+		return
+	}
 
-	if err := w.storage.Put(w.ctx, objectName(w.prefix, seq, segSuffix), chunk); err != nil {
+	err := w.storage.Put(w.ctx, objectName(w.prefix, seq, segSuffix), chunk)
+	if err == nil && requiresWALCommit(w.storage) {
+		err = w.storage.Put(w.ctx, objectName(w.prefix, seq, commitSuffix), encodeWALCommit(chunk))
+	}
+	if err != nil && w.ctx.Err() == nil {
 		w.mu.Lock()
 		if w.err == nil {
 			w.err = errors.New("failed to store segment").Base(err)
@@ -217,29 +261,39 @@ func (w *walWriter) upload(seq int64, chunk []byte) {
 }
 
 func (w *walWriter) Close() error {
-	w.mu.Lock()
-	if w.closed {
+	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		close(w.stop)
 		w.mu.Unlock()
-		return nil
-	}
-	w.closed = true
-	for len(w.buf) > 0 && w.err == nil {
-		if err := w.flushLocked(nil, nil); err != nil {
-			break
+		<-w.flushDone
+
+		w.mu.Lock()
+		var flushErr error
+		for len(w.buf) > 0 && w.err == nil {
+			if err := w.flushLockedMode(nil, nil, true); err != nil {
+				flushErr = err
+				break
+			}
 		}
-	}
-	w.mu.Unlock()
+		w.mu.Unlock()
+		w.wg.Wait()
 
-	w.wg.Wait()
-
-	w.mu.Lock()
-	err, seq := w.err, w.seq
-	w.mu.Unlock()
-
-	if err != nil {
-		return err
-	}
-	return w.storage.Put(w.ctx, objectName(w.prefix, seq, endSuffix), nil)
+		w.mu.Lock()
+		err, seq := w.err, w.seq
+		w.mu.Unlock()
+		switch {
+		case err != nil:
+			w.closeErr = err
+		case w.ctx.Err() != nil:
+			w.closeErr = w.ctx.Err()
+		case flushErr != nil:
+			w.closeErr = flushErr
+		default:
+			w.closeErr = w.storage.Put(w.ctx, objectName(w.prefix, seq, endSuffix), nil)
+		}
+	})
+	return w.closeErr
 }
 
 type walReader struct {
@@ -257,6 +311,8 @@ type walReader struct {
 
 	errMu sync.Mutex
 	err   error
+	done  chan struct{}
+	work  sync.WaitGroup
 }
 
 func newWALReader(ctx context.Context, storage Storage, prefix string, p params, discard bool) *walReader {
@@ -268,10 +324,15 @@ func newWALReader(ctx context.Context, storage Storage, prefix string, p params,
 		ch:      make(chan []byte, p.concurrency),
 		discard: discard,
 		wake:    make(chan struct{}, 1),
+		done:    make(chan struct{}),
 	}
 	if discard {
 		r.discards = make(chan string, 4*p.concurrency)
-		go r.discardLoop()
+		r.work.Add(1)
+		go func() {
+			defer r.work.Done()
+			r.discardLoop()
+		}()
 	}
 	go r.run()
 	return r
@@ -288,7 +349,13 @@ func (r *walReader) Wake() {
 	}
 }
 
+func (r *walReader) wait() {
+	<-r.done
+	r.work.Wait()
+}
+
 func (r *walReader) run() {
+	defer close(r.done)
 	defer close(r.ch)
 
 	delay := r.minPollInterval
@@ -344,34 +411,35 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		return false, false, err
 	}
 	if len(listed) == 0 {
-		return false, false, nil
+		return false, false, r.pendingError(false)
 	}
 
 	pending := make(map[int64]Entry, len(listed))
-	ahead := false
+	observedThrough := int64(-1)
 	for _, entry := range listed {
 		seq, ok := parseEntry(entry.Name)
 		if !ok {
+			if requiresWALCommit(r.storage) && strings.HasSuffix(entry.Name, commitSuffix) {
+				seq, ok = parseEntry(strings.TrimSuffix(entry.Name, commitSuffix) + segSuffix)
+				if ok {
+					observedThrough = max(observedThrough, seq)
+				}
+			}
+			continue
+		}
+		observedThrough = max(observedThrough, seq)
+		if previous, exists := pending[seq]; exists && strings.HasSuffix(previous.Name, errSuffix) {
 			continue
 		}
 		pending[seq] = entry
-		if seq > r.seq {
-			ahead = true
-		}
-	}
-
-	if _, ok := pending[r.seq]; !ok && ahead {
-		if r.holeSince.IsZero() {
-			r.holeSince = time.Now()
-		} else if time.Since(r.holeSince) >= r.holeTimeout {
-			return false, false, errors.New("segment ", r.seq,
-				" never arrived while later ones did, the peer lost it")
-		}
-	} else {
-		r.holeSince = time.Time{}
 	}
 
 	for {
+		if _, ok := pending[r.seq]; !ok {
+			if err := r.pendingError(observedThrough >= r.seq); err != nil {
+				return advanced, false, err
+			}
+		}
 		if entry, ok := pending[r.seq]; ok && strings.HasSuffix(entry.Name, errSuffix) {
 			r.queueDiscard(r.prefix + "/" + entry.Name)
 			return advanced, false, errors.New("the peer could not store segment ", r.seq)
@@ -388,7 +456,7 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 		chunks, err := r.fetch(batch)
 		if err != nil {
 			if err == errNotFound {
-				return advanced, false, nil
+				return advanced, false, r.pendingError(true)
 			}
 			return advanced, false, err
 		}
@@ -399,11 +467,29 @@ func (r *walReader) poll() (advanced, eof bool, err error) {
 			case <-r.ctx.Done():
 				return advanced, true, nil
 			}
+			seq := r.seq
 			r.seq++
+			r.holeSince = time.Time{}
 			advanced = true
 			r.queueDiscard(r.prefix + "/" + batch[i].Name)
+			if requiresWALCommit(r.storage) {
+				r.queueDiscard(objectName(r.prefix, seq, commitSuffix))
+			}
 		}
 	}
+}
+
+func (r *walReader) pendingError(observed bool) error {
+	if r.holeSince.IsZero() {
+		if observed {
+			r.holeSince = time.Now()
+		}
+		return nil
+	}
+	if time.Since(r.holeSince) >= r.holeTimeout {
+		return errors.New("segment ", r.seq, " did not complete before the stream progress timeout")
+	}
+	return nil
 }
 
 func (r *walReader) nextBatch(pending map[int64]Entry) (batch []Entry, done bool) {
@@ -442,9 +528,41 @@ func (r *walReader) fetch(batch []Entry) ([][]byte, error) {
 	}
 	wg.Wait()
 
-	for i := range batch {
-		if failures[i] != nil {
-			return nil, failures[i]
+	for _, err := range failures {
+		if err != nil && err != errNotFound {
+			return nil, err
+		}
+	}
+	for _, chunk := range chunks {
+		if len(chunk) > maxSegmentBytes {
+			return nil, errors.New("segment exceeds the maximum size")
+		}
+	}
+	commits := make([][]byte, len(batch))
+	commitFailures := make([]error, len(batch))
+	if requiresWALCommit(r.storage) {
+		for i, entry := range batch {
+			wg.Add(1)
+			go func(i int, name string) {
+				defer wg.Done()
+				seq, _ := parseEntry(name)
+				ctx := context.WithValue(r.ctx, maxBodyKey{}, int64(walCommitBytes))
+				commits[i], commitFailures[i] = r.storage.Get(ctx, objectName(r.prefix, seq, commitSuffix))
+			}(i, entry.Name)
+		}
+		wg.Wait()
+		for _, err := range commitFailures {
+			if err != nil && err != errNotFound {
+				return nil, err
+			}
+		}
+	}
+	for i, err := range failures {
+		if err != nil || len(chunks[i]) == 0 {
+			return nil, errNotFound
+		}
+		if requiresWALCommit(r.storage) && (commitFailures[i] != nil || !validWALCommit(commits[i], chunks[i])) {
+			return nil, errNotFound
 		}
 	}
 	return chunks, nil
@@ -474,7 +592,11 @@ func (r *walReader) discardLoop() {
 		case <-r.ctx.Done():
 			return
 		case name := <-r.discards:
-			sem <- struct{}{}
+			select {
+			case sem <- struct{}{}:
+			case <-r.ctx.Done():
+				return
+			}
 			wg.Add(1)
 			go func(name string) {
 				defer wg.Done()

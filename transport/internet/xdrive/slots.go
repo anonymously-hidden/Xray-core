@@ -262,14 +262,23 @@ func readWatermark(ctx context.Context, store slotStore, id string, lazy bool) (
 
 var errWriteStopped = errors.New("write stopped")
 
+type slotWriteResult struct {
+	done chan struct{}
+	err  error // published before done closes
+}
+
 type slotWriter struct {
 	ctx   context.Context
 	store slotStore
 	table slotTable
 	params
 	// slots has a token for each segment on its way, at most one for each slot
-	slots chan struct{}
-	wg    sync.WaitGroup
+	slots     chan struct{}
+	wg        sync.WaitGroup
+	flushDone chan struct{}
+	flushStop chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 
 	mu           sync.Mutex
 	buf          []byte
@@ -288,7 +297,7 @@ type slotWriter struct {
 	first        chan []byte
 	lazy         bool
 	created      []bool
-	gates        []chan struct{} // completion of the last assigned write to each physical slot
+	gates        []*slotWriteResult // completion and result of the last assigned physical write
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -309,12 +318,14 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		table:     table,
 		params:    p,
 		slots:     make(chan struct{}, min(len(table.Slots), max(slotWriteInflight, slotBulkInflight))),
+		flushDone: make(chan struct{}),
+		flushStop: make(chan struct{}),
 		available: make(chan struct{}),
 		size:      min(slotInlineLimit, p.segmentBytes),
 		acked:     -1,
 		progress:  time.Now(),
 		lazy:      table.lazy,
-		gates:     make([]chan struct{}, len(table.Slots)),
+		gates:     make([]*slotWriteResult, len(table.Slots)),
 
 		ackRetry:     slotAckRetry,
 		watermarkTTL: slotWatermarkTTL,
@@ -353,20 +364,14 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 	}
 	w.applyGrowLocked()
 
-	if w.err != nil {
-		return 0, w.err
-	}
-	if w.closed {
-		return 0, io.ErrClosedPipe
+	if err := w.admissionErrorLocked(deadline, closing, false); err != nil {
+		return 0, err
 	}
 
 	accepted := 0
 	for len(p) > 0 {
-		if w.err != nil {
-			return accepted, w.err
-		}
-		if w.closed {
-			return accepted, io.ErrClosedPipe
+		if err := w.admissionErrorLocked(deadline, closing, false); err != nil {
+			return accepted, err
 		}
 		n := min(len(p), w.segmentBytes-len(w.buf))
 		w.buf = append(w.buf, p[:n]...)
@@ -381,13 +386,39 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 	return accepted, nil
 }
 
+func (w *slotWriter) admissionErrorLocked(deadline, closing <-chan struct{}, allowClosed bool) error {
+	if w.err != nil {
+		return w.err
+	}
+	if err := w.ctx.Err(); err != nil {
+		if allowClosed {
+			return err
+		}
+		return io.ErrClosedPipe
+	}
+	if !allowClosed && w.closed {
+		return io.ErrClosedPipe
+	}
+	select {
+	case <-deadline:
+		return errWriteStopped
+	case <-closing:
+		return errWriteStopped
+	default:
+		return nil
+	}
+}
+
 func (w *slotWriter) flushLoop() {
+	defer close(w.flushDone)
 	ticker := time.NewTicker(w.flushInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-w.ctx.Done():
+			return
+		case <-w.flushStop:
 			return
 		case <-ticker.C:
 			w.mu.Lock()
@@ -453,12 +484,16 @@ func (w *slotWriter) releaseSlotLocked() {
 // without w.mu, so that a reader that falls behind holds Write back. w.mu is
 // held. Either stop channel, when closed, ends the wait with errWriteStopped
 func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
-	select {
-	case <-deadline:
-		return errWriteStopped
-	case <-closing:
-		return errWriteStopped
-	default:
+	return w.flushAdmittedLocked(deadline, closing, false)
+}
+
+func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allowClosed bool) error {
+	if err := w.admissionErrorLocked(deadline, closing, allowClosed); err != nil {
+		return err
+	}
+	var stop <-chan struct{}
+	if !allowClosed {
+		stop = w.flushStop
 	}
 	for len(w.slots) >= w.writeWindow() {
 		available := w.available
@@ -469,6 +504,8 @@ func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
 		case <-available:
 		case <-w.ctx.Done():
 			stopped = w.ctx.Err()
+		case <-stop:
+			stopped = io.ErrClosedPipe
 		case <-deadline:
 			stopped = errWriteStopped
 		case <-closing:
@@ -479,6 +516,12 @@ func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
 		if stopped != nil {
 			return stopped
 		}
+		if err := w.admissionErrorLocked(deadline, closing, allowClosed); err != nil {
+			return err
+		}
+	}
+	if err := w.admissionErrorLocked(deadline, closing, allowClosed); err != nil {
+		return err
 	}
 	w.slots <- struct{}{}
 	if w.err != nil || len(w.buf) == 0 {
@@ -528,10 +571,10 @@ func (w *slotWriter) flushLocked(deadline, closing <-chan struct{}) error {
 	w.held = 0
 
 	idx := int(seq % int64(len(w.table.Slots)))
-	prev, done := w.gates[idx], make(chan struct{})
-	w.gates[idx] = done
+	prev, result := w.gates[idx], &slotWriteResult{done: make(chan struct{})}
+	w.gates[idx] = result
 	w.wg.Add(1)
-	go w.upload(seq, chunk, prev, done)
+	go w.upload(seq, chunk, prev, result)
 	return nil
 }
 
@@ -539,14 +582,14 @@ func (w *slotWriter) slotID(seq int64) string {
 	return w.table.Slots[seq%int64(len(w.table.Slots))]
 }
 
-func (w *slotWriter) upload(seq int64, chunk []byte, prev, done chan struct{}) {
+func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResult) {
 	defer w.wg.Done()
 	defer func() {
 		w.mu.Lock()
 		w.releaseSlotLocked()
 		w.mu.Unlock()
 	}()
-	defer close(done)
+	defer close(result.done)
 
 	mode := byte(slotMedia)
 	if len(chunk) <= slotInlineLimit {
@@ -554,27 +597,19 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, done chan struct{}) {
 	}
 	w.prefetchWatermark(seq)
 	began := time.Now()
-	if err := w.await(seq); err != nil {
+	if err := w.awaitPrevious(seq, prev); err != nil {
+		result.err = err
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
-	}
-	// A seeded first frame can be acknowledged before its upload finishes.
-	// The watermark permits reuse, but only this gate orders physical writes
-	// (including lazy creation and an error marker) across laps.
-	if prev != nil {
-		select {
-		case <-prev:
-		case <-w.ctx.Done():
-			w.fail(w.ctx.Err())
-			return
-		}
 	}
 	awaited := time.Since(began)
 	putAt := time.Now()
 	if err := w.write(seq, mode, chunk); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
-		// the slot is free, the reader learns there what happened
+		// Completion includes the best-effort error frame, before reuse can
+		// observe the failed predecessor and leave that frame intact.
 		w.write(seq, slotErr, nil)
+		result.err = err
 		return
 	}
 	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
@@ -582,6 +617,9 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, done chan struct{}) {
 }
 
 func (w *slotWriter) write(seq int64, mode byte, data []byte) error {
+	if err := w.ctx.Err(); err != nil {
+		return err
+	}
 	f := newSlotFrame(seq, mode, data)
 	var body []byte
 	if mode == slotMedia {
@@ -665,18 +703,51 @@ func (w *slotWriter) prefetchWatermark(seq int64) {
 	if !start {
 		return
 	}
-	go w.fetchWatermark()
+	// The calling upload is already registered, so the group cannot reach
+	// zero before this child is registered, even while Close is waiting.
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		w.fetchWatermark()
+	}()
 }
 
-// await waits for drained, for slotStallTimeout at most, or slotCloseGrace
-// without progress once the writer is closed
 func (w *slotWriter) await(seq int64) error {
+	w.mu.Lock()
+	prev := w.gates[seq%int64(len(w.gates))]
+	w.mu.Unlock()
+	return w.awaitPrevious(seq, prev)
+}
+
+// Reuse needs both cumulative acknowledgement and completion of the previous
+// physical write. Once acknowledged, storage I/O is not a reader stall.
+func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 	start := time.Now()
 	wait := w.ackRetry
 	for {
+		if err := w.ctx.Err(); err != nil {
+			return err
+		}
+		if prev != nil {
+			select {
+			case <-prev.done:
+				if prev.err != nil {
+					return prev.err
+				}
+			default:
+			}
+		}
 		ok, err := w.drained(seq)
 		if ok {
-			return nil
+			if prev == nil {
+				return nil
+			}
+			select {
+			case <-prev.done:
+				return prev.err
+			case <-w.ctx.Done():
+				return w.ctx.Err()
+			}
 		}
 		if time.Since(start) >= ackDelay {
 			w.mu.Lock()
@@ -724,42 +795,50 @@ func (w *slotWriter) fail(err error) {
 }
 
 func (w *slotWriter) Close() error {
-	w.mu.Lock()
-	if w.closed {
-		w.mu.Unlock()
-		return nil
-	}
-	// Publish a fresh grace period before uploads can observe closed while
-	// Close is still waiting for tokens to flush the buffered tail.
-	w.ackMu.Lock()
-	w.progress = time.Now()
-	w.ackMu.Unlock()
-	w.closed = true
-	for len(w.buf) > 0 && w.err == nil {
-		if err := w.flushLocked(nil, nil); err != nil {
-			w.mu.Unlock()
-			return err
+	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		// Publish a fresh grace period before uploads can observe closed while
+		// Close is still waiting for tokens to flush the buffered tail.
+		w.ackMu.Lock()
+		w.progress = time.Now()
+		w.ackMu.Unlock()
+		w.closed = true
+		close(w.flushStop)
+		var flushErr error
+		for len(w.buf) > 0 && w.err == nil {
+			if flushErr = w.flushAdmittedLocked(nil, nil, true); flushErr != nil {
+				break
+			}
 		}
-	}
-	seq := w.seq
-	w.mu.Unlock()
+		seq := w.seq
+		w.mu.Unlock()
 
-	w.ackMu.Lock()
-	w.progress = time.Now()
-	w.ackMu.Unlock()
+		w.ackMu.Lock()
+		w.progress = time.Now()
+		w.ackMu.Unlock()
 
-	w.wg.Wait()
+		<-w.flushDone
+		w.wg.Wait()
 
+		if err := w.Err(); err != nil {
+			w.closeErr = err
+		} else if flushErr != nil {
+			w.closeErr = flushErr
+		} else if err := w.ctx.Err(); err != nil {
+			w.closeErr = err
+		} else if err := w.await(seq); err != nil {
+			w.closeErr = err
+		} else {
+			w.closeErr = w.write(seq, slotEnd, nil)
+		}
+	})
+	return w.closeErr
+}
+
+func (w *slotWriter) Err() error {
 	w.mu.Lock()
-	err := w.err
-	w.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if err := w.await(seq); err != nil {
-		return err
-	}
-	return w.write(seq, slotEnd, nil)
+	defer w.mu.Unlock()
+	return w.err
 }
 
 type slotReader struct {
@@ -772,6 +851,7 @@ type slotReader struct {
 	wake chan struct{}
 	acks chan struct{}
 	grow chan struct{}
+	wg   sync.WaitGroup
 
 	mu      sync.Mutex
 	head    int64
@@ -841,13 +921,24 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		default:
 		}
 	}
-	go r.run()
-	go r.ackLoop()
+	r.wg.Add(2)
+	go func() {
+		defer r.wg.Done()
+		r.run()
+	}()
+	go func() {
+		defer r.wg.Done()
+		r.ackLoop()
+	}()
 	return r
 }
 
 func (r *slotReader) chunks() <-chan []byte {
 	return r.ch
+}
+
+func (r *slotReader) wait() {
+	r.wg.Wait()
 }
 
 // Wake has the head asked for now, as an answer is likely to come
@@ -911,7 +1002,11 @@ func (r *slotReader) run() {
 				if int64(i) <= slotReadAhead {
 					fetches[seq].enter()
 				}
-				go r.fetch(ctx, seq, i, fetches[seq])
+				r.wg.Add(1)
+				go func(f *slotFetch) {
+					defer r.wg.Done()
+					r.fetch(ctx, seq, i, f)
+				}(fetches[seq])
 			}
 			// Mixed inline/media traffic needs the same bound as a bulk stream.
 			if i < slotBodyAhead {
@@ -1006,13 +1101,29 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 
 	id := r.slotID(seq)
+	descriptionCtx, cancelDescription := context.WithCancel(ctx)
+	defer cancelDescription()
+	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
-	var goneSince, warnedAt, visibleSince time.Time
+	var goneSince, warnedAt, visibleSince, missingSince time.Time
 	for {
-		description, err := r.readSlotDescription(ctx, id, seq, f.promoted)
+		description, err := r.huntSlotDescription(descriptionCtx, id, seq, f.promoted, &hunt)
 		frame, ok := decodeSlot(description)
+		missing := err != nil || !ok || frame.seq != seq
+		r.mu.Lock()
+		progressPastHead := r.head == seq && r.frontier > seq
+		r.mu.Unlock()
+		if missing && progressPastHead {
+			if missingSince.IsZero() {
+				missingSince = time.Now()
+			} else if time.Since(missingSince) > r.stallTimeout {
+				f.err = errors.New("segment ", seq, " is missing despite later slot frames after ", r.stallTimeout).Base(err)
+				return
+			}
+		} else if !missing {
+			missingSince = time.Time{}
+		}
 		if err == errNotFound || (err == nil && description == "") {
-			// An absent or empty slot is idle, not a failure.
 			visibleSince = time.Time{}
 		}
 		switch {
@@ -1151,9 +1262,26 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 }
 
+type slotDescriptionResult struct {
+	description string
+	err         error
+}
+
+type slotDescriptionHunt struct {
+	results     chan slotDescriptionResult
+	outstanding int
+	last        slotDescriptionResult
+	seen        bool
+}
+
 func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
+	return r.huntSlotDescription(ctx, id, seq, promoted, &hunt)
+}
+
+func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}, pending *slotDescriptionHunt) (string, error) {
 	r.mu.Lock()
 	head := r.head == seq
 	if head {
@@ -1172,43 +1300,46 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 	hunt := func() {
 		head = true
 		promoted = nil
-		ticker = time.NewTicker(r.huntCeiling)
+		if ticker == nil {
+			ticker = time.NewTicker(r.huntCeiling)
+		}
 		ticks, wake = ticker.C, r.wake
 	}
 	if head {
 		hunt()
 	}
 
-	type result struct {
-		description string
-		err         error
-	}
-	results := make(chan result, 4)
-	outstanding := 0
+	// Yield observations for fetch's stall checks without canceling or
+	// restarting sibling requests. Their lifetime belongs to the fetch.
+	observationWindow := max(3*r.huntCeiling, min(r.stallTimeout/4, r.eagerWindow))
+	observationTimer := time.NewTimer(observationWindow)
+	defer observationTimer.Stop()
 	launch := func() {
-		outstanding++
+		pending.outstanding++
 		readCtx := ctx
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
 		}
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			r.reads.Add(1)
 			description, err := r.store.readDescription(readCtx, id)
-			results <- result{description, err}
+			pending.results <- slotDescriptionResult{description, err}
 		}()
 	}
-	launch()
-	var last result
-	seen := false
+	if pending.outstanding < 3 {
+		launch()
+	}
 	for {
 		select {
-		case res := <-results:
-			outstanding--
+		case res := <-pending.results:
+			pending.outstanding--
 			if !head || res.err != nil {
-				if head && outstanding > 0 {
-					// A failed sibling of the overlapping head hunt is not
-					// definitive while another read may be about to succeed,
-					// and returning would cancel it.
+				pending.last, pending.seen = res, true
+				if head && pending.outstanding > 0 {
+					// Give a pending sibling a chance to supply a valid frame
+					// before yielding this error to the outer retry path.
 					continue
 				}
 				return res.description, res.err
@@ -1216,7 +1347,7 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 			if frame, ok := decodeSlot(res.description); ok && frame.seq == seq {
 				return res.description, nil
 			}
-			last, seen = res, true
+			pending.last, pending.seen = res, true
 		case <-promoted:
 			// Keep the pending tail read in the head's overlap budget rather
 			// than waiting for it to finish before starting the head hunt.
@@ -1226,15 +1357,26 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 			idle := time.Since(r.activeAt) > r.eagerWindow
 			r.mu.Unlock()
 			switch {
-			case idle && seen:
-				return last.description, nil
-			case !idle && outstanding < 3:
+			case pending.seen && idle:
+				return pending.last.description, pending.last.err
+			case !idle && pending.outstanding < 3:
 				launch()
 			}
 		case <-wake:
-			if outstanding < 3 {
+			if pending.outstanding < 3 {
 				launch()
 			}
+		case <-observationTimer.C:
+			if pending.seen {
+				return pending.last.description, pending.last.err
+			}
+			r.mu.Lock()
+			progressPastHead := r.head == seq && r.frontier > seq
+			r.mu.Unlock()
+			if progressPastHead {
+				return "", nil
+			}
+			observationTimer.Reset(observationWindow)
 		case <-ctx.Done():
 			return "", ctx.Err()
 		}
@@ -1273,7 +1415,9 @@ func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([
 	}
 	results := make(chan result, 2)
 	launch := func() {
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			body, err := r.store.readBody(ctx, id)
 			results <- result{body, err}
 		}()
