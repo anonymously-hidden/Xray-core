@@ -355,6 +355,14 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, err
 	}
 
+	if streamSettings.Destination == nil && dest.Address != nil {
+		front := dest
+		front.Network = net.Network_TCP
+		patched := *streamSettings
+		patched.Destination = &front
+		streamSettings = &patched
+	}
+
 	p := paramsFromConfig(config)
 
 	var spare spareRing
