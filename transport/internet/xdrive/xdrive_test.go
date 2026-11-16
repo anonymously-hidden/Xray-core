@@ -1133,6 +1133,94 @@ func TestWALDeliversValidatedPrefixBeforeMissingSuffix(t *testing.T) {
 	}
 }
 
+func TestSpareRefillRechecksRestoredQueue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		box := &spareBox{ctx: ctx, cancel: cancel, ch: make(chan spareRing, spareCount), wake: make(chan struct{}, 1)}
+		cfg := &Config{Service: "invalid"}
+		fillSparesBox(box, &internet.MemoryStreamConfig{ProtocolSettings: cfg}, cfg, paramsFromConfig(cfg))
+		synctest.Wait()
+		box.mu.Lock()
+		for range spareCount {
+			box.ch <- spareRing{storage: &spareCloseCounter{}, at: time.Now()}
+		}
+		box.mu.Unlock()
+		<-time.NewTimer(2 * time.Second).C
+		synctest.Wait()
+		box.mu.Lock()
+		defer box.mu.Unlock()
+		if box.timer == nil || box.busy.Load() || len(box.ch) != spareCount {
+			t.Fatal("refill attempted construction after the queue was restored")
+		}
+		box.timer.Stop()
+	})
+}
+
+func TestCancelledDialDoesNotConsumeWarmSpare(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := &Config{Service: "google-drive"}
+		settings := &internet.MemoryStreamConfig{ProtocolSettings: cfg}
+		box := spareBoxFor(cfg, settings)
+		store := &spareCloseCounter{}
+		box.mu.Lock()
+		box.ch <- spareRing{storage: store, at: time.Now()}
+		box.mu.Unlock()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if conn, err := Dial(ctx, net.Destination{}, settings); conn != nil || err != context.Canceled || len(box.ch) != 1 || store.closes.Load() != 0 {
+			t.Fatalf("cancelled Dial consumed or exposed a spare: %v", err)
+		}
+		stopSpares(cfg)
+		<-box.done
+	})
+}
+
+type cleanupStateStorage struct {
+	Storage
+	fail  bool
+	calls int
+}
+
+func (s *cleanupStateStorage) List(context.Context, string) ([]Entry, error) {
+	return []Entry{{Name: "dead"}}, nil
+}
+
+func (s *cleanupStateStorage) Delete(context.Context, string) error {
+	s.calls++
+	if s.fail {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
+func TestFailedCleanupPreservesEstablishedAge(t *testing.T) {
+	store := &cleanupStateStorage{fail: true}
+	l := &Listener{ctx: context.Background(), storage: store, params: paramsFromConfig(&Config{}), idleSince: map[string]time.Time{"dead": time.Now().Add(-2 * defaultSessionTTL)}}
+	age := l.idleSince["dead"]
+	if err := l.collect(); err != io.ErrUnexpectedEOF || l.idleSince["dead"] != age {
+		t.Fatal("failed collection reset eligibility")
+	}
+	l.finishDrop(sessionPrefix("dead"), io.ErrUnexpectedEOF)
+	if l.idleSince["dead"] != age {
+		t.Fatal("failed queued cleanup reset eligibility")
+	}
+	store.fail = false
+	if err := l.collect(); err != nil || store.calls != 2 || !l.idleSince["dead"].IsZero() {
+		t.Fatal("eligible cleanup did not retry and clear on success")
+	}
+}
+
+func TestCollectPrunesOrphanAnnouncementWarnings(t *testing.T) {
+	l := &Listener{ctx: context.Background(), storage: &cleanupStateStorage{}, params: paramsFromConfig(&Config{}), announceWarned: map[string]bool{"orphan": true, "recent": true, "active": true}, active: map[string]bool{"active": true}, lastSeen: map[string]time.Time{"1-recent": time.Now()}}
+	if err := l.collect(); err != nil {
+		t.Fatal(err)
+	}
+	if l.announceWarned["orphan"] || !l.announceWarned["recent"] || !l.announceWarned["active"] {
+		t.Fatal("warning pruning lost guards or retained orphan state")
+	}
+}
+
 func TestSpareStopSignalsReaper(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		for _, busy := range []bool{false, true} {

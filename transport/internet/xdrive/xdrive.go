@@ -300,8 +300,14 @@ func fillSparesBox(box *spareBox, streamSettings *internet.MemoryStreamConfig, c
 				return
 			case <-time.After(2 * time.Second):
 			}
-			if box.stop.Load() {
+			box.mu.Lock()
+			stopped, full := box.stop.Load(), len(box.ch) == cap(box.ch)
+			box.mu.Unlock()
+			if stopped {
 				return
+			}
+			if full {
+				break
 			}
 			storage, err := newStorage(streamSettings)
 			if err != nil {
@@ -363,6 +369,9 @@ func fillSparesBox(box *spareBox, streamSettings *internet.MemoryStreamConfig, c
 }
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	config, err := streamConfig(streamSettings)
 	if err != nil {
 		return nil, err
@@ -432,6 +441,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		storage.Close()
+		return nil, err
+	}
 	if ok {
 		if !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
@@ -728,12 +741,12 @@ func (l *Listener) cleanupWorker() {
 		l.cleanupQueue[0] = ""
 		l.cleanupQueue = l.cleanupQueue[1:]
 		l.mu.Unlock()
-		l.drop(name)
-		l.finishDrop(name)
+		err := l.drop(name)
+		l.finishDrop(name, err)
 	}
 }
 
-func (l *Listener) finishDrop(name string) {
+func (l *Listener) finishDrop(name string, err error) {
 	l.mu.Lock()
 	delete(l.cleanupPending, name)
 	if strings.HasPrefix(name, streamsDir+"/") {
@@ -742,7 +755,9 @@ func (l *Listener) finishDrop(name string) {
 		if l.idleSince == nil {
 			l.idleSince = make(map[string]time.Time)
 		}
-		l.idleSince[session] = time.Now()
+		if err == nil || l.idleSince[session].IsZero() {
+			l.idleSince[session] = time.Now()
+		}
 	}
 	l.mu.Unlock()
 }
@@ -868,7 +883,6 @@ func (l *Listener) collect() error {
 		if now.Sub(since) >= l.sessionTTL {
 			l.collecting[session] = true
 			expired = append(expired, session)
-			delete(l.idleSince, session)
 		}
 	}
 	for session := range l.idleSince {
@@ -885,6 +899,11 @@ func (l *Listener) collect() error {
 	for session, at := range l.handled {
 		if !l.active[session] && !l.collecting[session] && !announced[session] && now.Sub(at) >= 2*l.sessionTTL {
 			delete(l.handled, session)
+			delete(l.announceWarned, session)
+		}
+	}
+	for session := range l.announceWarned {
+		if !l.active[session] && !l.collecting[session] && !announced[session] && l.handled[session].IsZero() {
 			delete(l.announceWarned, session)
 		}
 	}
@@ -906,8 +925,14 @@ func (l *Listener) collect() error {
 			case <-time.After(l.collectPause):
 			}
 		}
-		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil && first == nil {
-			first = err
+		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil {
+			if first == nil {
+				first = err
+			}
+		} else {
+			l.mu.Lock()
+			delete(l.idleSince, session)
+			l.mu.Unlock()
 		}
 	}
 	return first
