@@ -1092,6 +1092,7 @@ func (s *prefixBatchStorage) requiresWALCommit() bool { return s.committed }
 func (s *prefixBatchStorage) List(context.Context, string) ([]Entry, error) {
 	return []Entry{{Name: "000000000.seg"}, {Name: "000000001.seg"}}, nil
 }
+
 func (s *prefixBatchStorage) Get(_ context.Context, name string) ([]byte, error) {
 	if strings.HasSuffix(name, "000000000.seg") {
 		s.prefixReads.Add(1)
