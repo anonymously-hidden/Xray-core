@@ -202,6 +202,9 @@ func (c *Conn) closeOrdered(err error) error {
 		}
 	}
 	c.cancel()
+	if writer, ok := c.writer.(interface{ wait() }); ok {
+		writer.wait()
+	}
 	if reader, ok := c.reader.(interface{ wait() }); ok {
 		reader.wait()
 	}

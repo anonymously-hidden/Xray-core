@@ -280,6 +280,7 @@ type slotWriter struct {
 	flushStop chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+	closeDone chan struct{}
 
 	mu           sync.Mutex
 	buf          []byte
@@ -767,6 +768,9 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 			}
 			w.mu.Unlock()
 		}
+		if isAuthError(err) {
+			return err
+		}
 		if err == errNotFound {
 			// An eager ring whose watermark is gone was cleaned up; fail at
 			// once instead of waiting out the stall timeout.
@@ -803,6 +807,10 @@ func (w *slotWriter) fail(err error) {
 	defer w.mu.Unlock()
 	if w.err == nil {
 		w.err = err
+		if w.available != nil {
+			close(w.available)
+		}
+		w.available = make(chan struct{})
 	}
 }
 
@@ -844,14 +852,23 @@ func (w *slotWriter) Close() error {
 			w.ackMu.Unlock()
 		}
 		w.mu.Unlock()
+		w.closeDone = make(chan struct{})
 		done := make(chan error, 1)
-		go func() { done <- w.closeOrdered() }()
+		go func() {
+			defer close(w.closeDone)
+			done <- w.closeOrdered()
+		}()
 		w.closeErr = waitCloseProgress(done, w.ctx, w.closeProgress)
 		if w.cancel != nil {
 			w.cancel()
 		}
 	})
 	return w.closeErr
+}
+
+func (w *slotWriter) wait() {
+	w.Close()
+	<-w.closeDone
 }
 
 func (w *slotWriter) closeOrdered() error {
@@ -1157,10 +1174,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	backoff := r.huntFloor
 	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
 	for {
-		observations := hunt.observations
+		observations, present := hunt.observations, hunt.present
 		description, err := r.huntSlotDescription(descriptionCtx, id, seq, f.promoted, &hunt)
 		if hunt.observations != observations {
 			failedSince = time.Time{}
+		}
+		if hunt.present != present {
+			goneSince = time.Time{}
 		}
 		frame, ok := decodeSlot(description)
 		missing := err != nil || !ok || frame.seq != seq
@@ -1335,6 +1355,7 @@ type slotDescriptionHunt struct {
 	seen         bool
 	err          error
 	observations uint64
+	present      uint64
 }
 
 func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
@@ -1400,6 +1421,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			pending.outstanding--
 			if res.err == nil || res.err == errNotFound {
 				pending.observations++
+			}
+			if res.err == nil {
+				pending.present++
 			}
 			if !head {
 				return res.description, res.err

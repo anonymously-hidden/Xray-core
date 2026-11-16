@@ -1144,6 +1144,134 @@ func TestSlotClosePreservesPendingProgress(t *testing.T) {
 	}
 }
 
+type controlledSlots struct {
+	*memSlots
+	put  func(context.Context, string, string, []byte) error
+	desc func(context.Context, string) (string, error)
+}
+
+func (s *controlledSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if s.put != nil {
+		return s.put(ctx, id, description, body)
+	}
+	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func (s *controlledSlots) readDescription(ctx context.Context, id string) (string, error) {
+	if s.desc != nil {
+		return s.desc(ctx, id)
+	}
+	return s.memSlots.readDescription(ctx, id)
+}
+
+func TestSlotFailureWakesAdmissionWithoutReturningPermit(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		w := newSlotWriter(context.Background(), newMemSlots(), slotTable{Slots: []string{"slot"}}, paramsFromConfig(&Config{}))
+		w.slots <- struct{}{}
+		done := make(chan error, 1)
+		go func() { _, err := w.Write(make([]byte, slotInlineLimit)); done <- err }()
+		synctest.Wait()
+		failure := io.ErrUnexpectedEOF
+		started := time.Now()
+		w.fail(failure)
+		if err := <-done; err != failure || time.Now() != started || len(w.slots) != 1 {
+			t.Fatalf("admission failed to wake without freeing the permit: %v", err)
+		}
+		<-w.slots
+		w.cancel()
+		w.wait()
+	})
+}
+
+func TestConnCleanupJoinsActualSlotWriterCompletion(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		entered, release, cleaned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		store := &controlledSlots{memSlots: newMemSlots(), put: func(ctx context.Context, _, _ string, _ []byte) error {
+			close(entered)
+			<-ctx.Done()
+			<-release
+			return ctx.Err()
+		}}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		w := newSlotWriter(ctx, store, slotTable{Slots: []string{"slot"}}, paramsFromConfig(&Config{}))
+		if _, err := w.Write(make([]byte, slotInlineLimit)); err != nil {
+			t.Fatal(err)
+		}
+		<-entered
+		w.ackMu.Lock()
+		w.progress = time.Now().Add(-slotStallTimeout)
+		w.ackMu.Unlock()
+		c := &Conn{ctx: ctx, cancel: cancel, writer: w, closing: make(chan struct{}), readDeadline: newPipeDeadline(), writeDeadline: newPipeDeadline(), onClose: func() { close(cleaned) }}
+		started := time.Now()
+		if err := c.Close(); err != context.DeadlineExceeded || time.Now() != started {
+			t.Fatalf("public Close received a new budget: %v", err)
+		}
+		synctest.Wait()
+		select {
+		case <-cleaned:
+			t.Fatal("cleanup overlapped writer teardown")
+		default:
+		}
+		close(release)
+		w.wait()
+		<-cleaned
+	})
+}
+
+func TestSlotWriterWatermarkAuthFailureIsTerminal(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		failure := authError{code: "invalid_grant"}
+		calls := 0
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) { calls++; return "", failure }}
+		w := newSlotWriter(context.Background(), store, slotTable{Slots: []string{"slot"}, Watermark: "watermark"}, paramsFromConfig(&Config{}))
+		started := time.Now()
+		if err := w.awaitPrevious(1, nil); err != failure || calls != 1 || time.Now() != started {
+			t.Fatalf("authentication error retried or replaced: %v", err)
+		}
+		w.cancel()
+		w.wait()
+	})
+}
+
+func TestSlotFreshPresenceResetsAbsenceBudget(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		requests := make(chan struct{}, 1)
+		results := make(chan slotDescriptionResult)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(ctx context.Context, _ string) (string, error) {
+			requests <- struct{}{}
+			select {
+			case res := <-results:
+				return res.description, res.err
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}}
+		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), head: 1, frontier: -1, active: make(chan struct{}), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), media: make(chan struct{}), near: make(chan struct{})}
+		done := make(chan struct{})
+		go func() { defer close(done); r.fetch(ctx, 1, 0, f) }()
+		<-requests
+		results <- slotDescriptionResult{err: errNotFound}
+		<-requests
+		<-time.NewTimer(slotGoneTimeout).C
+		results <- slotDescriptionResult{description: newSlotFrame(0, slotInline, []byte("old")).encode()}
+		<-requests
+		results <- slotDescriptionResult{err: errNotFound}
+		synctest.Wait()
+		select {
+		case <-f.ready:
+			t.Fatalf("fresh presence did not reset absence budget: %v", f.err)
+		default:
+		}
+		cancel()
+		<-done
+		r.wait()
+	})
+}
+
 func TestSlotCloseUsesDrainProgress(t *testing.T) {
 	for _, stalled := range []bool{false, true} {
 		t.Run(strconv.FormatBool(stalled), func(t *testing.T) {
