@@ -186,14 +186,17 @@ func decodeRing(b []byte) (ring, bool) {
 	if len(r.Up.Slots) > maxConcurrency || len(r.Down.Slots) > maxConcurrency {
 		return ring{}, false
 	}
+	seen := make(map[string]bool, len(r.Up.Slots)+len(r.Down.Slots)+2)
 	for _, t := range []slotTable{r.Up, r.Down} {
-		if len(t.Watermark) > maxSlotIDLen {
+		if len(t.Watermark) > maxSlotIDLen || seen[t.Watermark] {
 			return ring{}, false
 		}
+		seen[t.Watermark] = true
 		for _, id := range t.Slots {
-			if len(id) == 0 || len(id) > maxSlotIDLen {
+			if len(id) == 0 || len(id) > maxSlotIDLen || seen[id] {
 				return ring{}, false
 			}
+			seen[id] = true
 		}
 	}
 	return r, true
@@ -284,6 +287,7 @@ type slotWriter struct {
 
 	mu           sync.Mutex
 	buf          []byte
+	bufBase      []byte
 	seq          int64
 	size         int
 	full         int
@@ -291,6 +295,7 @@ type slotWriter struct {
 	held         int
 	flushing     bool          // a flush is waiting for a token with mu released
 	available    chan struct{} // closed when an upload permit is returned; guarded by mu
+	failed       chan struct{}
 	bulkSegments int
 	bulkLimited  bool
 	throttles    int64
@@ -325,6 +330,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		flushDone: make(chan struct{}),
 		flushStop: make(chan struct{}),
 		available: make(chan struct{}),
+		failed:    make(chan struct{}),
 		size:      min(slotInlineLimit, p.segmentBytes),
 		acked:     -1,
 		progress:  time.Now(),
@@ -378,7 +384,7 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 			return accepted, err
 		}
 		n := min(len(p), w.segmentBytes-len(w.buf))
-		w.buf = append(w.buf, p[:n]...)
+		w.appendBufferLocked(p[:n])
 		accepted += n
 		p = p[n:]
 		for len(w.buf) >= w.size {
@@ -388,6 +394,22 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 		}
 	}
 	return accepted, nil
+}
+
+func (w *slotWriter) appendBufferLocked(p []byte) {
+	if w.bufBase == nil {
+		w.bufBase = w.buf[:0]
+	}
+	if len(w.buf)+len(p) > cap(w.buf) {
+		if len(w.buf)+len(p) <= cap(w.bufBase) {
+			w.buf = append(w.bufBase, w.buf...)
+		} else {
+			w.buf = append(w.buf, p...)
+			w.bufBase = w.buf[:0]
+			return
+		}
+	}
+	w.buf = append(w.buf, p...)
 }
 
 func (w *slotWriter) admissionErrorLocked(deadline, closing <-chan struct{}, allowClosed bool) error {
@@ -567,7 +589,13 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	}
 
 	chunk := bytes.Clone(w.buf[:n])
-	w.buf = append(w.buf[:0], w.buf[n:]...)
+	if w.bufBase == nil {
+		w.bufBase = w.buf[:0]
+	}
+	w.buf = w.buf[n:]
+	if len(w.buf) == 0 {
+		w.buf = w.bufBase
+	}
 	seq := w.seq
 	w.seq++
 	if seq == 0 && w.first != nil {
@@ -741,6 +769,12 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 	start := time.Now()
 	wait := w.ackRetry
 	for {
+		w.mu.Lock()
+		failure, failed := w.err, w.failed
+		w.mu.Unlock()
+		if failure != nil {
+			return failure
+		}
 		if err := w.ctx.Err(); err != nil {
 			return err
 		}
@@ -797,6 +831,7 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		select {
 		case <-w.ctx.Done():
 			return w.ctx.Err()
+		case <-failed:
 		case <-time.After(wait):
 		}
 	}
@@ -807,6 +842,9 @@ func (w *slotWriter) fail(err error) {
 	defer w.mu.Unlock()
 	if w.err == nil {
 		w.err = err
+		if w.failed != nil {
+			close(w.failed)
+		}
 		if w.available != nil {
 			close(w.available)
 		}
@@ -1160,6 +1198,9 @@ func (r *slotReader) reach(seq int64) {
 // behind it soon after it was asked for, then at the pace that segments come
 func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
 	defer func() {
+		if len(f.body) == 0 && !f.end && f.err == nil {
+			f.err = ctx.Err()
+		}
 		f.readyAt = time.Now()
 		close(f.ready)
 	}()

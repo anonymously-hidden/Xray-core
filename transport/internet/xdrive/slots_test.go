@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"math/rand"
@@ -1162,6 +1163,181 @@ func (s *controlledSlots) readDescription(ctx context.Context, id string) (strin
 		return s.desc(ctx, id)
 	}
 	return s.memSlots.readDescription(ctx, id)
+}
+
+func TestSlotTerminalFailureStopsAdmittedCreditWait(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		w := newSlotWriter(context.Background(), newMemSlots(), slotTable{Slots: []string{"slot"}, Watermark: "watermark"}, paramsFromConfig(&Config{}))
+		w.ackMu.Lock()
+		w.reading = true
+		w.ackMu.Unlock()
+		w.slots <- struct{}{}
+		w.wg.Add(1)
+		go w.upload(1, []byte("pending"), nil, &slotWriteResult{done: make(chan struct{})})
+		synctest.Wait()
+		failure := io.ErrUnexpectedEOF
+		started := time.Now()
+		w.fail(failure)
+		if err := w.Close(); err != failure || time.Now() != started {
+			t.Fatalf("admitted credit waiter masked terminal failure or delayed Close: %v", err)
+		}
+		w.wait()
+		if len(w.slots) != 0 {
+			t.Fatal("failed upload retained its permit")
+		}
+	})
+}
+
+func TestSlotCancelledFetchPublishesFailureNotEmptyChunk(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		for _, media := range []bool{false, true} {
+			ctx, cancel := context.WithCancel(context.Background())
+			store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
+				return newSlotFrame(0, slotMedia, []byte("body")).encode(), nil
+			}}
+			r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, tailMin: time.Hour, active: make(chan struct{}), grow: make(chan struct{}, 1), frontier: -1}
+			f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+			offset := 1
+			if media {
+				offset = 0
+			}
+			go r.fetch(ctx, 0, offset, f)
+			synctest.Wait()
+			if media && f.mode != slotMedia {
+				t.Fatal("fetch did not reach body admission")
+			}
+			cancel()
+			<-f.ready
+			if f.err != context.Canceled || len(f.body) != 0 || f.end {
+				t.Fatalf("cancelled fetch published successful readiness: %v", f.err)
+			}
+			r.wait()
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for _, f := range []*slotFetch{{body: []byte("completed")}, {end: true}, {err: io.ErrUnexpectedEOF}} {
+			f.ready = make(chan struct{})
+			r := &slotReader{tailMin: time.Hour}
+			r.fetch(ctx, 0, 1, f)
+			<-f.ready
+			if len(f.body) > 0 || f.end {
+				if f.err != nil {
+					t.Fatal("cancellation overwrote completed data or terminal frame")
+				}
+			} else if f.err != io.ErrUnexpectedEOF {
+				t.Fatal("cancellation overwrote the existing fetch error")
+			}
+		}
+	})
+}
+
+func TestSlotInlineBurstConsumesWithoutShiftingUnreadBytes(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		store := newMemSlots()
+		p := paramsFromConfig(&Config{Concurrency: 64})
+		r, err := makeRing(context.Background(), store, "buffer", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := newSlotWriter(context.Background(), store, r.Up, p)
+		payload := randomPayload(18 * slotInlineLimit)
+		w.mu.Lock()
+		w.appendBufferLocked(payload)
+		backing := w.buf
+		w.mu.Unlock()
+		for i := range 18 {
+			w.mu.Lock()
+			err := w.flushLocked(nil, nil)
+			if err != nil {
+				w.mu.Unlock()
+				t.Fatal(err)
+			}
+			consumed := (i + 1) * slotInlineLimit
+			if len(w.buf) != len(payload)-consumed || len(w.buf) > 0 && &w.buf[0] != &backing[consumed] || len(w.buf) == 0 && &w.buf[:1][0] != &backing[0] {
+				w.mu.Unlock()
+				t.Fatal("inline flush shifted unread bytes or discarded reusable backing")
+			}
+			w.mu.Unlock()
+			synctest.Wait()
+		}
+		store.mu.Lock()
+		var got []byte
+		for i := range 18 {
+			frame, ok := decodeSlot(store.descs[w.slotID(int64(i))])
+			if !ok || frame.mode != slotInline {
+				store.mu.Unlock()
+				t.Fatal("inline burst framing changed")
+			}
+			got = append(got, frame.data...)
+		}
+		store.mu.Unlock()
+		if !bytes.Equal(got, payload) {
+			t.Fatal("inline burst bytes changed")
+		}
+		w.mu.Lock()
+		w.appendBufferLocked(payload[:3*slotInlineLimit])
+		if err := w.flushLocked(nil, nil); err != nil {
+			w.mu.Unlock()
+			t.Fatal(err)
+		}
+		tail := &w.buf[0]
+		w.appendBufferLocked([]byte{8})
+		if &w.buf[0] != tail || &w.bufBase[:1][0] != &backing[0] {
+			w.mu.Unlock()
+			t.Fatal("append with tail capacity moved unread bytes")
+		}
+		unread := bytes.Clone(w.buf)
+		addition := bytes.Repeat([]byte{7}, cap(backing)-len(unread))
+		w.appendBufferLocked(addition)
+		if &w.buf[0] != &backing[0] || !bytes.Equal(w.buf, append(unread, addition...)) {
+			w.mu.Unlock()
+			t.Fatal("append failed to compact and reuse backing without losing unread bytes")
+		}
+		beforeGrowth := bytes.Clone(w.buf)
+		w.appendBufferLocked([]byte{9})
+		if &w.buf[0] == &backing[0] || &w.bufBase[:1][0] != &w.buf[0] || !bytes.Equal(w.buf, append(beforeGrowth, 9)) {
+			w.mu.Unlock()
+			t.Fatal("growth failed to refresh backing or preserve unread bytes")
+		}
+		grown := w.buf
+		w.buf = w.bufBase
+		w.appendBufferLocked([]byte{10})
+		if &w.buf[0] != &grown[0] || len(w.buf) != 1 || w.buf[0] != 10 {
+			w.mu.Unlock()
+			t.Fatal("reset failed to reuse grown backing")
+		}
+		w.buf = w.bufBase
+		w.mu.Unlock()
+		w.cancel()
+		w.wait()
+	})
+}
+
+func TestSlotRingRejectsEveryRepeatedPhysicalID(t *testing.T) {
+	ids := []string{"up0", "up1", "up-watermark", "down0", "down1", "down-watermark"}
+	decode := func(ids []string, lazy bool) bool {
+		r := ring{Up: slotTable{Slots: ids[:2], Watermark: ids[2]}, Down: slotTable{Slots: ids[3:5], Watermark: ids[5]}, Lazy: lazy}
+		body, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, ok := decodeRing(body)
+		return ok
+	}
+	for _, lazy := range []bool{false, true} {
+		if !decode(ids, lazy) {
+			t.Fatal("distinct physical IDs rejected")
+		}
+		for i := range ids {
+			for j := i + 1; j < len(ids); j++ {
+				repeated := append([]string(nil), ids...)
+				repeated[j] = repeated[i]
+				if decode(repeated, lazy) {
+					t.Fatalf("repeated physical IDs accepted at positions %d and %d", i, j)
+				}
+			}
+		}
+	}
 }
 
 func TestSlotFailureWakesAdmissionWithoutReturningPermit(t *testing.T) {
