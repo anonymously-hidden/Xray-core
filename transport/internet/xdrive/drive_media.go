@@ -72,6 +72,20 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 		parts = 1
 	}
 	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
+	if parts == 1 {
+		r := driveMediaRequest{end: frame.size, size: frame.size}
+		if len(s.mediaClients) > 0 {
+			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
+		}
+		body, err := s.readMediaRange(ctx, target, r)
+		if err != nil {
+			return nil, err
+		}
+		if !frame.holds(body) {
+			return nil, errors.New("Drive media ranges do not match the segment checksum")
+		}
+		return body, nil
+	}
 	width := (frame.size + parts - 1) / parts
 	type result struct {
 		start int

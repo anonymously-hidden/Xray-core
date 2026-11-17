@@ -1337,8 +1337,8 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, err
 	}
 
-	known := s.cachedFiles(flat, false)[flat]
-	for _, candidate := range append([]string{id}, known.extra...) {
+	known := mergeDriveFile(driveFile{id: id}, s.cachedFiles(flat, false)[flat])
+	for _, candidate := range append([]string{known.id}, known.extra...) {
 		payload, err := s.readBody(ctx, candidate)
 		if err == nil && len(payload) == 0 {
 			payload, err = s.getInline(ctx, candidate)

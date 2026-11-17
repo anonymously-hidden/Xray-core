@@ -2,6 +2,7 @@ package xdrive
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1119,6 +1120,32 @@ func TestDriveGetRetriesCachedDuplicateAfterEitherStage404(t *testing.T) {
 	}
 }
 
+func TestDriveGetIncludesConcurrentlyPromotedDuplicate(t *testing.T) {
+	flat := flatten("sessions/item")
+	var s *driveStorage
+	calls := make(map[string]int)
+	s = memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("alt") != "media" {
+			if r.URL.Query().Get("pageToken") == "next" {
+				s.retireID(flat, "gone")
+				return memoryResponse(http.StatusOK, `{"files":[]}`), nil
+			}
+			return memoryResponse(http.StatusOK, `{"nextPageToken":"next","files":[{"id":"gone","name":"sessions~item"},{"id":"kept","name":"sessions~item"},{"id":"kept","name":"sessions~item"}]}`), nil
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/files/")
+		calls[id]++
+		if id == "gone" {
+			return memoryResponse(http.StatusNotFound, ""), nil
+		}
+		return memoryResponse(http.StatusOK, "payload"), nil
+	}))
+	body, err := s.Get(context.Background(), "sessions/item")
+	known := s.cachedFiles(flat, false)[flat]
+	if err != nil || string(body) != "payload" || known.id != "kept" || len(known.extra) != 0 || calls["gone"] != 1 || calls["kept"] != 1 || len(calls) != 2 {
+		t.Fatalf("promoted duplicate was omitted or retried: err=%v candidates=%d", err, len(calls))
+	}
+}
+
 func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
@@ -1230,6 +1257,68 @@ func TestDriveMediaHeadOnlySplitsRanges(t *testing.T) {
 			got, err := s.readFrameBody(ctx, "item", frame)
 			if err != nil || string(got) != body || int(calls.Load()) != tc.calls {
 				t.Fatalf("head=%v cool=%v: ranges=%d err=%v", tc.head, tc.cool, calls.Load(), err)
+			}
+		}
+	})
+}
+
+type mediaBufferBody struct {
+	data []byte
+	last *byte
+}
+
+func (b *mediaBufferBody) Read(p []byte) (int, error) {
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	if n > 0 {
+		b.last = &p[n-1]
+	}
+	if len(b.data) == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (*mediaBufferBody) Close() error { return nil }
+
+func TestDriveSinglePartMediaReturnsValidatedRangeBuffer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		for _, tc := range []struct {
+			size, status     int
+			badCRC, badRange bool
+		}{{384, http.StatusOK, false, false}, {384, http.StatusPartialContent, false, false}, {512 << 10, http.StatusOK, false, false}, {512 << 10, http.StatusPartialContent, false, false}, {512 << 10, http.StatusPartialContent, true, false}, {512 << 10, http.StatusPartialContent, false, true}} {
+			payload := bytes.Repeat([]byte{7}, tc.size)
+			reader := &mediaBufferBody{data: payload}
+			calls := 0
+			s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Header.Get("Range") != fmt.Sprintf("bytes=0-%d", tc.size-1) {
+					t.Fatal("single-part range changed")
+				}
+				resp := memoryResponse(tc.status, "")
+				resp.Body = reader
+				resp.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", tc.size-1, tc.size))
+				if tc.badRange {
+					resp.Header.Set("Content-Range", fmt.Sprintf("bytes 1-%d/%d", tc.size, tc.size))
+				}
+				return resp, nil
+			}))
+			frame := newSlotFrame(1, slotMedia, payload)
+			if tc.badCRC {
+				frame.crc ^= 1
+			}
+			body, err := s.readFrameBody(context.Background(), "item", frame)
+			if tc.badCRC || tc.badRange {
+				if err == nil || body != nil {
+					t.Fatal("invalid single-part data was returned")
+				}
+			} else if err != nil || !bytes.Equal(body, payload) || tc.size <= 512 && &body[len(body)-1] != reader.last {
+				t.Fatalf("single-part range buffer was copied or changed: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if body, err := s.readFrameBody(ctx, "item", frame); body != nil || err != context.Canceled || calls != 1 {
+				t.Fatalf("single-part cancellation changed: %v", err)
 			}
 		}
 	})
