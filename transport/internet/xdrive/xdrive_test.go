@@ -1082,6 +1082,51 @@ func TestSpareProfilesStayIsolated(t *testing.T) {
 	})
 }
 
+type blockedWALFailureStorage struct {
+	Storage
+	entered, fail, marker, release chan struct{}
+}
+
+func (s *blockedWALFailureStorage) Put(_ context.Context, name string, _ []byte) error {
+	if strings.HasSuffix(name, segSuffix) {
+		close(s.entered)
+		<-s.fail
+		return io.ErrUnexpectedEOF
+	}
+	close(s.marker)
+	<-s.release
+	return nil
+}
+
+func TestWALFailureWakesAdmissionBeforeErrorMarkerFinishes(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		store := &blockedWALFailureStorage{entered: make(chan struct{}), fail: make(chan struct{}), marker: make(chan struct{}), release: make(chan struct{})}
+		w := newWALWriter(context.Background(), store, "session", params{concurrency: 1, segmentBytes: 1, flushInterval: time.Hour})
+		if _, err := w.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		<-store.entered
+		result := make(chan error, 1)
+		go func() { _, err := w.Write([]byte{2}); result <- err }()
+		synctest.Wait()
+		close(store.fail)
+		<-store.marker
+		synctest.Wait()
+		select {
+		case err := <-result:
+			if err == nil || len(w.sem) != 1 {
+				t.Fatal("failure was lost or error marker released its permit early")
+			}
+		default:
+			t.Error("admitted writer remained blocked behind failed error-marker upload")
+		}
+		close(store.release)
+		if err := w.Close(); err == nil {
+			t.Fatal("Close lost the upload failure")
+		}
+	})
+}
+
 type prefixBatchStorage struct {
 	Storage
 	committed, invalid bool

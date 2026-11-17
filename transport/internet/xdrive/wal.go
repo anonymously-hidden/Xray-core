@@ -50,6 +50,7 @@ type walWriter struct {
 	wg        sync.WaitGroup
 	flushDone chan struct{}
 	stop      chan struct{}
+	failed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
 
@@ -71,6 +72,7 @@ func newWALWriter(ctx context.Context, storage Storage, prefix string, p params)
 		sem:       make(chan struct{}, p.concurrency),
 		flushDone: make(chan struct{}),
 		stop:      make(chan struct{}),
+		failed:    make(chan struct{}),
 	}
 	go w.flushLoop()
 	return w
@@ -188,6 +190,9 @@ func (w *walWriter) flushLockedMode(deadline, closing <-chan struct{}, draining 
 	w.mu.Unlock()
 	select {
 	case w.sem <- struct{}{}:
+	case <-w.failed:
+		w.mu.Lock()
+		return w.err
 	case <-w.ctx.Done():
 		w.mu.Lock()
 		return w.ctx.Err()
@@ -254,6 +259,7 @@ func (w *walWriter) upload(seq int64, chunk []byte) {
 		w.mu.Lock()
 		if w.err == nil {
 			w.err = errors.New("failed to store segment").Base(err)
+			close(w.failed)
 		}
 		w.mu.Unlock()
 		w.storage.Put(w.ctx, objectName(w.prefix, seq, errSuffix), nil)
