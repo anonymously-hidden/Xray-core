@@ -1012,6 +1012,95 @@ func (okConn) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
+func TestSessionSelectionDoesNotOverdrawSharedRequestBudget(t *testing.T) {
+	pool := newConnPool(&splithttp.XmuxConfig{MaxConcurrency: &splithttp.RangeConfig{From: 1, To: 1}, HMaxRequestTimes: &splithttp.RangeConfig{From: 1, To: 1}}, func(context.Context) *http.Client {
+		return &http.Client{Transport: okConn{}}
+	})
+	defer pool.Close()
+	a, b := &sessionTransport{pool: pool}, &sessionTransport{pool: pool}
+	defer a.Close()
+	defer b.Close()
+	send := func(transport *sessionTransport) *splithttp.XmuxClient {
+		req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/files", nil)
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return transport.client
+	}
+	first, second, replacement := send(a), send(b), send(a)
+	if first == second || replacement == first || replacement == second || first.LeftRequests.Load() != 0 || second.LeftRequests.Load() != 0 || replacement.LeftRequests.Load() != 0 || second.Running.Load() != 1 || replacement.Running.Load() != 1 {
+		t.Fatal("selection over-reserved a request or concurrency allowance")
+	}
+}
+
+func TestSessionStallUsesSuccessFromOtherSharingSession(t *testing.T) {
+	pool := newConnPool(nil, func(context.Context) *http.Client { return &http.Client{Transport: okConn{}} })
+	defer pool.Close()
+	a, b := &sessionTransport{pool: pool}, &sessionTransport{pool: pool}
+	defer a.Close()
+	defer b.Close()
+	req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/files", nil)
+	resp, err := a.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	a.takenAt = time.Now().Add(-2 * stalledGrace)
+	began := time.Now().Add(-time.Nanosecond)
+	other, err := b.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Body.Close()
+	conn := a.client.XmuxConn.(*poolConn)
+	if b.client != a.client || !a.servedAt.IsZero() {
+		t.Fatal("regression did not isolate another session's success")
+	}
+	a.stalled(began, conn)
+	if conn.IsClosed() {
+		t.Fatal("first isolated stall retired a shared healthy connection")
+	}
+	a.stalled(began, conn)
+	if !conn.IsClosed() {
+		t.Fatal("shared service suppressed the existing second strike")
+	}
+}
+
+func TestSessionServicePublicationKeepsSessionAndConnectionTogether(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		pool := newConnPool(nil, func(context.Context) *http.Client { return &http.Client{Transport: okConn{}} })
+		defer pool.Close()
+		a, b := &sessionTransport{pool: pool}, &sessionTransport{pool: pool}
+		defer a.Close()
+		defer b.Close()
+		req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/files", nil)
+		resp, err := a.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		other, err := b.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		other.Body.Close()
+		conn := a.client.XmuxConn.(*poolConn)
+		if conn.servedBy != b || !a.servedAt.IsZero() || b.servedAt != conn.servedAt {
+			t.Fatal("shared service lost the serving session's identity")
+		}
+		resp.Body.Close()
+		if conn.servedBy != a || a.servedAt != conn.servedAt {
+			t.Fatal("session and connection service records diverged")
+		}
+		a.takenAt, a.servedAt = time.Now().Add(-2*stalledGrace), time.Time{}
+		a.stalled(time.Now().Add(-time.Nanosecond), conn)
+		if !conn.IsClosed() {
+			t.Fatal("own shared record overrode explicit session service state")
+		}
+	})
+}
+
 func TestSessionRetiresStalledConn(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		made := atomic.Int32{}
@@ -1314,6 +1403,55 @@ func TestSessionStallTracksSelectedConnection(t *testing.T) {
 type closeTestWriter struct{ connWriter }
 
 func (closeTestWriter) Close() error { return nil }
+
+type bufferedTestReader struct {
+	chunkReader
+	ch chan []byte
+}
+
+func (r *bufferedTestReader) chunks() <-chan []byte { return r.ch }
+
+func TestConnEmptyReadDoesNotConsumePendingChunk(t *testing.T) {
+	reader := &bufferedTestReader{ch: make(chan []byte, 1)}
+	reader.ch <- []byte("pending")
+	c := &Conn{reader: reader, closing: make(chan struct{}), readDeadline: newPipeDeadline()}
+	if n, err := c.Read(nil); n != 0 || err != nil || len(reader.ch) != 1 || c.readBuf != nil {
+		t.Fatalf("empty read consumed a pending chunk: %v", err)
+	}
+	reader.ch = nil
+	if n, err := c.Read(nil); n != 0 || err != nil {
+		t.Fatalf("empty read waited for unavailable data: %v", err)
+	}
+	c.readDeadline.set(time.Now().Add(-time.Second))
+	if _, err := c.Read(nil); err != os.ErrDeadlineExceeded {
+		t.Fatal("empty read bypassed deadline state")
+	}
+	close(c.closing)
+	if _, err := c.Read(nil); err != io.ErrClosedPipe {
+		t.Fatal("empty read bypassed closed state")
+	}
+}
+
+func TestConnConsumedChunkReleasesBackingBuffer(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		reader := &bufferedTestReader{ch: make(chan []byte, 1)}
+		payload := bytes.Repeat([]byte{7}, 512<<10)
+		reader.ch <- payload
+		c := &Conn{reader: reader, closing: make(chan struct{}), readDeadline: newPipeDeadline()}
+		got := make([]byte, len(payload))
+		offset := 0
+		if split {
+			n, err := c.Read(got[:1])
+			if n != 1 || err != nil || len(c.readBuf) != len(payload)-1 {
+				t.Fatalf("partial chunk was not retained: %v", err)
+			}
+			offset = n
+		}
+		if n, err := c.Read(got[offset:]); err != nil || n != len(payload)-offset || !bytes.Equal(got, payload) || c.readBuf != nil {
+			t.Fatalf("consumed chunk retained backing or changed bytes: %v", err)
+		}
+	}
+}
 
 type closeTestReader struct {
 	chunkReader

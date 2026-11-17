@@ -565,6 +565,8 @@ type poolConn struct {
 	mu       sync.Mutex
 	inflight int
 	closing  bool
+	servedAt time.Time
+	servedBy *sessionTransport
 }
 
 func (c *poolConn) IsClosed() bool {
@@ -677,7 +679,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	client := t.client
 	var conn *poolConn
-	if client != nil && client.LeftRequests.Add(-1) >= 0 && (client.UnreusableAt.IsZero() || !time.Now().After(client.UnreusableAt)) {
+	t.pool.mu.Lock()
+	if client != nil && client.LeftRequests.Load() > 0 && (client.UnreusableAt.IsZero() || !time.Now().After(client.UnreusableAt)) {
+		client.LeftRequests.Add(-1)
 		// counted under mu and against Close, or another request of the session
 		// that moves on, or another session of the pool that retires the
 		// connection, could close it before this one is sent
@@ -686,6 +690,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			conn = nil
 		}
 	}
+	t.pool.mu.Unlock()
 	for try := 0; conn == nil; try++ {
 		t.pool.mu.Lock()
 		if t.pool.closed || r.Context().Err() != nil {
@@ -697,9 +702,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			return nil, errSessionClosed
 		}
 		next := t.pool.xmux.GetXmuxClient(r.Context())
-		t.pool.mu.Unlock()
 		next.AddRunning()
 		next.LeftRequests.Add(-1)
+		t.pool.mu.Unlock()
 		if client != nil {
 			client.DoneRunning()
 			t.movedAt = time.Now()
@@ -727,8 +732,14 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if err == nil {
 		resp.Body = &servedBody{ReadCloser: resp.Body, ctx: r.Context(), served: sync.OnceFunc(func() {
 			t.mu.Lock()
+			now := time.Now()
+			conn.mu.Lock()
+			if !now.Before(conn.servedAt) {
+				conn.servedAt, conn.servedBy = now, t
+			}
+			conn.mu.Unlock()
 			if t.client == client {
-				t.servedAt = time.Now()
+				t.servedAt = maxTime(t.servedAt, now)
 			}
 			t.mu.Unlock()
 		})}
@@ -772,17 +783,24 @@ func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {
 	} else if began.Before(t.movedAt) {
 		return
 	}
-	now := time.Now()
-	if t.servedAt.IsZero() && now.Sub(t.takenAt) < stalledGrace {
+	if t.client == nil {
 		return
 	}
-	if t.client == nil {
+	conn := t.client.XmuxConn.(*poolConn)
+	conn.mu.Lock()
+	servedAt := t.servedAt
+	if conn.servedBy != t {
+		servedAt = maxTime(servedAt, conn.servedAt)
+	}
+	conn.mu.Unlock()
+	now := time.Now()
+	if servedAt.IsZero() && now.Sub(t.takenAt) < stalledGrace {
 		return
 	}
 	// A connection that has served nothing since this request began is dead
 	// already, so its first stall retires it. One that still served other
 	// requests meanwhile keeps the two-strikes rule against a lone hiccup.
-	if t.servedAt.After(began) {
+	if servedAt.After(began) {
 		slow := now.Sub(t.slowAt) < 3*time.Second
 		t.slowAt = now
 		if !slow || now.Sub(t.retiredAt) < 2*time.Second {

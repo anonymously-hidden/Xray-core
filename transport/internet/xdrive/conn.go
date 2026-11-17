@@ -91,6 +91,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 		return 0, os.ErrDeadlineExceeded
 	default:
 	}
+	if len(b) == 0 {
+		return 0, nil
+	}
 	if len(c.readBuf) > 0 {
 		// Check state again before consuming buffered bytes: deadline or Close
 		// may have happened after we filled readBuf but before this Read call.
@@ -106,6 +109,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 		}
 		n := copy(b, c.readBuf)
 		c.readBuf = c.readBuf[n:]
+		if len(c.readBuf) == 0 {
+			c.readBuf = nil
+		}
 		return n, nil
 	}
 	data, err := c.receive()
@@ -115,6 +121,9 @@ func (c *Conn) Read(b []byte) (int, error) {
 	c.readBuf = data
 	n := copy(b, c.readBuf)
 	c.readBuf = c.readBuf[n:]
+	if len(c.readBuf) == 0 {
+		c.readBuf = nil
+	}
 	return n, nil
 }
 
