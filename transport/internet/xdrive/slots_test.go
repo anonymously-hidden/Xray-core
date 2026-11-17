@@ -1395,6 +1395,131 @@ func TestConnCleanupJoinsActualSlotWriterCompletion(t *testing.T) {
 	})
 }
 
+func TestSlotHeadAuthFailureDoesNotWaitForSiblingReads(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		failure := authError{code: "invalid_grant"}
+		entered := make(chan struct{}, 3)
+		answers := make(chan slotDescriptionResult)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(ctx context.Context, _ string) (string, error) {
+			entered <- struct{}{}
+			select {
+			case res := <-answers:
+				return res.description, res.err
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}}
+		r := &slotReader{ctx: ctx, store: store, params: params{eagerWindow: time.Hour}, head: 0, activeAt: time.Now(), huntCeiling: time.Millisecond, stallTimeout: time.Hour}
+		done := make(chan error, 1)
+		go func() { _, err := r.readSlotDescription(ctx, "slot", 0, nil); done <- err }()
+		for range 3 {
+			<-entered
+		}
+		started := time.Now()
+		answers <- slotDescriptionResult{err: failure}
+		if err := <-done; err != failure || time.Now() != started {
+			t.Fatalf("permanent auth failure waited for sibling reads: %v", err)
+		}
+		r.wait()
+	})
+}
+
+func TestSlotMediaAuthFailurePublishesImmediately(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		failure := authError{code: "invalid_grant"}
+		calls := 0
+		store := &validatedFrameSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
+			return newSlotFrame(0, slotMedia, []byte("body")).encode(), nil
+		}}, read: func(context.Context, string, slotFrame) ([]byte, error) { calls++; return nil, failure }}
+		r := &slotReader{ctx: context.Background(), store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), head: 0, frontier: -1, active: make(chan struct{}), grow: make(chan struct{}, 1), huntCeiling: time.Millisecond, stallTimeout: time.Hour}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+		close(f.media)
+		started := time.Now()
+		r.fetch(r.ctx, 0, 0, f)
+		r.wait()
+		if f.err != failure || calls != 1 || time.Now() != started || len(f.body) != 0 {
+			t.Fatalf("permanent media auth failure retried or was replaced: %v", f.err)
+		}
+	})
+}
+
+func TestSlotTailAuthFailureCancelsBlockedHead(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		for _, media := range []bool{false, true} {
+			failure := authError{code: "invalid_grant"}
+			ctx, cancel := context.WithCancel(context.Background())
+			entered := make(chan struct{})
+			store := &validatedFrameSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(ctx context.Context, id string) (string, error) {
+				if id == "head" {
+					close(entered)
+					<-ctx.Done()
+					return "", ctx.Err()
+				}
+				if media {
+					return newSlotFrame(1, slotMedia, []byte("body")).encode(), nil
+				}
+				return "", failure
+			}}, read: func(context.Context, string, slotFrame) ([]byte, error) { return nil, failure }}
+			r := &slotReader{ctx: ctx, stop: cancel, store: store, table: slotTable{Slots: []string{"head", "tail"}}, params: paramsFromConfig(&Config{}), active: make(chan struct{}), grow: make(chan struct{}, 1), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: time.Hour}
+			makeFetch := func() *slotFetch {
+				f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+				close(f.near)
+				close(f.media)
+				return f
+			}
+			head, tail := makeFetch(), makeFetch()
+			go r.fetch(ctx, 0, 0, head)
+			<-entered
+			started := time.Now()
+			r.fetch(ctx, 1, 1, tail)
+			<-head.ready
+			r.wait()
+			if r.Err() != failure || tail.err != failure || ctx.Err() != context.Canceled || time.Now() != started {
+				t.Fatal("lookahead auth failure waited for head completion or failed to cancel siblings")
+			}
+		}
+	})
+}
+
+type validatedFrameSlots struct {
+	*controlledSlots
+	read func(context.Context, string, slotFrame) ([]byte, error)
+}
+
+func (s *validatedFrameSlots) readFrameBody(ctx context.Context, id string, frame slotFrame) ([]byte, error) {
+	return s.read(ctx, id, frame)
+}
+
+func TestSlotMediaReaderPreservesValidatedDelegationAndGenericChecks(t *testing.T) {
+	body := []byte("validated")
+	frame := newSlotFrame(0, slotMedia, body)
+	delegated := &validatedFrameSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots()}, read: func(ctx context.Context, id string, got slotFrame) ([]byte, error) {
+		if ctx.Value(mediaHeadKey{}) == nil || id != "slot" || !got.holds(body) {
+			t.Fatal("validated reader lost head context, identity, or checksum contract")
+		}
+		return body, nil
+	}}
+	r := &slotReader{store: delegated, head: 0}
+	if got, err := r.readMediaBody(context.Background(), "slot", 0, frame); err != nil || &got[0] != &body[0] {
+		t.Fatalf("validated delegation changed buffer or result: %v", err)
+	}
+	generic := newMemSlots()
+	r.store = generic
+	for _, data := range [][]byte{body, []byte("corrupted"), body[:2]} {
+		generic.bodies["slot"] = data
+		got, err := r.readMediaBody(context.Background(), "slot", 0, frame)
+		if bytes.Equal(data, body) {
+			if err != nil || !bytes.Equal(got, body) {
+				t.Fatalf("valid generic media body rejected: %v", err)
+			}
+		} else if err == nil {
+			t.Fatal("generic body bypassed checksum or length validation")
+		}
+	}
+}
+
 func TestSlotWriterWatermarkAuthFailureIsTerminal(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		failure := authError{code: "invalid_grant"}

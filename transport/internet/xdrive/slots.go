@@ -1273,21 +1273,14 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					return
 				}
 				began := time.Now()
-				var body []byte
-				var bodyErr error
-				if store, ok := r.store.(interface {
-					readFrameBody(context.Context, string, slotFrame) ([]byte, error)
-				}); ok {
-					bodyCtx := ctx
-					if r.isHead(seq) {
-						bodyCtx = context.WithValue(ctx, mediaHeadKey{}, true)
-					}
-					body, bodyErr = store.readFrameBody(bodyCtx, id, frame)
-				} else {
-					body, bodyErr = r.readBodyHedged(ctx, id, frame.size)
-				}
+				body, bodyErr := r.readMediaBody(ctx, id, seq, frame)
 				f.bodyTime += time.Since(began)
-				if bodyErr == nil && frame.holds(body) {
+				if isAuthError(bodyErr) {
+					f.err = bodyErr
+					r.setErr(bodyErr)
+					return
+				}
+				if bodyErr == nil {
 					f.body = body
 					r.hit()
 					return
@@ -1337,6 +1330,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		case err != nil:
 			if isAuthError(err) {
 				f.err = err
+				r.setErr(err)
 				return
 			}
 			if failedSince.IsZero() {
@@ -1397,6 +1391,24 @@ type slotDescriptionHunt struct {
 	err          error
 	observations uint64
 	present      uint64
+}
+
+// Frame-aware stores validate the complete size and checksum before returning;
+// only generic body readers need the validation here.
+func (r *slotReader) readMediaBody(ctx context.Context, id string, seq int64, frame slotFrame) ([]byte, error) {
+	if store, ok := r.store.(interface {
+		readFrameBody(context.Context, string, slotFrame) ([]byte, error)
+	}); ok {
+		if r.isHead(seq) {
+			ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+		}
+		return store.readFrameBody(ctx, id, frame)
+	}
+	body, err := r.readBodyHedged(ctx, id, frame.size)
+	if err == nil && !frame.holds(body) {
+		err = errors.New("slot body does not match the segment checksum")
+	}
+	return body, err
 }
 
 func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
@@ -1460,6 +1472,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		select {
 		case res := <-pending.results:
 			pending.outstanding--
+			if isAuthError(res.err) {
+				return "", res.err
+			}
 			if res.err == nil || res.err == errNotFound {
 				pending.observations++
 			}
