@@ -171,9 +171,11 @@ type driveShared struct {
 	tokenBackoff  time.Duration
 	lastTokenErr  error
 
-	idMu   sync.Mutex
-	ids    map[string]string
-	dupIDs map[string][]string
+	idMu       sync.Mutex
+	ids        map[string]string
+	dupIDs     map[string][]string
+	knownIDs   map[string]map[string]struct{}
+	missingIDs map[string]map[string]struct{}
 
 	coolMu        sync.Mutex
 	coolUntil     time.Time
@@ -836,7 +838,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if errors.Cause(err) == errSessionClosed {
 				return 0, nil, lastErr
 			}
-			if createOnce {
+			if createOnce && dispatched.Load() {
 				return 0, nil, createAmbiguityError{err: lastErr}
 			}
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
@@ -864,11 +866,11 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				return 0, nil, ctx.Err()
 			}
 			lastErr = errors.New("failed to read the Drive response").Base(err)
-			if !createOnce {
+			if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests && !(resp.StatusCode == http.StatusForbidden && rateLimited(payload)) {
+				if createOnce {
+					return 0, nil, createAmbiguityError{err: lastErr}
+				}
 				continue
-			}
-			if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests {
-				return 0, nil, createAmbiguityError{err: lastErr}
 			}
 		}
 		if int64(len(payload)) > limit {
@@ -1031,6 +1033,28 @@ func (s *driveStorage) rememberID(name, id string, extra []string) {
 		return
 	}
 	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	s.retireIDsLocked(name, s.missingIDs[name])
+	s.rememberIDLocked(name, id, extra)
+}
+
+func (s *driveStorage) rememberListedIDs(name string, listed []string) {
+	if len(listed) == 0 {
+		return
+	}
+	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	s.retireIDsLocked(name, s.missingIDs[name])
+	id := s.ids[name]
+	if id == "" {
+		id = listed[0]
+	}
+	extra := append([]string(nil), listed...)
+	slices.Reverse(extra)
+	s.rememberIDLocked(name, id, extra)
+}
+
+func (s *driveStorage) rememberIDLocked(name, id string, extra []string) {
 	if s.ids == nil {
 		s.ids = make(map[string]string)
 	}
@@ -1038,6 +1062,8 @@ func (s *driveStorage) rememberID(name, id string, extra []string) {
 		for victim := range s.ids {
 			delete(s.ids, victim)
 			delete(s.dupIDs, victim)
+			delete(s.knownIDs, victim)
+			delete(s.missingIDs, victim)
 			if len(s.ids) < idCacheMax {
 				break
 			}
@@ -1049,8 +1075,13 @@ func (s *driveStorage) rememberID(name, id string, extra []string) {
 	}
 	s.ids[name] = id
 	var duplicates []string
+	seen := make(map[string]struct{}, len(extra))
 	for _, candidate := range extra {
-		if candidate != "" && candidate != id && !slices.Contains(duplicates, candidate) {
+		if candidate == "" || candidate == id {
+			continue
+		}
+		if _, ok := seen[candidate]; !ok {
+			seen[candidate] = struct{}{}
 			duplicates = append(duplicates, candidate)
 		}
 	}
@@ -1059,30 +1090,79 @@ func (s *driveStorage) rememberID(name, id string, extra []string) {
 			s.dupIDs = make(map[string][]string)
 		}
 		s.dupIDs[name] = duplicates
+	} else {
+		delete(s.dupIDs, name)
 	}
-	s.idMu.Unlock()
+	seen[id] = struct{}{}
+	if s.knownIDs == nil {
+		s.knownIDs = make(map[string]map[string]struct{})
+	}
+	s.knownIDs[name] = seen
 }
 
 func (s *driveStorage) forgetID(name string) {
 	s.idMu.Lock()
 	delete(s.ids, name)
 	delete(s.dupIDs, name)
+	delete(s.knownIDs, name)
+	delete(s.missingIDs, name)
 	s.idMu.Unlock()
 }
 
-func (s *driveStorage) retireID(name, id string) {
+func (s *driveStorage) markMissingID(name, id string) {
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
+	if _, known := s.knownIDs[name][id]; !known {
+		return
+	}
+	if s.missingIDs == nil {
+		s.missingIDs = make(map[string]map[string]struct{})
+	}
+	if s.missingIDs[name] == nil {
+		s.missingIDs[name] = make(map[string]struct{})
+	}
+	s.missingIDs[name][id] = struct{}{}
+}
+
+func (s *driveStorage) retireID(name, id string) {
+	s.retireIDs(name, map[string]struct{}{id: {}})
+}
+
+func (s *driveStorage) retireIDs(name string, retired map[string]struct{}) {
+	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	s.retireIDsLocked(name, retired)
+}
+
+func (s *driveStorage) retireMissingIDs(name string) {
+	s.idMu.Lock()
+	defer s.idMu.Unlock()
+	s.retireIDsLocked(name, s.missingIDs[name])
+}
+
+func (s *driveStorage) retireIDsLocked(name string, retired map[string]struct{}) {
+	if len(retired) == 0 {
+		return
+	}
 	known := append([]string{s.ids[name]}, s.dupIDs[name]...)
 	kept := known[:0]
 	for _, candidate := range known {
-		if candidate != "" && candidate != id {
+		if _, gone := retired[candidate]; candidate != "" && !gone {
 			kept = append(kept, candidate)
 		}
+	}
+	for id := range retired {
+		delete(s.missingIDs[name], id)
+		delete(s.knownIDs[name], id)
+	}
+	if len(s.missingIDs[name]) == 0 {
+		delete(s.missingIDs, name)
 	}
 	if len(kept) == 0 {
 		delete(s.ids, name)
 		delete(s.dupIDs, name)
+		delete(s.knownIDs, name)
+		delete(s.missingIDs, name)
 		return
 	}
 	s.ids[name] = kept[0]
@@ -1099,7 +1179,24 @@ func (s *driveStorage) cachedFiles(flat string, descendants bool) map[string]dri
 	found := make(map[string]driveFile)
 	for name, id := range s.ids {
 		if name == flat || descendants && strings.HasPrefix(name, flat+flatSeparator) {
-			found[name] = driveFile{id: id, extra: append([]string(nil), s.dupIDs[name]...)}
+			if len(s.missingIDs[name]) == 0 {
+				found[name] = driveFile{id: id, extra: append([]string(nil), s.dupIDs[name]...)}
+				continue
+			}
+			file := driveFile{}
+			for _, candidate := range append([]string{id}, s.dupIDs[name]...) {
+				if _, missing := s.missingIDs[name][candidate]; missing {
+					continue
+				}
+				if file.id == "" {
+					file.id = candidate
+				} else {
+					file.extra = append(file.extra, candidate)
+				}
+			}
+			if file.id != "" {
+				found[name] = file
+			}
 		}
 	}
 	return found
@@ -1111,8 +1208,17 @@ func mergeDriveFile(first, next driveFile) driveFile {
 		first.extra = append([]string(nil), next.extra...)
 		return first
 	}
+	seen := make(map[string]struct{}, len(first.extra)+len(next.extra)+2)
+	seen[first.id] = struct{}{}
+	for _, id := range first.extra {
+		seen[id] = struct{}{}
+	}
 	for _, id := range append([]string{next.id}, next.extra...) {
-		if id != "" && id != first.id && !slices.Contains(first.extra, id) {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; !ok {
+			seen[id] = struct{}{}
 			first.extra = append(first.extra, id)
 		}
 	}
@@ -1122,8 +1228,17 @@ func mergeDriveFile(first, next driveFile) driveFile {
 func (s *driveStorage) cachedID(name string) (string, bool) {
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
-	id, ok := s.ids[name]
-	return id, ok
+	if id := s.ids[name]; id != "" {
+		if _, missing := s.missingIDs[name][id]; !missing {
+			return id, true
+		}
+		for _, candidate := range s.dupIDs[name] {
+			if _, missing := s.missingIDs[name][candidate]; !missing {
+				return candidate, true
+			}
+		}
+	}
+	return "", false
 }
 
 type driveFile struct {
@@ -1134,6 +1249,7 @@ type driveFile struct {
 
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
 	found := make(map[string]driveFile)
+	seen := make(map[string]map[string]struct{})
 	pageToken := ""
 	fields := "nextPageToken,files(id,name,description)"
 	if ctx.Value(namesOnlyKey{}) != nil {
@@ -1172,12 +1288,31 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 			return found, errors.New("failed to parse the Drive listing").Base(err)
 		}
 
+		listed := make(map[string][]string)
 		for _, file := range parsed.Files {
 			if file.ID == "" {
 				continue
 			}
-			found[file.Name] = mergeDriveFile(found[file.Name], driveFile{id: file.ID, description: file.Description})
-			s.rememberID(file.Name, file.ID, nil)
+			listed[file.Name] = append(listed[file.Name], file.ID)
+			ids := seen[file.Name]
+			if ids == nil {
+				ids = make(map[string]struct{})
+				seen[file.Name] = ids
+			}
+			if _, duplicate := ids[file.ID]; duplicate {
+				continue
+			}
+			ids[file.ID] = struct{}{}
+			known := found[file.Name]
+			if known.id == "" {
+				known.id, known.description = file.ID, file.Description
+			} else {
+				known.extra = append(known.extra, file.ID)
+			}
+			found[file.Name] = known
+		}
+		for name, ids := range listed {
+			s.rememberListedIDs(name, ids)
 		}
 
 		pageToken = parsed.NextPageToken
@@ -1205,11 +1340,11 @@ func (s *driveStorage) resolveID(ctx context.Context, flat string) (string, erro
 		return id, nil
 	}
 	found, err := s.query(context.WithValue(ctx, namesOnlyKey{}, true), "name = '"+quoteDriveValue(flat)+"'")
-	if err != nil {
-		return "", err
-	}
 	if file, ok := found[flat]; ok {
 		return file.id, nil
+	}
+	if err != nil {
+		return "", err
 	}
 	return "", errNotFound
 }
@@ -1338,15 +1473,35 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 	}
 
 	known := mergeDriveFile(driveFile{id: id}, s.cachedFiles(flat, false)[flat])
-	for _, candidate := range append([]string{known.id}, known.extra...) {
-		payload, err := s.readBody(ctx, candidate)
-		if err == nil && len(payload) == 0 {
-			payload, err = s.getInline(ctx, candidate)
+	candidates := append([]string{known.id}, known.extra...)
+	tried := make(map[string]struct{}, len(candidates))
+	missing := make(map[string]struct{}, len(candidates))
+	defer s.retireMissingIDs(flat)
+	var refreshErr error
+	for round := range 2 {
+		if round > 0 {
+			s.retireMissingIDs(flat)
+			candidates, refreshErr = s.resolveIDs(ctx, flat)
+			s.retireIDs(flat, missing)
 		}
-		if err != errNotFound {
-			return payload, err
+		for _, candidate := range candidates {
+			if _, ok := tried[candidate]; ok {
+				continue
+			}
+			tried[candidate] = struct{}{}
+			payload, err := s.readBody(ctx, candidate)
+			if err == nil && len(payload) == 0 {
+				payload, err = s.getInline(ctx, candidate)
+			}
+			if err != errNotFound {
+				return payload, err
+			}
+			missing[candidate] = struct{}{}
+			s.markMissingID(flat, candidate)
 		}
-		s.retireID(flat, candidate)
+	}
+	if refreshErr != nil {
+		return nil, refreshErr
 	}
 	return nil, errNotFound
 }

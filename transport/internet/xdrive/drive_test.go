@@ -24,6 +24,7 @@ import (
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
 type fakeFile struct {
@@ -807,6 +808,46 @@ type failingDriveBody struct{}
 func (failingDriveBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func (failingDriveBody) Close() error             { return nil }
 
+func TestDriveUnkeyedCreateRetriesBeforeDispatch(t *testing.T) {
+	for _, media := range []bool{false, true} {
+		driveClock(t, func(t *testing.T) {
+			var dials atomic.Int32
+			served := make(chan error, 1)
+			transport := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+				if dials.Add(1) == 1 {
+					return nil, io.ErrUnexpectedEOF
+				}
+				client, server := stdnet.Pipe()
+				go func() {
+					defer server.Close()
+					req, err := http.ReadRequest(bufio.NewReader(server))
+					if err == nil {
+						_, err = io.Copy(io.Discard, req.Body)
+						req.Body.Close()
+					}
+					if err == nil {
+						_, err = io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"id\":\"created\"}")
+					}
+					served <- err
+				}()
+				return client, nil
+			}}
+			defer transport.CloseIdleConnections()
+			s := memoryDrive(transport)
+			data := []byte("inline")
+			if media {
+				data = make([]byte, driveInlineLimit+1)
+			}
+			if err := s.Put(context.Background(), "sessions/new", data); err != nil {
+				t.Fatalf("pre-dispatch failure aborted creation: %v", err)
+			}
+			if err := <-served; err != nil || dials.Load() != 2 || len(s.inflight)+len(s.reserved) != 0 {
+				t.Fatalf("creation dispatch or permit accounting changed: %v", err)
+			}
+		})
+	}
+}
+
 func TestDriveUnkeyedCreateDoesNotReplayAmbiguity(t *testing.T) {
 	for _, media := range []bool{false, true} {
 		for _, outcome := range []string{"transport", "body", "server", "invalid", "missing", "replay", "quota"} {
@@ -935,6 +976,44 @@ func TestDriveIDWaiterIgnoresWrappedCallerCancellation(t *testing.T) {
 		if err := <-done; err != nil || s.poolErr != nil || !s.poolRetryAt.IsZero() {
 			t.Fatalf("caller cancellation poisoned another allocation: %v", err)
 		}
+	})
+}
+
+func TestDriveKeepWarmReleasesBindingsBetweenTicks(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var made atomic.Int32
+		probed := make(chan struct{}, 2)
+		pool := newConnPool(&splithttp.XmuxConfig{MaxConcurrency: &splithttp.RangeConfig{From: 1, To: 1}}, func(context.Context) *http.Client {
+			made.Add(1)
+			return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+				probed <- struct{}{}
+				return memoryResponse(http.StatusOK, ""), nil
+			})}
+		})
+		defer pool.Close()
+		s := memoryDrive(nil)
+		s.owner, s.conns = s, pool
+		s.keepWarmEvery, s.keepWarmWindow = time.Minute, time.Hour
+		s.keeperRunning = true
+		s.lastTraffic = time.Now()
+		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), keeperKey{}, true))
+		done := make(chan struct{})
+		go s.keepWarm(ctx, done)
+		<-probed
+		synctest.Wait()
+		foreground := &sessionTransport{pool: pool}
+		defer foreground.Close()
+		req, _ := http.NewRequest(http.MethodGet, "http://drive.invalid/files/item", nil)
+		resp, err := foreground.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if made.Load() != 1 || foreground.client.Running.Load() != 1 {
+			t.Fatal("keeper binding prevented foreground reuse of the warmed socket")
+		}
+		cancel()
+		<-done
 	})
 }
 
@@ -1088,6 +1167,167 @@ func TestDriveDescriptionHedgeCancellationDoesNotJoinRPCs(t *testing.T) {
 	})
 }
 
+func TestDriveIdentityMergePreservesDuplicatePreference(t *testing.T) {
+	s := memoryDrive(nil)
+	s.rememberID("item", "primary", []string{"old", "older", "old", "", "primary"})
+	s.rememberID("item", "new", []string{"old", "extra", "new", "primary", ""})
+	known := s.cachedFiles("item", false)["item"]
+	if known.id != "primary" || strings.Join(known.extra, ",") != "new,old,extra,older" {
+		t.Fatal("duplicate merge changed primary, preference, or uniqueness")
+	}
+	for i := range 1000 {
+		s.rememberID("many", fmt.Sprint(i), nil)
+	}
+	for i := range 1000 {
+		s.rememberID("many", fmt.Sprint(i), nil)
+	}
+	known = s.cachedFiles("many", false)["many"]
+	seen := map[string]bool{known.id: true}
+	for _, id := range known.extra {
+		if seen[id] {
+			t.Fatal("repeated listing retained duplicate identities")
+		}
+		seen[id] = true
+	}
+	if known.id != "0" || len(seen) != 1000 || known.extra[0] != "999" {
+		t.Fatal("repeated listing lost identities or changed preference")
+	}
+}
+
+func TestDriveQueryBatchesDuplicateIdentitiesAcrossPartialPages(t *testing.T) {
+	files := make([]map[string]string, 0, 1000)
+	for i := range 1000 {
+		files = append(files, map[string]string{"id": fmt.Sprint(i), "name": "item", "description": "first"})
+	}
+	payload, _ := json.Marshal(map[string]interface{}{"nextPageToken": "next", "files": files})
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("pageToken") != "" {
+			return memoryResponse(http.StatusOK, "{"), nil
+		}
+		return memoryResponse(http.StatusOK, string(payload)), nil
+	}))
+	s.rememberID("item", "cached", []string{"older"})
+	for range 2 {
+		found, err := s.query(context.Background(), "name = 'item'")
+		known := s.cachedFiles("item", false)["item"]
+		if err == nil || found["item"].id != "0" || found["item"].description != "first" || len(found["item"].extra) != 999 || known.id != "cached" || len(known.extra) != 1001 || known.extra[0] != "999" || known.extra[999] != "0" || known.extra[1000] != "older" {
+			t.Fatal("partial listing lost identities, ordering, metadata, or cache deduplication")
+		}
+	}
+}
+
+func TestDriveQueryPublishesPagesWithoutReplayingRetiredIDs(t *testing.T) {
+	var s *driveStorage
+	s = memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("pageToken") == "" {
+			return memoryResponse(http.StatusOK, `{"nextPageToken":"next","files":[{"id":"a","name":"item"},{"id":"b","name":"item"},{"id":"primary","name":"item"}]}`), nil
+		}
+		known := s.cachedFiles("item", false)["item"]
+		if known.id != "primary" || strings.Join(known.extra, ",") != "b,a,older" {
+			t.Fatal("first page was not visible or changed duplicate preference")
+		}
+		s.retireID("item", "a")
+		return memoryResponse(http.StatusOK, `{"files":[]}`), nil
+	}))
+	s.rememberID("item", "primary", []string{"older"})
+	found, err := s.query(context.Background(), "name = 'item'")
+	known := s.cachedFiles("item", false)["item"]
+	if err != nil || found["item"].id != "a" || len(found["item"].extra) != 2 || known.id != "primary" || strings.Join(known.extra, ",") != "b,older" {
+		t.Fatal("later page completion resurrected a retired earlier-page identity")
+	}
+}
+
+func TestDriveGetBatchesExhaustedIdentitiesBeforeRefresh(t *testing.T) {
+	for _, survives := range []bool{false, true} {
+		flat := flatten("sessions/item")
+		missing := make([]string, 1000)
+		for i := range missing {
+			missing[i] = fmt.Sprint(i)
+		}
+		var s *driveStorage
+		reads, listings := 0, 0
+		s = memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/files" {
+				listings++
+				if _, cached := s.cachedID(flat); cached {
+					t.Fatal("exhausted identities remained cached before refresh")
+				}
+				return memoryResponse(http.StatusOK, `{"files":[{"id":"kept","name":"sessions~item"},{"id":"0","name":"sessions~item"}]}`), nil
+			}
+			reads++
+			if strings.HasSuffix(r.URL.Path, "/kept") && survives {
+				return memoryResponse(http.StatusOK, "payload"), nil
+			}
+			return memoryResponse(http.StatusNotFound, ""), nil
+		}))
+		s.rememberID(flat, missing[0], missing[1:])
+		body, err := s.Get(context.Background(), "sessions/item")
+		known := s.cachedFiles(flat, false)[flat]
+		if listings != 1 || reads != 1001 || survives && (err != nil || string(body) != "payload" || known.id != "kept" || len(known.extra) != 0) || !survives && (err != errNotFound || known.id != "") {
+			t.Fatal("batch retirement repeated stale reads, retained missing IDs, or lost a survivor")
+		}
+	}
+}
+
+func TestDriveMissingIdentityIsHiddenDuringSurvivorRead(t *testing.T) {
+	flat := flatten("sessions/item")
+	var s *driveStorage
+	s = memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/gone") {
+			return memoryResponse(http.StatusNotFound, ""), nil
+		}
+		id, cached := s.cachedID(flat)
+		known := s.cachedFiles(flat, false)[flat]
+		if !cached || id != "kept" || known.id != "kept" || len(known.extra) != 0 {
+			t.Fatal("survivor read left a confirmed missing identity visible")
+		}
+		s.rememberID(flat, "gone", nil)
+		return memoryResponse(http.StatusOK, "payload"), nil
+	}))
+	s.rememberID(flat, "gone", []string{"kept"})
+	body, err := s.Get(context.Background(), "sessions/item")
+	known := s.cachedFiles(flat, false)[flat]
+	if err != nil || string(body) != "payload" || known.id != "kept" || strings.Join(known.extra, ",") != "gone" || len(s.missingIDs[flat]) != 0 {
+		t.Fatal("completed stale read erased a later confirmed identity publication")
+	}
+	s.markMissingID(flat, "uncached")
+	if len(s.missingIDs[flat]) != 0 {
+		t.Fatal("uncached historical identity created a missing marker")
+	}
+	s.markMissingID(flat, "gone")
+	s.rememberListedIDs(flat, []string{"fresh"})
+	known = s.cachedFiles(flat, false)[flat]
+	if known.id != "kept" || strings.Join(known.extra, ",") != "fresh" || len(s.knownIDs[flat]) != 2 || len(s.missingIDs[flat]) != 0 {
+		t.Fatal("merge resurrected a marked old identity or retained stale marker state")
+	}
+	s.markMissingID(flat, "kept")
+	s.forgetID(flat)
+	if len(s.knownIDs[flat]) != 0 || len(s.missingIDs[flat]) != 0 {
+		t.Fatal("forget retained membership or missing marker state")
+	}
+}
+
+func TestDriveRetireIDsFiltersCacheInOneBatch(t *testing.T) {
+	s := memoryDrive(nil)
+	retired := make(map[string]struct{}, 1000)
+	extra := []string{"survivor", "other"}
+	for i := range 1000 {
+		id := fmt.Sprint(i)
+		retired[id] = struct{}{}
+		extra = append(extra, id)
+	}
+	s.rememberID("item", "0", extra)
+	s.retireIDs("item", retired)
+	known := s.cachedFiles("item", false)["item"]
+	if known.id != "survivor" || strings.Join(known.extra, ",") != "other" {
+		t.Fatal("batch retirement lost or reordered surviving identities")
+	}
+	s.retireIDs("item", map[string]struct{}{"survivor": {}, "other": {}})
+	if _, ok := s.cachedID("item"); ok || len(s.dupIDs["item"]) != 0 {
+		t.Fatal("batch retirement retained an exhausted cache entry")
+	}
+}
+
 func TestDriveListPreservesDirectInlineWithDescendants(t *testing.T) {
 	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
 		return memoryResponse(http.StatusOK, `{"files":[{"id":"child","name":"sessions~one~child"},{"id":"direct","name":"sessions~one","description":"aW5saW5l"}]}`), nil
@@ -1096,6 +1336,99 @@ func TestDriveListPreservesDirectInlineWithDescendants(t *testing.T) {
 		entries, err := s.List(context.Background(), "sessions")
 		if err != nil || len(entries) != 1 || string(entries[0].Inline) != "inline" {
 			t.Fatalf("direct metadata lost: %v", err)
+		}
+	}
+}
+
+func TestDriveGetRetiresEveryPreviouslyMissingListedIdentity(t *testing.T) {
+	calls := make(map[string]int)
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/files" {
+			return memoryResponse(http.StatusOK, `{"files":[{"id":"kept","name":"sessions~item"},{"id":"gone","name":"sessions~item"}]}`), nil
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/files/")
+		calls[id]++
+		if id == "gone" {
+			return memoryResponse(http.StatusNotFound, ""), nil
+		}
+		return memoryResponse(http.StatusOK, "payload"), nil
+	}))
+	s.rememberID(flatten("sessions/item"), "gone", nil)
+	body, err := s.Get(context.Background(), "sessions/item")
+	known := s.cachedFiles(flatten("sessions/item"), false)[flatten("sessions/item")]
+	if err != nil || string(body) != "payload" || calls["gone"] != 1 || calls["kept"] != 1 || known.id != "kept" || len(known.extra) != 0 {
+		t.Fatalf("early survivor success retained a previously missing identity: %v", err)
+	}
+}
+
+func TestDriveGetUsesIdentitiesFromPartiallyFailedListing(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		for _, survives := range []bool{false, true} {
+			calls := make(map[string]int)
+			pages := 0
+			s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/files" {
+					pages++
+					if r.URL.Query().Get("pageToken") != "" {
+						return memoryResponse(http.StatusOK, "{"), nil
+					}
+					return memoryResponse(http.StatusOK, `{"nextPageToken":"next","files":[{"id":"gone","name":"sessions~item"},{"id":"kept","name":"sessions~item"}]}`), nil
+				}
+				id := strings.TrimPrefix(r.URL.Path, "/files/")
+				calls[id]++
+				if id == "gone" || !survives {
+					return memoryResponse(http.StatusNotFound, ""), nil
+				}
+				return memoryResponse(http.StatusOK, "payload"), nil
+			}))
+			if cached {
+				s.rememberID(flatten("sessions/item"), "gone", nil)
+			}
+			body, err := s.Get(context.Background(), "sessions/item")
+			_, remembered := s.cachedID(flatten("sessions/item"))
+			if calls["gone"] != 1 || calls["kept"] != 1 || survives && (err != nil || string(body) != "payload" || pages != 2) || !survives && (err == nil || err == errNotFound || remembered) {
+				t.Fatalf("partial listing discarded confirmed identity or retained stale one: %v", err)
+			}
+		}
+	}
+}
+
+func TestDriveGetRefreshesExhaustedIdentitySnapshot(t *testing.T) {
+	for _, inline := range []bool{false, true} {
+		for _, survives := range []bool{false, true} {
+			calls := make(map[string]int)
+			lists := 0
+			s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/files" {
+					lists++
+					if !strings.Contains(r.URL.Query().Get("q"), "name = 'sessions~item'") {
+						t.Fatal("identity refresh was not exact-name")
+					}
+					return memoryResponse(http.StatusOK, `{"files":[{"id":"gone","name":"sessions~item"},{"id":"kept","name":"sessions~item"},{"id":"kept","name":"sessions~item"}]}`), nil
+				}
+				id := strings.TrimPrefix(r.URL.Path, "/files/")
+				calls[id]++
+				if inline && r.URL.Query().Get("alt") == "media" {
+					return memoryResponse(http.StatusOK, ""), nil
+				}
+				if id == "gone" || !survives {
+					return memoryResponse(http.StatusNotFound, ""), nil
+				}
+				if inline {
+					return memoryResponse(http.StatusOK, `{"description":"cGF5bG9hZA=="}`), nil
+				}
+				return memoryResponse(http.StatusOK, "payload"), nil
+			}))
+			s.rememberID(flatten("sessions/item"), "gone", nil)
+			body, err := s.Get(context.Background(), "sessions/item")
+			id, cached := s.cachedID(flatten("sessions/item"))
+			reads := 1
+			if inline {
+				reads = 2
+			}
+			if lists != 1 || calls["gone"] != reads || calls["kept"] != reads || len(calls) != 2 || survives && (err != nil || string(body) != "payload" || id != "kept") || !survives && (err != errNotFound || cached) {
+				t.Fatalf("identity refresh omitted survivors or repeated missing IDs: %v", err)
+			}
 		}
 	}
 }
@@ -1158,6 +1491,67 @@ func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
 			t.Fatalf("reserved request waited or replaced cached error: %v", err)
 		}
 	})
+}
+
+func TestDriveQuota403SurvivesCompleteErrorBodyReadFailure(t *testing.T) {
+	for _, create := range []bool{false, true} {
+		driveClock(t, func(t *testing.T) {
+			calls := 0
+			s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+				calls++
+				if calls > 1 {
+					return memoryResponse(http.StatusOK, "accepted"), nil
+				}
+				resp := memoryResponse(http.StatusForbidden, "")
+				resp.Body = io.NopCloser(io.MultiReader(strings.NewReader(`{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}`), failingDriveBody{}))
+				return resp, nil
+			}))
+			ctx, method := context.Background(), http.MethodGet
+			if create {
+				ctx = context.WithValue(ctx, createOnceKey{}, true)
+				method = http.MethodPost
+			}
+			status, body, err := s.do(ctx, method, "http://drive.invalid/files/item", "", nil)
+			if err != nil || status != http.StatusOK || string(body) != "accepted" || calls != 2 || s.lastRateLimitAt().IsZero() {
+				t.Fatalf("confirmed quota rejection bypassed retry or cooldown: %v", err)
+			}
+		})
+	}
+}
+
+func TestDriveRejectedStatusSurvivesBodyReadFailure(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests} {
+		driveClock(t, func(t *testing.T) {
+			calls, tokens := 0, 0
+			var s *driveStorage
+			s = memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path == "/token" {
+					tokens++
+					return memoryResponse(http.StatusOK, `{"access_token":"fresh","expires_in":3600}`), nil
+				}
+				calls++
+				if status == http.StatusUnauthorized && calls > 1 {
+					if r.Header.Get("Authorization") != "Bearer fresh" {
+						t.Fatal("body failure retained the rejected token")
+					}
+					return memoryResponse(http.StatusOK, "accepted"), nil
+				}
+				if status == http.StatusTooManyRequests && calls > 1 && s.lastRateLimitAt().IsZero() {
+					t.Fatal("body failure bypassed quota cooldown")
+				}
+				if calls > driveMaxAttempts {
+					return memoryResponse(http.StatusOK, "accepted"), nil
+				}
+				resp := memoryResponse(status, "")
+				resp.Body = failingDriveBody{}
+				return resp, nil
+			}))
+			code, body, err := s.do(context.Background(), http.MethodGet, "http://drive.invalid/files/item", "", nil)
+			if err != nil || code != http.StatusOK || string(body) != "accepted" || status == http.StatusUnauthorized && tokens != 1 || len(s.inflight)+len(s.reserved) != 0 {
+				t.Fatalf("known rejection lost status handling: %v", err)
+			}
+		})
+	}
 }
 
 func TestDriveQuotaRetryBudget(t *testing.T) {

@@ -69,8 +69,8 @@ func (s *driveShared) stopKeeper() {
 	}
 }
 
-// Hold pooled transports across ticks so sessions can reuse the warmed sockets,
-// rather than warming only the owner's separate maintenance connection.
+// Warm pooled sockets rather than the owner's separate maintenance connection;
+// release the session bindings after each tick so foreground sessions can reuse them.
 func (s *driveShared) keeperStorage() *driveStorage {
 	warm := &driveStorage{
 		driveShared: s,
@@ -185,5 +185,9 @@ func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
 			}
 		}
 		cancel()
+		if warm != nil {
+			warm.Close()
+			warm = nil
+		}
 	}
 }
