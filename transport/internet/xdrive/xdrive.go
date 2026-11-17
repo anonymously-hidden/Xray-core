@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -234,7 +235,15 @@ func stopAllSpares() {
 }
 
 func takeSpare(config *Config, p params, settings ...*internet.MemoryStreamConfig) (spareRing, bool) {
-	box := spareBoxFor(config, settings...)
+	var streamSettings *internet.MemoryStreamConfig
+	if len(settings) > 0 {
+		streamSettings = settings[0]
+	}
+	value, found := spareBoxes.Load(spareKey{config: config, profile: shareKey(streamSettings, config)})
+	if !found {
+		return spareRing{}, false
+	}
+	box := value.(*spareBox)
 	box.mu.Lock()
 	defer box.mu.Unlock()
 	if box.stop.Load() {
@@ -368,6 +377,10 @@ func fillSparesBox(box *spareBox, streamSettings *internet.MemoryStreamConfig, c
 	}()
 }
 
+func terminalSessionError(err error) bool {
+	return isAuthError(err) || stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded)
+}
+
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -413,20 +426,28 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	p = paramsForStorage(config, storage)
 
 	slots, ok := storage.(slotStore)
+	ls, canAllocate := storage.(interface {
+		takeIDs(context.Context, int, int) ([]string, error)
+	})
 	lazy := false
 	if ok && !warm {
-		if ls, lok := storage.(interface {
-			takeIDs(context.Context, int, int) ([]string, error)
-		}); lok {
+		if canAllocate {
 			depth := max(p.concurrency, 2)
 			worth := depth + 1
 			ids, e := ls.takeIDs(ctx, 2*worth, worth)
-			if e != nil {
+			if e != nil && !terminalSessionError(e) {
 				if cooled, ok := storage.(interface{ waitCool(context.Context) error }); ok {
 					if e = cooled.waitCool(ctx); e == nil {
 						ids, e = ls.takeIDs(ctx, 2*worth, worth)
 					}
 				}
+			}
+			if ctx.Err() != nil {
+				e = ctx.Err()
+			}
+			if terminalSessionError(e) {
+				storage.Close()
+				return nil, e
 			}
 			if e == nil && len(ids) >= 2*worth {
 				r = lazyRing(session, depth, ids)
@@ -435,6 +456,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		if !lazy {
 			if r, err = makeRing(ctx, slots, session, p); err != nil {
+				if terminalSessionError(err) {
+					storage.Close()
+					return nil, err
+				}
 				ok = false
 				errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
 			}
@@ -446,7 +471,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, err
 	}
 	if ok {
-		if !lazy && streamSettings.FinalMask == nil {
+		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
 		}
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
@@ -647,6 +672,11 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 			continue
 		}
 		if !l.claim(session) {
+			l.mu.Lock()
+			if !l.handled[session].IsZero() {
+				l.queueDropLocked(full)
+			}
+			l.mu.Unlock()
 			continue
 		}
 		announce := listed.Inline
@@ -822,6 +852,10 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
 			errors.LogInfo(logCtx, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
 			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, onClose)
+		}
+		if len(announce) > 0 {
+			storage.Close()
+			return nil
 		}
 	}
 	errors.LogInfo(logCtx, "accepted session ", session)

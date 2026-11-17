@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	gotls "crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1036,6 +1037,80 @@ func TestLocalSessionStorage(t *testing.T) {
 	}
 }
 
+func TestTakeSpareMissDoesNotCreateMaintenance(t *testing.T) {
+	cfg := &Config{Service: "google-drive"}
+	settings := &internet.MemoryStreamConfig{ProtocolSettings: cfg}
+	key := spareKey{config: cfg, profile: shareKey(settings, cfg)}
+	if _, ok := takeSpare(cfg, paramsFromConfig(cfg), settings); ok {
+		t.Fatal("empty profile returned a spare")
+	}
+	if _, exists := spareBoxes.Load(key); exists {
+		stopSpares(cfg)
+		t.Fatal("spare lookup created an empty maintenance box")
+	}
+}
+
+func TestDriveEagerFallbackDoesNotStartSpareMaintenance(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var creates atomic.Int32
+		store := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodPost {
+				return memoryResponse(http.StatusOK, fmt.Sprintf(`{"id":"made-%d"}`, creates.Add(1))), nil
+			}
+			return memoryResponse(http.StatusOK, `{"description":""}`), nil
+		}))
+		store.poolErr, store.poolRetryAt = io.ErrUnexpectedEOF, time.Now().Add(time.Hour)
+		store.conns = newConnPool(nil, func(context.Context) *http.Client { return store.client })
+		cfg := &Config{Service: "google-drive", Concurrency: 2}
+		settings := &internet.MemoryStreamConfig{ProtocolSettings: cfg}
+		owner, err := sharedStorage(settings, cfg, func() (Storage, error) { return store, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Close()
+		defer stopSpares(cfg)
+		key := spareKey{config: cfg, profile: shareKey(settings, cfg)}
+		conn, err := Dial(context.Background(), net.Destination{}, settings)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.(*Conn).cancel()
+		conn.Close()
+		if _, exists := spareBoxes.Load(key); exists || creates.Load() != 6 {
+			t.Fatal("lazy-capable eager fallback started recurring spare creation")
+		}
+	})
+}
+
+func TestDriveDialReturnsTerminalAllocationFailure(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		for _, failure := range []error{authError{code: "invalid_grant"}, context.Canceled, context.DeadlineExceeded} {
+			var dispatched atomic.Int32
+			store := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+				dispatched.Add(1)
+				return nil, io.ErrUnexpectedEOF
+			}))
+			store.poolErr, store.poolRetryAt = failure, time.Now().Add(time.Hour)
+			store.conns = newConnPool(nil, func(context.Context) *http.Client { return store.client })
+			cfg := &Config{Service: "google-drive"}
+			settings := &internet.MemoryStreamConfig{ProtocolSettings: cfg}
+			owner, err := sharedStorage(settings, cfg, func() (Storage, error) { return store, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease := owner.(interface{ storageLeaseState() *storageLease }).storageLeaseState()
+			conn, err := Dial(context.Background(), net.Destination{}, settings)
+			sharedMu.Lock()
+			refs := lease.owner.refs
+			sharedMu.Unlock()
+			owner.Close()
+			if conn != nil || err != failure || dispatched.Load() != 0 || refs != 1 {
+				t.Fatalf("terminal allocation failure retried, fanned out, or retained a lease: %v", err)
+			}
+		}
+	})
+}
+
 type spareCloseCounter struct {
 	Storage
 	closes atomic.Int32
@@ -1219,6 +1294,95 @@ func TestCancelledDialDoesNotConsumeWarmSpare(t *testing.T) {
 		stopSpares(cfg)
 		<-box.done
 	})
+}
+
+type announcementCleanupStorage struct {
+	Storage
+	entry   Entry
+	deleted chan string
+}
+
+func (s *announcementCleanupStorage) List(context.Context, string) ([]Entry, error) {
+	return []Entry{s.entry}, nil
+}
+
+func (s *announcementCleanupStorage) Delete(_ context.Context, name string) error {
+	s.deleted <- name
+	return nil
+}
+
+func TestHandledAnnouncementCleanupRetriesOnLaterListings(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		store := &announcementCleanupStorage{entry: Entry{Name: "1-session"}, deleted: make(chan string, 2)}
+		l := &Listener{ctx: context.Background(), storage: store, params: paramsFromConfig(&Config{}), active: map[string]bool{"session": active}, handled: map[string]time.Time{"session": time.Now()}, cleanupQueue: make([]string, listenerCleanupQueue), cleanupRunning: listenerCleanupWorkers}
+		if accepted, err := l.acceptPending(context.Background()); accepted || err != nil {
+			t.Fatal("handled session was accepted again")
+		}
+		l.cleanupQueue, l.cleanupRunning = nil, 0
+		for range 2 {
+			if accepted, err := l.acceptPending(context.Background()); accepted || err != nil {
+				t.Fatal("cleanup retry accepted an old session")
+			}
+			l.cleanupWG.Wait()
+			select {
+			case name := <-store.deleted:
+				if name != sessionsDir+"/"+store.entry.Name {
+					t.Fatal("announcement cleanup touched stream objects")
+				}
+			default:
+				t.Fatal("handled announcement cleanup was not retried")
+			}
+			l.finishDrop(sessionsDir+"/"+store.entry.Name, io.ErrUnexpectedEOF)
+		}
+		if l.active["session"] != active || l.handled["session"].IsZero() {
+			t.Fatal("cleanup changed accepted-session guards")
+		}
+	}
+}
+
+type malformedAnnouncementStorage struct {
+	*memSlots
+	closes atomic.Int32
+}
+
+func (*malformedAnnouncementStorage) Put(context.Context, string, []byte) error { return nil }
+func (*malformedAnnouncementStorage) Get(context.Context, string) ([]byte, error) {
+	return nil, errNotFound
+}
+
+func (*malformedAnnouncementStorage) List(context.Context, string) ([]Entry, error) { return nil, nil }
+func (*malformedAnnouncementStorage) Delete(context.Context, string) error          { return nil }
+func (s *malformedAnnouncementStorage) Close() error                                { s.closes.Add(1); return nil }
+
+func TestInvalidNonemptySlotAnnouncementDoesNotFallBackToWAL(t *testing.T) {
+	store := &malformedAnnouncementStorage{memSlots: newMemSlots()}
+	owner := ownedStorage(store)
+	defer owner.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	l := &Listener{ctx: ctx, storage: owner, params: paramsFromConfig(&Config{})}
+	invalid, _ := json.Marshal(ring{Up: slotTable{Slots: []string{"duplicate"}, Watermark: "up"}, Down: slotTable{Slots: []string{"duplicate"}, Watermark: "down"}})
+	for _, announce := range [][]byte{[]byte("invalid"), invalid} {
+		if conn := l.newSessionConn(context.Background(), "session", announce); conn != nil {
+			conn.Close()
+			t.Fatal("invalid nonempty slot announcement selected WAL")
+		}
+		lease := owner.(interface{ storageLeaseState() *storageLease }).storageLeaseState()
+		sharedMu.Lock()
+		refs := lease.owner.refs
+		sharedMu.Unlock()
+		if refs != 1 || store.closes.Load() != 0 {
+			t.Fatal("rejected announcement leaked a child lease or closed the listener")
+		}
+	}
+	conn := l.newSessionConn(context.Background(), "legacy", nil)
+	if conn == nil {
+		t.Fatal("legacy empty announcement was rejected")
+	}
+	if _, ok := conn.writer.(*walWriter); !ok {
+		t.Fatal("legacy empty announcement changed transport")
+	}
+	conn.Close()
 }
 
 type cleanupStateStorage struct {
