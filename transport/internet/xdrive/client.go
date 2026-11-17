@@ -150,7 +150,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	r.Header = r.Header.Clone()
 	utils.TryDefaultHeadersWith(r.Header, "fetch")
 	if r.Body != nil && r.Body != http.NoBody {
-		r.Body = &progressBody{ReadCloser: r.Body, alive: alive}
+		r.Body = &progressBody{ReadCloser: r.Body, alive: alive, upload: true}
 	}
 	// a body sent again by the transport itself, after a GOAWAY or on a reused
 	// connection that failed, moves just the same
@@ -160,7 +160,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			if err != nil || body == http.NoBody {
 				return body, err
 			}
-			return &progressBody{ReadCloser: body, alive: alive}, nil
+			return &progressBody{ReadCloser: body, alive: alive, upload: true}, nil
 		}
 	}
 
@@ -197,8 +197,9 @@ func stalled(ctx context.Context, err error) error {
 
 type progressBody struct {
 	io.ReadCloser
-	alive func()
-	end   func()
+	alive  func()
+	end    func()
+	upload bool
 	// ctx is that of the request, for the body of its response
 	ctx context.Context
 }
@@ -206,7 +207,10 @@ type progressBody struct {
 func (b *progressBody) Read(p []byte) (int, error) {
 	// http2 reads a request body up to 512 KiB at a time and sends it all before
 	// the next read, which on a slow link could look like no progress
-	n, err := b.ReadCloser.Read(p[:min(len(p), 16<<10)])
+	if b.upload {
+		p = p[:min(len(p), 16<<10)]
+	}
+	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
 		b.alive()
 	}
@@ -721,7 +725,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	resp, err := conn.roundTrip(r)
 	if err == nil {
-		resp.Body = &servedBody{ReadCloser: resp.Body, served: sync.OnceFunc(func() {
+		resp.Body = &servedBody{ReadCloser: resp.Body, ctx: r.Context(), served: sync.OnceFunc(func() {
 			t.mu.Lock()
 			if t.client == client {
 				t.servedAt = time.Now()
@@ -734,6 +738,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 
 type servedBody struct {
 	io.ReadCloser
+	ctx    context.Context
 	served func()
 	failed atomic.Bool
 }
@@ -749,8 +754,9 @@ func (b *servedBody) Read(p []byte) (int, error) {
 }
 
 func (b *servedBody) Close() error {
+	canceled := b.ctx != nil && b.ctx.Err() != nil
 	err := b.ReadCloser.Close()
-	if err == nil && !b.failed.Load() {
+	if err == nil && !canceled && !b.failed.Load() {
 		b.served()
 	}
 	return err

@@ -1155,6 +1155,91 @@ func TestSessionStallRetiresIdleConnAtOnce(t *testing.T) {
 	})
 }
 
+func TestServiceProgressReadCapOnlyLimitsUploads(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		payload := bytes.Repeat([]byte{7}, 512<<10)
+		transport := &serviceTransport{stall: time.Hour, plain: roundTrip(func(r *http.Request) (*http.Response, error) {
+			for _, replay := range []bool{false, true} {
+				body := r.Body
+				if replay {
+					var err error
+					body, err = r.GetBody()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				buf := make([]byte, 64<<10)
+				if n, err := body.Read(buf); n != 16<<10 || err != nil || !bytes.Equal(buf[:n], payload[:n]) {
+					t.Fatalf("upload/replay lost its bounded progress reads: n=%d err=%v", n, err)
+				}
+				body.Close()
+			}
+			return memoryResponse(http.StatusOK, string(payload)), nil
+		})}
+		req, _ := http.NewRequest(http.MethodPost, "http://drive.invalid/files", bytes.NewReader(payload))
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 64<<10)
+		for range 8 {
+			if n, err := resp.Body.Read(buf); n != len(buf) || err != nil || !bytes.Equal(buf, payload[:len(buf)]) {
+				t.Fatalf("download inherited the upload read cap: n=%d err=%v", n, err)
+			}
+		}
+		if n, err := resp.Body.Read(buf); n != 0 || err != io.EOF {
+			t.Fatalf("download termination changed: n=%d err=%v", n, err)
+		}
+	})
+}
+
+func TestSessionCanceledCloseDoesNotCountAsService(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		for _, tc := range []struct {
+			cancel, partial, eof, served bool
+		}{{false, false, false, true}, {true, false, false, false}, {true, true, false, false}, {true, false, true, true}} {
+			transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
+				return &http.Client{Transport: &serviceTransport{stall: time.Hour, plain: okConn{}}}
+			})}
+			ctx, cancel := context.WithCancel(context.Background())
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://drive.invalid/files", nil)
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.partial {
+				if _, err := resp.Body.Read(make([]byte, 1)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.eof {
+				if _, err := io.ReadAll(resp.Body); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.cancel {
+				cancel()
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			transport.mu.Lock()
+			served := !transport.servedAt.IsZero()
+			transport.takenAt = time.Now().Add(-2 * stalledGrace)
+			conn := transport.client.XmuxConn.(*poolConn)
+			transport.mu.Unlock()
+			transport.stalled(time.Now().Add(-time.Second), conn)
+			if served != tc.served || conn.IsClosed() == tc.served {
+				t.Fatalf("cancel=%v partial=%v eof=%v: service=%v closed=%v", tc.cancel, tc.partial, tc.eof, served, conn.IsClosed())
+			}
+			cancel()
+			transport.Close()
+			transport.pool.Close()
+		}
+	})
+}
+
 func TestSessionFailedBodyDoesNotCountAsService(t *testing.T) {
 	transport := &sessionTransport{pool: newConnPool(nil, func(context.Context) *http.Client {
 		return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
