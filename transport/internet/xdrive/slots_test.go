@@ -1603,3 +1603,129 @@ func TestSlotCloseUsesDrainProgress(t *testing.T) {
 		})
 	}
 }
+
+func TestSlotIdleHeadWakeStartsUrgentReadWithoutWaiting(t *testing.T) {
+	for _, seq := range []int64{0, 1} {
+		t.Run(strconv.FormatInt(seq, 10), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				entered := make(chan bool, 8)
+				store := &controlledSlots{memSlots: newMemSlots(), desc: func(ctx context.Context, _ string) (string, error) {
+					entered <- ctx.Value(laneKey{}) != nil
+					<-ctx.Done()
+					return "", ctx.Err()
+				}}
+				r := &slotReader{ctx: ctx, store: store, params: paramsFromConfig(&Config{}), active: make(chan struct{}), wake: make(chan struct{}, 1), huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
+				done := make(chan error, 1)
+				go func() { _, err := r.readSlotDescription(ctx, "slot", seq, make(chan struct{})); done <- err }()
+				defer func() { cancel(); <-done; r.wait() }()
+				synctest.Wait()
+				if len(entered) != 1 || <-entered {
+					t.Fatal("idle read started an eager hunt")
+				}
+				started := time.Now()
+				r.Wake()
+				synctest.Wait()
+				if seq == 1 {
+					if r.reads.Load() != 1 || len(r.wake) != 1 {
+						t.Fatal("tail consumed the head wake")
+					}
+					return
+				}
+				if len(entered) != 1 || !<-entered || time.Now() != started {
+					t.Fatal("idle head wake waited for its pending read instead of launching an urgent sibling")
+				}
+				for range 5 {
+					r.Wake()
+					synctest.Wait()
+				}
+				if r.reads.Load() != 3 || time.Now() != started {
+					t.Fatal("wake changed the overlap cap or introduced a wait")
+				}
+			})
+		})
+	}
+}
+
+func TestSlotMediaCancelsDescriptionSiblingsAndIsolatesRetries(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		type request struct {
+			ctx   context.Context
+			reply chan string
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan request, 3)
+		lateResults := make(chan struct{})
+		bodyEntered, bodyResult := make(chan struct{}), make(chan error)
+		payload := []byte("media")
+		store := &validatedFrameSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(ctx context.Context, _ string) (string, error) {
+			req := request{ctx: ctx, reply: make(chan string)}
+			entered <- req
+			select {
+			case description := <-req.reply:
+				return description, nil
+			case <-ctx.Done():
+				<-lateResults
+				return newSlotFrame(0, slotInline, []byte("stale")).encode(), nil
+			}
+		}}, read: func(ctx context.Context, _ string, _ slotFrame) ([]byte, error) {
+			select {
+			case bodyEntered <- struct{}{}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			select {
+			case err := <-bodyResult:
+				if err != nil {
+					return nil, err
+				}
+				return payload, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}}
+		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), frontier: -1, activeAt: time.Now(), active: make(chan struct{}), grow: make(chan struct{}, 1), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+		go r.fetch(ctx, 0, 0, f)
+		lateClosed := false
+		defer func() {
+			cancel()
+			if !lateClosed {
+				close(lateResults)
+			}
+			<-f.ready
+			r.wait()
+		}()
+		for attempt := range 2 {
+			requests := []request{<-entered, <-entered, <-entered}
+			if attempt == 1 {
+				close(lateResults)
+				lateClosed = true
+				synctest.Wait()
+				select {
+				case <-f.ready:
+					t.Fatal("late cancelled descriptions completed the new round")
+				default:
+				}
+			}
+			requests[2].reply <- newSlotFrame(0, slotMedia, payload).encode()
+			synctest.Wait()
+			if requests[0].ctx.Err() != context.Canceled || requests[1].ctx.Err() != context.Canceled {
+				t.Fatal("losing descriptions remained active during media admission or reading")
+			}
+			if attempt == 0 {
+				close(f.media)
+			}
+			<-bodyEntered
+			if attempt == 0 {
+				bodyResult <- io.ErrUnexpectedEOF
+			} else {
+				bodyResult <- nil
+			}
+		}
+		<-f.ready
+		if f.err != nil || !bytes.Equal(f.body, payload) || r.reads.Load() != 6 {
+			t.Fatalf("media retry reused cancelled description results: reads=%d err=%v body=%q", r.reads.Load(), f.err, f.body)
+		}
+	})
+}

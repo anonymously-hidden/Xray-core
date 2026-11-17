@@ -1209,8 +1209,11 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 
 	id := r.slotID(seq)
-	descriptionCtx, cancelDescription := context.WithCancel(ctx)
-	defer cancelDescription()
+	newDescriptionContext := func() (context.Context, context.CancelFunc) {
+		return context.WithCancel(ctx)
+	}
+	descriptionCtx, cancelDescription := newDescriptionContext()
+	defer func() { cancelDescription() }()
 	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
 	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
@@ -1243,6 +1246,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		switch {
 		case err == nil && ok && frame.seq == seq:
+			cancelDescription()
 			if f.visibleAt.IsZero() {
 				f.visibleAt = time.Now()
 			}
@@ -1300,6 +1304,8 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					f.err = errors.New("segment ", seq, " has no usable body after ", r.stallTimeout).Base(bodyErr)
 					return
 				}
+				descriptionCtx, cancelDescription = newDescriptionContext()
+				hunt = slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), observations: hunt.observations, present: hunt.present}
 			}
 		case err == nil && !ok && description != "":
 			// A present but undecodable description for this slot is not idle;
@@ -1421,14 +1427,15 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}, pending *slotDescriptionHunt) (string, error) {
 	r.mu.Lock()
 	head := r.head == seq
+	var wake <-chan struct{}
 	if head {
 		promoted = nil
+		wake = r.wake
 	}
 	head = head && time.Since(r.activeAt) <= r.eagerWindow
 	r.mu.Unlock()
 	var ticker *time.Ticker
 	var ticks <-chan time.Time
-	var wake <-chan struct{}
 	defer func() {
 		if ticker != nil {
 			ticker.Stop()
@@ -1447,7 +1454,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	}
 
 	// Yield observations for fetch's stall checks without canceling or
-	// restarting sibling requests. Their lifetime belongs to the fetch.
+	// restarting sibling requests. Their lifetime belongs to the description round.
 	observationWindow := max(3*r.huntCeiling, min(r.stallTimeout/4, r.eagerWindow))
 	observationTimer := time.NewTimer(observationWindow)
 	defer observationTimer.Stop()
@@ -1457,12 +1464,13 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
 		}
+		results := pending.results
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
 			r.reads.Add(1)
 			description, err := r.store.readDescription(readCtx, id)
-			pending.results <- slotDescriptionResult{description, err}
+			results <- slotDescriptionResult{description, err}
 		}()
 	}
 	if pending.outstanding < 3 {
@@ -1515,6 +1523,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 				launch()
 			}
 		case <-wake:
+			hunt()
 			if pending.outstanding < 3 {
 				launch()
 			}
