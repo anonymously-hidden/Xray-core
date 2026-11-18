@@ -18,6 +18,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
@@ -27,12 +28,22 @@ import (
 
 const testPatience = 30 * time.Second
 
+// The standard log handler writes in a goroutine that never exits, so a log
+// call inside a fake-clock bubble keeps that bubble from draining. A
+// synchronous handler leaves the bubble usable.
+type testLogHandler struct{}
+
+func (testLogHandler) Handle(msg log.Message) {
+	fmt.Fprintln(os.Stderr, msg.String())
+}
+
 // Install process-lifetime guards before any test worker starts; never restore
 // mutable request hooks while a teardown goroutine might still be using them.
 func TestMain(m *testing.M) {
 	for _, name := range []string{"XRAY_XDRIVE_DRIVE_SECRETS", "XDRIVE_YANDEX_USER", "XDRIVE_YANDEX_PASS"} {
 		os.Unsetenv(name)
 	}
+	log.RegisterHandler(testLogHandler{})
 	testServiceDial = func(dest net.Destination) error { return localTestTarget(dest.Address.String()) }
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil

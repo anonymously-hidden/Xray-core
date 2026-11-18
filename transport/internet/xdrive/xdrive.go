@@ -54,6 +54,17 @@ func announceName(session string, at time.Time) string {
 }
 
 func parseAnnounce(entry string) (string, time.Time, bool) {
+	session, at, ok := announceParts(entry)
+	if !ok || !safeSessionID(session) {
+		return "", time.Time{}, false
+	}
+	return session, at, true
+}
+
+// announceParts splits an announcement entry into its session and its time.
+// The session is not checked: a caller that turns it into an object name has
+// to ask safeSessionID first.
+func announceParts(entry string) (string, time.Time, bool) {
 	dash := strings.IndexByte(entry, '-')
 	if dash <= 0 || dash == len(entry)-1 {
 		return "", time.Time{}, false
@@ -63,6 +74,49 @@ func parseAnnounce(entry string) (string, time.Time, bool) {
 		return "", time.Time{}, false
 	}
 	return entry[dash+1:], time.Unix(0, nanos), true
+}
+
+// A session id reaches object names, so it must not traverse, must not
+// collide with another name once a separator is flattened, and must not name
+// a reserved file.
+func safeSessionID(session string) bool {
+	return safeNameChars(session) && !reservedName(session)
+}
+
+// A listed name becomes a delete target, so it must be safe to build one
+// from.
+func safeListedName(name string) bool {
+	return safeNameChars(name) && !reservedName(name)
+}
+
+func safeNameChars(name string) bool {
+	if name == "" || len(name) > 255 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return name[0] != '.' && name[len(name)-1] != '.'
+}
+
+func reservedName(name string) bool {
+	base := name
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	switch strings.ToUpper(base) {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(base) == 4 && base[3] >= '1' && base[3] <= '9' {
+		return strings.EqualFold(base[:3], "COM") || strings.EqualFold(base[:3], "LPT")
+	}
+	return false
 }
 
 func sessionPrefix(session string) string {
@@ -657,9 +711,18 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		entry := listed.Name
 		full := sessionsDir + "/" + entry
 
-		session, _, ok := parseAnnounce(entry)
+		session, _, ok := announceParts(entry)
 		if !ok {
-			l.queueDrop(full)
+			// A name that is not an announcement is stale litter, unless it is
+			// unsafe to turn into a delete target.
+			if safeListedName(entry) {
+				l.queueDrop(full)
+			}
+			continue
+		}
+		if !safeSessionID(session) {
+			// An unsafe session must never reach an object name; leave the
+			// entry alone rather than deleting through it.
 			continue
 		}
 		l.mu.Lock()
@@ -819,6 +882,9 @@ func (l *Listener) drop(name string) error {
 func (l *Listener) claim(session string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !safeSessionID(session) {
+		return false
+	}
 	if l.stopping || l.ctx.Err() != nil || l.active[session] || !l.handled[session].IsZero() || l.collecting[session] {
 		return false
 	}
@@ -830,6 +896,9 @@ func (l *Listener) claim(session string) bool {
 	}
 	l.active[session] = true
 	l.handled[session] = time.Now()
+	// The session was accepted, so the inactivity it was listed with is over:
+	// a claim must not hand the session the age it had before it was taken.
+	delete(l.idleSince, session)
 	return true
 }
 
@@ -901,6 +970,10 @@ func (l *Listener) collect() error {
 	present := make(map[string]bool, len(sessions))
 	for _, listed := range sessions {
 		session := listed.Name
+		if !safeSessionID(session) {
+			// A listed stream name must never reach an object name.
+			continue
+		}
 		present[session] = true
 		if l.active[session] {
 			delete(l.idleSince, session)
