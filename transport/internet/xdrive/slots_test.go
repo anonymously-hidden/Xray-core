@@ -705,6 +705,125 @@ func TestSlotReaderReachesPastWindow(t *testing.T) {
 	}
 }
 
+// An idle reader must not keep asking for segments that cannot have been
+// written yet: only the head probes, and every tail sleeps until something
+// comes or the local side wakes it. Otherwise a browser's think time spends
+// Drive GET quota for nothing.
+func TestSlotIdleTailsStopPolling(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		var mu sync.Mutex
+		polled := make(map[string]int)
+		spinning := false
+		stalled := make(chan struct{})
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(_ context.Context, id string) (string, error) {
+			mu.Lock()
+			polled[id]++
+			n := polled[id]
+			if n > 64 {
+				spinning = true
+			}
+			mu.Unlock()
+			// A reader that polls in a tight loop would starve the fake clock and
+			// hang instead of failing, so stall the slot once it is clearly
+			// spinning and let the assertions below report it.
+			if n > 64 {
+				<-stalled
+				return "", context.Canceled
+			}
+			return "", errNotFound
+		}}
+		p := paramsFromConfig(&Config{Concurrency: 16, PollIntervalMs: 1, MaxPollIntervalMs: 20, EagerWindowMs: 20})
+		ring, err := makeRing(ctx, store, "session", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := newSlotReader(ctx, store, ring.Down, p, nil)
+		defer func() {
+			close(stalled)
+			cancel()
+			r.wait()
+		}()
+		r.reach(int64(len(ring.Down.Slots) - 1))
+		snapshot := func() map[string]int {
+			mu.Lock()
+			defer mu.Unlock()
+			out := make(map[string]int, len(polled))
+			for id, n := range polled {
+				out[id] = n
+			}
+			return out
+		}
+		// Let the window open, every tail take its first look, and the eager
+		// window lapse. The head keeps probing at the idle interval.
+		<-time.NewTimer(3 * r.tailMin).C
+		synctest.Wait()
+		mu.Lock()
+		spun := spinning
+		mu.Unlock()
+		if spun {
+			t.Fatal("an idle tail polled its slot in a tight loop")
+		}
+		before := snapshot()
+		<-time.NewTimer(10 * max(r.maxPollInterval, r.huntCeiling)).C
+		synctest.Wait()
+		after := snapshot()
+		head := ring.Down.Slots[0]
+		if after[head] <= before[head] {
+			t.Fatalf("the idle head stopped probing: %d -> %d", before[head], after[head])
+		}
+		for _, id := range ring.Down.Slots[1:] {
+			if after[id] != before[id] {
+				t.Fatalf("an idle tail kept polling a slot: %d -> %d", before[id], after[id])
+			}
+		}
+		// A local write makes an answer likely, so the wake must put the tails
+		// back to work at once instead of waiting out the idle window.
+		r.Wake()
+		synctest.Wait()
+		woken := snapshot()
+		resumed := false
+		for _, id := range ring.Down.Slots[1:] {
+			if woken[id] > after[id] {
+				resumed = true
+			}
+			if woken[id] > after[id]+1 {
+				t.Fatalf("a woken tail polled its slot %d times", woken[id]-after[id])
+			}
+		}
+		if !resumed {
+			t.Fatal("no tail resumed after the local side woke the reader")
+		}
+	})
+}
+
+func TestSlotReadCountersSplitStaleAndEmpty(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		replies := []func() (string, error){
+			func() (string, error) { return newSlotFrame(0, slotInline, []byte("old")).encode(), nil },
+			func() (string, error) { return "", errNotFound },
+		}
+		next := 0
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
+			reply := replies[next]
+			next++
+			return reply()
+		}}
+		r := &slotReader{ctx: ctx, store: store, active: make(chan struct{}), wake: make(chan struct{}, 1), huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
+		for range len(replies) {
+			if _, err := r.readSlotDescription(ctx, "slot", 5, make(chan struct{})); err != nil && err != errNotFound {
+				t.Fatal(err)
+			}
+		}
+		if r.reads.Load() != 2 || r.headReads.Load() != 0 || r.tailReads.Load() != 2 || r.staleReads.Load() != 1 || r.emptyReads.Load() != 1 {
+			t.Fatalf("reads=%d heads=%d tails=%d stale=%d empty=%d",
+				r.reads.Load(), r.headReads.Load(), r.tailReads.Load(), r.staleReads.Load(), r.emptyReads.Load())
+		}
+	})
+}
+
 type bulkPermitSlots struct {
 	*memSlots
 	finish   chan struct{}

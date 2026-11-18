@@ -964,14 +964,22 @@ type slotReader struct {
 	// hitAt is when a segment last came and gap the time between them, activeAt
 	// when a segment came, was seen coming or Wake. Nothing for the eager window
 	// is idle, and active is closed when that ends
-	hitAt        time.Time
-	gap          time.Duration
-	activeAt     time.Time
-	active       chan struct{}
-	frontier     int64
-	err          error
-	stop         context.CancelFunc
-	reads        atomic.Int64
+	hitAt    time.Time
+	gap      time.Duration
+	activeAt time.Time
+	active   chan struct{}
+	frontier int64
+	err      error
+	stop     context.CancelFunc
+	reads    atomic.Int64
+	// headReads and tailReads split reads by the role the fetch had when the
+	// walk started; staleReads counts valid frames of another lap, the normal
+	// not-ready answer of a ring slot; emptyReads counts 404 and empty
+	// descriptions. They are diagnostic only.
+	headReads    atomic.Int64
+	tailReads    atomic.Int64
+	staleReads   atomic.Int64
+	emptyReads   atomic.Int64
 	tailMin      time.Duration
 	tailMax      time.Duration
 	huntFloor    time.Duration
@@ -1147,7 +1155,9 @@ func (r *slotReader) run() {
 		r.mu.Unlock()
 		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
 			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body),
-			" reads=", r.reads.Load(), " mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime)
+			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
+			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
+			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime)
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1365,7 +1375,9 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			}
 			backoff = min(2*backoff, ceiling)
 		case idle:
-			// only the head is asked for until something comes
+			// Only the head is asked for until something comes. promoted stays:
+			// run() may move the head here just after head was read, and its
+			// closed channel must still wake the fetch now that it is the head.
 			wait, a, b, backoff = 0, f.promoted, active, r.huntFloor
 		default:
 			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, r.huntFloor
@@ -1461,6 +1473,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	launch := func() {
 		pending.outstanding++
 		readCtx := ctx
+		role := head
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
 		}
@@ -1469,6 +1482,11 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		go func() {
 			defer r.wg.Done()
 			r.reads.Add(1)
+			if role {
+				r.headReads.Add(1)
+			} else {
+				r.tailReads.Add(1)
+			}
 			description, err := r.store.readDescription(readCtx, id)
 			results <- slotDescriptionResult{description, err}
 		}()
@@ -1488,6 +1506,13 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			}
 			if res.err == nil {
 				pending.present++
+				if res.description == "" {
+					r.emptyReads.Add(1)
+				} else if frame, ok := decodeSlot(res.description); ok && frame.seq != seq {
+					r.staleReads.Add(1)
+				}
+			} else if res.err == errNotFound {
+				r.emptyReads.Add(1)
 			}
 			if !head {
 				return res.description, res.err
