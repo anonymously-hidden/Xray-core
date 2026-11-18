@@ -64,10 +64,14 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
 	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
 	lanes := max(1, len(s.mediaClients))
-	parts := 1
+	// The head frame, which every later frame waits for, is split into
+	// driveMediaPart ranges; other frames take one range per default segment.
+	// Both are capped by the number of lanes.
+	partSize := int(defaultSegmentBytes)
 	if ctx.Value(mediaHeadKey{}) != nil {
-		parts = min((frame.size+driveMediaPart-1)/driveMediaPart, lanes)
+		partSize = driveMediaPart
 	}
+	parts := max(1, min((frame.size+partSize-1)/partSize, lanes))
 	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
 		parts = 1
 	}

@@ -867,7 +867,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if progress, ok := ctx.Value(bodyProgressKey{}).(func()); ok {
 			resp.Body = &progressBody{ReadCloser: resp.Body, alive: progress}
 		}
-		payload, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+		payload, err := readResponse(resp.Body, limit, resp.ContentLength)
 		if err != nil {
 			noteTimeout()
 		}
@@ -959,6 +959,19 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	}
 
 	return 0, nil, lastErr
+}
+
+// readResponse reads at most limit+1 bytes. When the server announced a length
+// that fits the cap, the buffer is allocated once; io.ReadAll would regrow and
+// copy a 512 KiB media range about twenty times. The extra bytes.MinRead keeps
+// bytes.Buffer.ReadFrom from growing the buffer again just to see EOF.
+func readResponse(r io.Reader, limit, announced int64) ([]byte, error) {
+	if announced <= 0 || announced > limit || announced > maxSegmentBytes {
+		return io.ReadAll(io.LimitReader(r, limit+1))
+	}
+	buf := bytes.NewBuffer(make([]byte, 0, announced+bytes.MinRead+1))
+	_, err := buf.ReadFrom(io.LimitReader(r, limit+1))
+	return buf.Bytes(), err
 }
 
 func (s *driveStorage) waitDispatch(ctx context.Context, cleanupDelete bool) error {
@@ -1065,6 +1078,11 @@ func (s *driveStorage) rememberListedIDs(name string, listed []string) {
 	}
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
+	// Re-listing a name whose single id is already the cached primary changes
+	// nothing; skip the per-name map and slice rebuilds on every poll.
+	if len(listed) == 1 && s.ids[name] == listed[0] && len(s.missingIDs[name]) == 0 {
+		return
+	}
 	s.retireIDsLocked(name, s.missingIDs[name])
 	id := s.ids[name]
 	if id == "" {
@@ -1432,6 +1450,7 @@ func multipartBody(metadata, data []byte) ([]byte, string) {
 		}
 	}
 	var body bytes.Buffer
+	body.Grow(len(metadata) + len(data) + 3*len(boundary) + 256)
 	fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", boundary)
 	body.Write(metadata)
 	fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", boundary)

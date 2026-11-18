@@ -288,6 +288,12 @@ func classifyDriveRequest(ctx context.Context, method, target, contentType strin
 // isWatermarkBody reports whether a PATCH metadata body carries a plain
 // integer description (a watermark ack) rather than a slot frame.
 func isWatermarkBody(body []byte) bool {
+	// A watermark body is {"description":"<integer>"}: well under 100 bytes.
+	// Inline slot frames are far larger; do not JSON-decode them just to
+	// label a timing line.
+	if len(body) > 128 {
+		return false
+	}
 	var doc struct {
 		Description string `json:"description"`
 	}

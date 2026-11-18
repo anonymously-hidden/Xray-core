@@ -943,10 +943,17 @@ func TestDriveGeneratedIDsRejectInvalidRingIdentities(t *testing.T) {
 
 func TestDriveInvalidIDSurplusDoesNotPoisonPool(t *testing.T) {
 	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Query().Get("count") != "6" {
+		// The pool keeps one full generateIds batch, at least 1000 ids.
+		if r.URL.Query().Get("count") != "1000" {
 			t.Fatal("unexpected surplus allocation size")
 		}
-		return memoryResponse(http.StatusOK, `{"ids":["new","a","b","c","d",""]}`), nil
+		ids := make([]string, 1000)
+		for i := range ids {
+			ids[i] = fmt.Sprint("id", i)
+		}
+		ids[len(ids)-1] = ""
+		payload, _ := json.Marshal(map[string]any{"ids": ids})
+		return memoryResponse(http.StatusOK, string(payload)), nil
 	}))
 	defer s.Close()
 	s.idPool = []idPoolEntry{{id: "saved", at: time.Now()}}
@@ -1112,15 +1119,17 @@ func TestDriveKeyedSlotCreationPreservesMetadataAndMedia(t *testing.T) {
 func TestDriveColdIDsBatchDemandAndSurplus(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		entered, release := make(chan struct{}), make(chan struct{})
+		// The pool keeps one full generateIds batch, at least 1000 ids.
+		const batch = 1000
 		calls := 0
 		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
 			calls++
-			if r.URL.Query().Get("count") != "390" {
+			if r.URL.Query().Get("count") != strconv.Itoa(batch) {
 				t.Fatal("cold allocation did not include bounded surplus")
 			}
 			close(entered)
 			<-release
-			ids := make([]string, 390)
+			ids := make([]string, batch)
 			for i := range ids {
 				ids[i] = fmt.Sprint(i)
 			}
@@ -1156,7 +1165,7 @@ func TestDriveColdIDsBatchDemandAndSurplus(t *testing.T) {
 		s.poolMu.Lock()
 		pooled := len(s.idPool)
 		s.poolMu.Unlock()
-		if calls != 1 || pooled != 260 {
+		if calls != 1 || pooled != batch-2*65 {
 			t.Fatalf("cold allocation requested twice or lost surplus: calls=%d pooled=%d", calls, pooled)
 		}
 		s.Close()
@@ -1955,7 +1964,7 @@ func TestDriveMediaHeadOnlySplitsRanges(t *testing.T) {
 		for _, tc := range []struct {
 			head, cool bool
 			calls      int
-		}{{false, false, 1}, {true, false, 4}, {true, true, 1}} {
+		}{{false, false, 4}, {true, false, 4}, {true, true, 1}} {
 			var calls atomic.Int32
 			rt := roundTrip(func(r *http.Request) (*http.Response, error) {
 				calls.Add(1)

@@ -20,6 +20,14 @@ type idPoolEntry struct {
 
 const idPoolTTL = 10 * time.Minute
 
+// idPoolCap is how many ids the pool keeps: three rings at least, and one full
+// generateIds call so that a burst of new sessions (a page opening many
+// connections) is served from the pool instead of queueing behind one
+// allocation after another. Unused ids cost nothing and expire with idPoolTTL.
+func (s *driveShared) idPoolCap() int {
+	return max(3*s.poolRing, 1000)
+}
+
 // generateIDs asks Drive for n pre-generated ids (n <= 1000).
 func (s *driveStorage) generateIDs(ctx context.Context, n int) ([]string, error) {
 	if n > 1000 {
@@ -111,7 +119,7 @@ func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]stri
 			return out, nil
 		}
 		shortfall := n - take
-		batch := max(shortfall, min(3*s.poolRing, 1000))
+		batch := max(shortfall, min(s.idPoolCap(), 1000))
 		f := &idPoolFlight{done: make(chan struct{})}
 		s.poolFlight = f
 		s.poolMu.Unlock()
@@ -177,14 +185,14 @@ func (s *driveShared) prunePoolLocked() {
 			kept = append(kept, e)
 		}
 	}
-	s.idPool = kept[max(0, len(kept)-3*s.poolRing):]
+	s.idPool = kept[max(0, len(kept)-s.idPoolCap()):]
 }
 
 func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
 	if s.poolFlight != nil || time.Now().Before(s.poolRetryAt) {
 		return nil, 0
 	}
-	want := 3*s.poolRing - len(s.idPool)
+	want := s.idPoolCap() - len(s.idPool)
 	if refreshOld {
 		for _, e := range s.idPool {
 			if time.Since(e.at) > 5*time.Minute {
