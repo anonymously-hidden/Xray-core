@@ -721,11 +721,11 @@ func (w *slotWriter) fetchWatermark() (int64, error) {
 	acked, err := readWatermark(w.ctx, w.store, w.table.Watermark, w.table.lazy)
 	w.ackMu.Lock()
 	w.reading = false
-	if err == nil {
-		w.ackedAt = time.Now()
-		if acked > w.acked {
-			w.acked, w.progress = acked, w.ackedAt
-		}
+	// The attempt counts even when it fails: a failing watermark must not be
+	// read again by every upload that retries its acknowledgement wait.
+	w.ackedAt = time.Now()
+	if err == nil && acked > w.acked {
+		w.acked, w.progress = acked, w.ackedAt
 	}
 	w.ackMu.Unlock()
 	return acked, err

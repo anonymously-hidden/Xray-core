@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -906,6 +907,208 @@ func TestDriveUnkeyedCreateDoesNotReplayAmbiguity(t *testing.T) {
 	}
 }
 
+func TestDriveGeneratedIDsRejectInvalidRingIdentities(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ids  []string
+	}{
+		{"missing", nil},
+		{"short", []string{"one"}},
+		{"extra", []string{"one", "two", "three"}},
+		{"empty", []string{"one", ""}},
+		{"duplicate", []string{"same", "same"}},
+		{"oversized", []string{"one", strings.Repeat("x", maxSlotIDLen+1)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]any{"ids": tc.ids})
+			if err != nil {
+				t.Fatal(err)
+			}
+			s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != "/files/generateIds" || r.URL.Query().Get("count") != "2" {
+					t.Fatal("unexpected ID allocation request")
+				}
+				return memoryResponse(http.StatusOK, string(payload)), nil
+			}))
+			defer s.Close()
+			if ids, err := s.generateIDs(context.Background(), 2); err == nil || ids != nil {
+				t.Fatalf("invalid generated IDs accepted: %q, %v", ids, err)
+			}
+			if len(s.inflight)+len(s.reserved) != 0 {
+				t.Fatal("invalid allocation leaked permits")
+			}
+		})
+	}
+}
+
+func TestDriveInvalidIDSurplusDoesNotPoisonPool(t *testing.T) {
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Query().Get("count") != "6" {
+			t.Fatal("unexpected surplus allocation size")
+		}
+		return memoryResponse(http.StatusOK, `{"ids":["new","a","b","c","d",""]}`), nil
+	}))
+	defer s.Close()
+	s.idPool = []idPoolEntry{{id: "saved", at: time.Now()}}
+	ids, err := s.takeIDs(context.Background(), 2, 1)
+	if err == nil || ids != nil || len(s.idPool) != 1 || s.idPool[0].id != "saved" || s.poolFlight != nil {
+		t.Fatalf("invalid surplus entered the pool or consumed existing IDs: %q, %v", ids, err)
+	}
+}
+
+func TestDriveDuplicateCreatePreservesProbeFailure(t *testing.T) {
+	for _, outcome := range []string{"auth", "cancel", "deadline", "missing"} {
+		t.Run(outcome, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+				defer cancel()
+				creates, reads, tokens := 0, 0, 0
+				s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+					switch {
+					case r.Method == http.MethodPost && r.URL.Path == "/files":
+						creates++
+						return memoryResponse(http.StatusConflict, "duplicate"), nil
+					case r.URL.Path == "/token":
+						tokens++
+						return memoryResponse(http.StatusBadRequest, `{"error":"invalid_grant"}`), nil
+					case r.Method == http.MethodGet && r.URL.Path == "/files/item":
+						reads++
+						switch outcome {
+						case "auth":
+							return memoryResponse(http.StatusUnauthorized, ""), nil
+						case "cancel":
+							cancel()
+							return nil, r.Context().Err()
+						case "deadline":
+							<-ctx.Done()
+							return nil, ctx.Err()
+						default:
+							return memoryResponse(http.StatusNotFound, ""), nil
+						}
+					default:
+						t.Fatal("failed creation probe attempted an update")
+						return nil, io.ErrUnexpectedEOF
+					}
+				}))
+				defer s.Close()
+				err := s.createSlot(ctx, "item", "streams/session/c2s/s0", "frame", nil)
+				switch outcome {
+				case "auth":
+					if !isAuthError(err) || tokens != 1 {
+						t.Fatalf("duplicate fallback hid terminal authentication: %v", err)
+					}
+				case "cancel":
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("duplicate fallback hid cancellation: %v", err)
+					}
+				case "deadline":
+					if !errors.Is(err, context.DeadlineExceeded) {
+						t.Fatalf("duplicate fallback hid deadline: %v", err)
+					}
+				default:
+					var conflict createError
+					if !errors.As(err, &conflict) || conflict.status != http.StatusConflict {
+						t.Fatalf("missing duplicate target lost the original create error: %v", err)
+					}
+				}
+				if creates != 1 || reads != 1 || len(s.inflight)+len(s.reserved) != 0 {
+					t.Fatal("duplicate fallback retried or leaked permits")
+				}
+			})
+		})
+	}
+}
+
+func TestDriveKeyedSlotCreationPreservesMetadataAndMedia(t *testing.T) {
+	for _, media := range []bool{false, true} {
+		for _, duplicate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("media=%v/duplicate=%v", media, duplicate), func(t *testing.T) {
+				creates, reads, updates := 0, 0, 0
+				var body []byte
+				if media {
+					body = []byte("media payload")
+				}
+				name, id, description := "streams/session/c2s/s0", "item", "frame"
+				s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+					if r.URL.Query().Get("supportsAllDrives") != "true" {
+						t.Fatal("keyed slot request lost shared-drive support")
+					}
+					if r.Method == http.MethodGet {
+						reads++
+						if !duplicate || r.URL.Path != "/files/"+id || r.URL.Query().Get("fields") != "description" {
+							t.Fatal("unexpected duplicate probe")
+						}
+						return memoryResponse(http.StatusOK, `{"description":"old frame"}`), nil
+					}
+					var metadata map[string]any
+					if media {
+						_, parameters, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+						if err != nil || r.URL.Query().Get("uploadType") != "multipart" {
+							t.Fatalf("media slot lost multipart upload: %v", err)
+						}
+						multipart := multipart.NewReader(r.Body, parameters["boundary"])
+						part, err := multipart.NextPart()
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := json.NewDecoder(part).Decode(&metadata); err != nil {
+							t.Fatal(err)
+						}
+						part, err = multipart.NextPart()
+						if err != nil {
+							t.Fatal(err)
+						}
+						got, err := io.ReadAll(part)
+						if err != nil || !bytes.Equal(got, body) {
+							t.Fatalf("media slot payload changed: %v", err)
+						}
+					} else if err := json.NewDecoder(r.Body).Decode(&metadata); err != nil {
+						t.Fatal(err)
+					}
+					if metadata["description"] != description {
+						t.Fatal("slot description changed")
+					}
+					base := "/files"
+					if media {
+						base = "/upload"
+					}
+					if r.Method == http.MethodPost {
+						creates++
+						parents, ok := metadata["parents"].([]any)
+						if r.URL.Path != base || metadata["id"] != id || metadata["name"] != flatten(name) || !ok || len(parents) != 1 || parents[0] != "fake-folder" {
+							t.Fatal("keyed creation lost identity, name, or parent")
+						}
+						if duplicate {
+							return memoryResponse(http.StatusConflict, "duplicate"), nil
+						}
+					} else if r.Method == http.MethodPatch {
+						updates++
+						if !duplicate || r.URL.Path != base+"/"+id || len(metadata) != 1 {
+							t.Fatal("duplicate fallback changed existing identity metadata")
+						}
+					} else {
+						t.Fatal("unexpected keyed slot method")
+					}
+					return memoryResponse(http.StatusOK, `{"id":"item"}`), nil
+				}))
+				s.uploadURL += "?uploadType=multipart&fields=id,name"
+				defer s.Close()
+				if err := s.createSlot(context.Background(), id, name, description, body); err != nil {
+					t.Fatal(err)
+				}
+				wantFallback := 0
+				if duplicate {
+					wantFallback = 1
+				}
+				cached, ok := s.cachedID(flatten(name))
+				if creates != 1 || reads != wantFallback || updates != wantFallback || !ok || cached != id || len(s.inflight)+len(s.reserved) != 0 {
+					t.Fatal("keyed creation lost identity, duplicated work, or leaked permits")
+				}
+			})
+		}
+	}
+}
+
 func TestDriveColdIDsBatchDemandAndSurplus(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		entered, release := make(chan struct{}), make(chan struct{})
@@ -975,6 +1178,61 @@ func TestDriveIDWaiterIgnoresWrappedCallerCancellation(t *testing.T) {
 		s.poolMu.Unlock()
 		if err := <-done; err != nil || s.poolErr != nil || !s.poolRetryAt.IsZero() {
 			t.Fatalf("caller cancellation poisoned another allocation: %v", err)
+		}
+	})
+}
+
+// A flight can fail after it filled the pool, so the waiter must look at the
+// pool before it repeats the flight's failure.
+func TestDriveIDWaiterTakesPoolAfterFailedFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected allocation"); return nil, io.EOF }))
+		f := &idPoolFlight{done: make(chan struct{})}
+		s.poolFlight = f
+		done := make(chan error, 1)
+		go func() { _, err := s.takeIDs(context.Background(), 1, 1); done <- err }()
+		synctest.Wait()
+		s.poolMu.Lock()
+		s.idPool = append(s.idPool, idPoolEntry{id: "available", at: time.Now()})
+		s.coolUntil = time.Now().Add(time.Hour)
+		s.finishPoolFlightLocked(f, errors.New("generateIds failed"))
+		s.poolMu.Unlock()
+		if err := <-done; err != nil {
+			t.Fatalf("waiter repeated a flight failure although the pool was filled: %v", err)
+		}
+	})
+}
+
+// The death of one session must not leave the shared pool in error: the other
+// sessions have to be able to allocate for themselves.
+func TestDriveIDPoolSessionCloseDoesNotPoisonWaiters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			count, err := strconv.Atoi(r.URL.Query().Get("count"))
+			if err != nil || count <= 0 {
+				t.Fatalf("unexpected id request %v", r.URL)
+			}
+			ids := make([]string, count)
+			for i := range ids {
+				ids[i] = fmt.Sprint("id", i)
+			}
+			body, _ := json.Marshal(map[string]any{"ids": ids})
+			return memoryResponse(http.StatusOK, string(body)), nil
+		}))
+		f := &idPoolFlight{done: make(chan struct{})}
+		s.poolFlight = f
+		done := make(chan error, 1)
+		go func() { _, err := s.takeIDs(context.Background(), 1, 1); done <- err }()
+		synctest.Wait()
+		s.poolMu.Lock()
+		s.coolUntil = time.Now().Add(time.Minute)
+		s.finishPoolFlightLocked(f, fmt.Errorf("Drive request failed: %w", errSessionClosed))
+		s.poolMu.Unlock()
+		if err := <-done; err != nil {
+			t.Fatalf("a dying session poisoned another session: %v", err)
+		}
+		if s.poolErr != nil || !s.poolRetryAt.IsZero() {
+			t.Fatalf("a dying session left the shared pool in error: %v", s.poolErr)
 		}
 	})
 }
@@ -1493,6 +1751,59 @@ func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
 	})
 }
 
+// The token backoff exists to spare the token endpoint. A wait that cannot end
+// inside the request's own budget is pure latency: report the last token error
+// now instead of stalling the caller for the whole budget.
+func TestDriveTokenBackoffBeyondBudgetFailsFast(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		calls := 0
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { calls++; return nil, fmt.Errorf("unexpected request") }))
+		s.token = ""
+		s.lastTokenErr = fmt.Errorf("token unavailable")
+		s.tokenRetryAt = time.Now().Add(2 * driveAuthBudget)
+		started := time.Now()
+		if _, err := s.accessToken(context.Background()); !errors.Is(err, s.lastTokenErr) || time.Since(started) != 0 || calls != 0 {
+			t.Fatalf("token backoff stalled a request: %v after %v calls=%d", err, time.Since(started), calls)
+		}
+	})
+}
+
+// A refresh grant can be rejected while the cached access token is still valid;
+// that must not discard the usable token before it expires.
+func TestDriveCachedTokenSurvivesRefreshRejection(t *testing.T) {
+	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected request"); return nil, io.EOF }))
+	s.tokenMu.Lock()
+	s.authErr = authError{code: "invalid_grant"}
+	s.tokenMu.Unlock()
+	if token, err := s.accessToken(context.Background()); err != nil || token != "fake" {
+		t.Fatalf("rejected refresh discarded a valid access token: token=%q err=%v", token, err)
+	}
+}
+
+// A persistent API 401 means the answer will not change. One retry with a
+// freshly fetched token may ride out a token that expired early; refetching a
+// token for all eight attempts only multiplies requests against the account.
+func TestDriveRejectedTokenStopsAfterOneRefresh(t *testing.T) {
+	var tokens, api atomic.Int32
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/token" {
+			tokens.Add(1)
+			return memoryResponse(http.StatusOK, `{"access_token":"fresh","expires_in":3600}`), nil
+		}
+		api.Add(1)
+		return memoryResponse(http.StatusUnauthorized, `{"error":{"code":401}}`), nil
+	}))
+	if _, _, err := s.do(context.Background(), http.MethodGet, "http://drive.invalid/files/item", "", nil); err == nil || !isAuthError(err) {
+		t.Fatalf("persistent 401 was retried instead of reported: %v", err)
+	}
+	if got := api.Load(); got != 2 {
+		t.Fatalf("persistent 401 spent %d API calls, want 2", got)
+	}
+	if got := tokens.Load(); got != 1 {
+		t.Fatalf("persistent 401 fetched %d tokens, want 1", got)
+	}
+}
+
 func TestDriveQuota403SurvivesCompleteErrorBodyReadFailure(t *testing.T) {
 	for _, create := range []bool{false, true} {
 		driveClock(t, func(t *testing.T) {
@@ -1557,14 +1868,12 @@ func TestDriveRejectedStatusSurvivesBodyReadFailure(t *testing.T) {
 func TestDriveQuotaRetryBudget(t *testing.T) {
 	for _, tc := range []struct {
 		elapsed      time.Duration
-		refunded     int
 		refund, stop bool
 	}{
-		{driveRateLimitBudget - time.Nanosecond, 0, true, false},
-		{driveRateLimitBudget, 0, false, false},
-		{driveRateLimitBudget, 1, false, true},
+		{driveRateLimitBudget - time.Nanosecond, true, false},
+		{driveRateLimitBudget, false, true},
 	} {
-		if refund, stop := driveQuotaRetry(tc.elapsed, tc.refunded); refund != tc.refund || stop != tc.stop {
+		if refund, stop := driveQuotaRetry(tc.elapsed); refund != tc.refund || stop != tc.stop {
 			t.Fatalf("quota policy at %v: refund=%v stop=%v", tc.elapsed, refund, stop)
 		}
 	}
@@ -1576,6 +1885,25 @@ func TestDriveQuotaRetryBudget(t *testing.T) {
 			t.Fatalf("cleanup quota response %d cooled or succeeded", status)
 		}
 	}
+}
+
+// A request whose first rate-limited answer arrives after the budget is spent
+// must stop there: the budget is the limit, not the attempt count.
+func TestDriveQuotaBudgetStopsLateRateLimit(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		var calls atomic.Int32
+		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			<-time.After(driveRateLimitBudget + time.Second)
+			return memoryResponse(http.StatusTooManyRequests, `{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}`), nil
+		}))
+		if _, _, err := s.do(context.Background(), http.MethodGet, "http://drive.invalid/files/item", "", nil); err == nil {
+			t.Fatal("rate limited request succeeded")
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("late rate limit spent %d Drive calls, want 1", got)
+		}
+	})
 }
 
 func TestDriveDescriptionRescueRearms(t *testing.T) {

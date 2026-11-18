@@ -39,6 +39,16 @@ func (s *driveStorage) generateIDs(ctx context.Context, n int) ([]string, error)
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return nil, errors.New("failed to parse Drive generateIds").Base(err)
 	}
+	if len(parsed.IDs) != n {
+		return nil, errors.New("Drive returned ", len(parsed.IDs), " ids, want ", n)
+	}
+	seen := make(map[string]bool, len(parsed.IDs))
+	for _, id := range parsed.IDs {
+		if len(id) == 0 || len(id) > maxSlotIDLen || seen[id] {
+			return nil, errors.New("Drive returned invalid or repeated generated ids")
+		}
+		seen[id] = true
+	}
 	return parsed.IDs, nil
 }
 
@@ -70,8 +80,14 @@ func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]stri
 				case <-f.done:
 					// A cold allocation belongs to its caller. Its cancellation
 					// must not cancel other sessions waiting for IDs.
-					if f.err != nil && !stderrors.Is(f.err, context.Canceled) && !stderrors.Is(f.err, context.DeadlineExceeded) {
-						return nil, f.err
+					s.poolMu.Lock()
+					filled := len(s.idPool) >= n
+					s.poolMu.Unlock()
+					if filled {
+						continue
+					}
+					if err := flightFailure(f.err); err != nil {
+						return nil, err
 					}
 				}
 				continue
@@ -187,7 +203,7 @@ func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
 func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
 	f.err = err
 	s.poolErr = err
-	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) {
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) || stderrors.Is(err, errSessionClosed) {
 		s.poolErr = nil
 		s.poolRetryAt = time.Time{}
 	} else if err != nil {
@@ -199,6 +215,17 @@ func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
 	}
 	s.poolFlight = nil
 	close(f.done)
+}
+
+// flightFailure reports the error a waiter must see for a finished flight. A
+// cancelled flight, or the death of the session that owned it, says nothing
+// about the pool: the waiter has to look at the pool and, when it is still
+// short, allocate for itself.
+func flightFailure(err error) error {
+	if err == nil || stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) || stderrors.Is(err, errSessionClosed) {
+		return nil
+	}
+	return err
 }
 
 func (s *driveStorage) refillIDs(ctx context.Context, f *idPoolFlight, want int) {
@@ -297,6 +324,8 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 			}
 			s.rememberID(flat, id, nil)
 			return nil
+		} else if isAuthError(derr) || stderrors.Is(derr, context.Canceled) || stderrors.Is(derr, context.DeadlineExceeded) {
+			return derr
 		}
 	}
 	return err

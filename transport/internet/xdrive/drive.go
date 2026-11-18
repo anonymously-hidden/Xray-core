@@ -371,11 +371,6 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 		s.tokenMu.Unlock()
 		return "", context.Canceled
 	}
-	if s.authErr != nil {
-		err := s.authErr
-		s.tokenMu.Unlock()
-		return "", err
-	}
 	if s.token != "" && time.Now().Before(s.tokenExpiry) {
 		if s.tokenLifetime > 0 && time.Until(s.tokenExpiry) < s.tokenLifetime/5 && s.flight == nil && time.Now().After(s.tokenRetryAt) {
 			if refreshCtx, finish, ok := s.beginWork(30 * time.Second); ok {
@@ -384,9 +379,16 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 				go func() { defer finish(); s.refreshTokenBackground(refreshCtx, f) }()
 			}
 		}
+		// A rejected refresh grant must not discard a token that Drive still
+		// accepts: serve it until it expires, then report the grant error.
 		token := s.token
 		s.tokenMu.Unlock()
 		return token, nil
+	}
+	if s.authErr != nil {
+		err := s.authErr
+		s.tokenMu.Unlock()
+		return "", err
 	}
 	if f := s.flight; f != nil {
 		s.tokenMu.Unlock()
@@ -401,12 +403,19 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 		return f.token, nil
 	}
 	if time.Now().Before(s.tokenRetryAt) && s.lastTokenErr != nil {
+		err := s.lastTokenErr
+		wait := time.Until(s.tokenRetryAt)
+		// A reserved lane never waits, and a wait that cannot finish inside
+		// this request's own budget would only burn that budget and then hide
+		// the token error: report the error now.
 		if ctx.Value(laneKey{}) != nil {
-			err := s.lastTokenErr
 			s.tokenMu.Unlock()
 			return "", err
 		}
-		wait := time.Until(s.tokenRetryAt)
+		if deadline, ok := ctx.Deadline(); ok && wait >= time.Until(deadline) {
+			s.tokenMu.Unlock()
+			return "", err
+		}
 		s.tokenMu.Unlock()
 		timer := time.NewTimer(wait)
 		defer timer.Stop()
@@ -599,8 +608,13 @@ func retryableStatus(status int) bool {
 	return false
 }
 
-func driveQuotaRetry(elapsed time.Duration, refunded int) (refund, stop bool) {
-	return elapsed < driveRateLimitBudget, elapsed >= driveRateLimitBudget && refunded > 0
+// driveQuotaRetry tells the request loop whether a rate-limited attempt may be
+// refunded (the budget is not spent yet) or whether the budget is spent and
+// the request must stop. The budget is the limit: a request that is answered
+// with a rate limit only after the budget is gone must not spend another
+// attempt on an account that is already refusing it.
+func driveQuotaRetry(elapsed time.Duration) (refund, stop bool) {
+	return elapsed < driveRateLimitBudget, elapsed >= driveRateLimitBudget
 }
 
 type createOnceKey struct{}
@@ -631,6 +645,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 
 	firstTry := time.Now()
 	refunded := 0
+	rejected := 0
 	for attempt := 0; attempt-refunded < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
@@ -902,6 +917,12 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
 			lastErr = errors.New("Drive rejected the access token")
+			// One retry with a freshly fetched token can ride out a token that
+			// expired early. A second rejection means the answer will not
+			// change: stop instead of fetching a token for every attempt.
+			if rejected++; rejected > 1 {
+				return 0, nil, authError{code: "401"}
+			}
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
@@ -914,7 +935,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				" bytes, body read ", strings.Contains(target, "alt=media"),
 				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
-			if refund, stop := driveQuotaRetry(time.Since(firstTry), refunded); refund {
+			if refund, stop := driveQuotaRetry(time.Since(firstTry)); refund {
 				refunded++
 			} else if stop {
 				// the budget is spent: give up now, not after eight more attempts

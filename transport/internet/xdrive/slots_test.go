@@ -1654,6 +1654,24 @@ func TestSlotWriterWatermarkAuthFailureIsTerminal(t *testing.T) {
 	})
 }
 
+// A failed watermark read is an attempt: it must space the next read by the
+// watermark TTL instead of letting every upload retry start a new GET.
+func TestSlotWatermarkFailureIsRateLimited(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		failure := io.ErrUnexpectedEOF
+		calls := 0
+		store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) { calls++; return "", failure }}
+		w := newSlotWriter(context.Background(), store, slotTable{Slots: []string{"slot"}, Watermark: "watermark"}, paramsFromConfig(&Config{}))
+		defer func() { w.cancel(); w.wait() }()
+		if _, err := w.drained(1); err != failure || calls != 1 {
+			t.Fatalf("first watermark read: err=%v calls=%d", err, calls)
+		}
+		if _, err := w.drained(1); err != nil || calls != 1 {
+			t.Fatalf("failed watermark was retried without the TTL: err=%v calls=%d", err, calls)
+		}
+	})
+}
+
 func TestSlotFreshPresenceResetsAbsenceBudget(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		requests := make(chan struct{}, 1)
