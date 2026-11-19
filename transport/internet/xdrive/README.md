@@ -8,7 +8,12 @@ Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);
 prefetched non-head frames use one range per 512 KiB, capped at four. After two
 seconds without progress after dispatch, a pending range may race one duplicate
-on the separate bulk connection. Headers and body bytes reset this clock;
+on the separate bulk connection. For slot reads with promotion tracking, a
+prefetched range defers this recovery until its frame becomes the delivery head.
+Promotion rechecks the primary's existing stall age and active status, rather
+than imposing another two-second delay. Standalone callers without a nonnil
+promotion channel retain their previous recovery policy. Headers and body bytes
+reset this clock;
 token/permit/connection waits do not start it. Completed ranges are retained.
 Moving transfers do not trigger duplicates. Generic slot-body reads also have a
 two-second hedge; Drive frame
@@ -24,6 +29,11 @@ or retry recovery can suppress a queued duplicate. Primary retries are unchanged
 but later retry attempts do not acquire another hedge; recovery latency after a
 failed first attempt can therefore differ. A spent timer does not wait for new
 hedge tokens or the end of a cooldown.
+`hedge-deferrals` counts expired nonhead recovery opportunities, not saved API
+calls: promotion may admit one later, and normal quota/budget checks still apply.
+Primary GETs, ranges, windows, and budgets are unchanged; useful speculative
+recovery can start later. Deferral does not guarantee fewer requests in every
+workload, since preserved tokens can instead fund delivery-head recovery.
 
 Heads and watermarks use a separate pooled control connection so speculative
 reads and uploads do not share their HTTP connection. This adds a connection
@@ -126,9 +136,10 @@ number so retry/error responses are distinguishable. Media lines include sequenc
 range (exclusive end), whole-frame and requested-range byte sizes, rescue status,
 and head-marker/promotion state at dispatch and HTTP completion. The head state
 is sticky once promoted, not evidence of HTTP priority or the current head after
-a losing rescue outlives its primary. Promotion tracking is diagnostic only; it
-does not reprioritize or restart requests. These details add no API calls and do
-not themselves improve download speed. Unobserved phases are reported as
+a losing rescue outlives its primary. Head flags are diagnostic; promotion can
+wake deferred media recovery but does not reprioritize or restart primary GETs.
+These diagnostic details add no API calls and do not themselves improve download
+speed. Unobserved phases are reported as
 unavailable (`-1ns`).
 Sum units across operation types and peers when comparing usage
 with the project's effective quota. These are estimates using the published
@@ -180,3 +191,17 @@ to media retrieval for that episode, but does not distinguish local queueing,
 first-byte delay, or a moving slow transfer. The excerpt does not cover the
 earlier inline discovery gaps. Phase-tail diagnostics are added before changing
 media scheduling, concurrency, or range counts on this evidence.
+
+### November 19 follow-up (resume.45)
+
+The 10:23:46–10:27:56 client log has four reported timing windows: 309 head
+dispatches with four cancellations (1.3%), and 562 media dispatches with ten
+duplicates and no wins. `quiet-tail-backoffs` remains zero, so this workload
+does not demonstrate savings from that gate. Slow media attempts have negligible
+local permit/connection waits, but first-byte waits up to 3.62 s and body retrieval
+up to 2.94 s. Those phase samples do not justify changing the local permit pool.
+Tracked nonhead duplicate recovery is deferred to preserve budget for delivery.
+The short server excerpt overlaps only the last part of the client log and misses
+its main media slowdown. For matched inline frame 1017, bounded clock alignment
+places most of its 4.73 s head wait before the server PUT began, not in a four-second
+metadata HTTP request. These are different workloads, not matched speed benchmarks.

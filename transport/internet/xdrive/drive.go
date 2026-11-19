@@ -2063,6 +2063,9 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 		return s.descriptionHedgeAllowed()
 	}
 	if media, ok := ctx.Value(driveMediaKey{}).(*driveMediaRequest); ok && media.rescue {
+		if promotion, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{}); promotion != nil && !mediaHead(ctx) {
+			return false
+		}
 		s.coolMu.Lock()
 		defer s.coolMu.Unlock()
 		now := time.Now()

@@ -75,6 +75,7 @@ type timingAggregator struct {
 	failed     [kindCount]int
 	canceled   [kindCount]int
 	rateLimits [kindCount]int
+	deferred   [kindCount]int
 }
 
 // Transport/body failures and cancelled attempts often have no latency sample.
@@ -173,6 +174,14 @@ func (a *timingAggregator) noteHedgeWin(kind int) {
 	a.mu.Unlock()
 }
 
+// A deferral is an expired nonhead recovery opportunity, not a saved API call:
+// promotion may later admit it, and ordinary quota/budget checks still apply.
+func (a *timingAggregator) noteDeferredHedge(kind int) {
+	a.mu.Lock()
+	a.deferred[kind]++
+	a.mu.Unlock()
+}
+
 func (a *timingAggregator) loop() {
 	t := time.NewTicker(timingWindow)
 	defer t.Stop()
@@ -253,6 +262,7 @@ type timingBatch struct {
 	samples                      []timingSample
 	requests, conns, hedges, won int
 	failed, canceled, rateLimits int
+	deferred                     int
 }
 
 func (a *timingAggregator) snapshot() [kindCount]timingBatch {
@@ -264,9 +274,11 @@ func (a *timingAggregator) snapshot() [kindCount]timingBatch {
 			samples:  append([]timingSample(nil), a.ring[k][:a.n[k]]...),
 			requests: a.requests[k], conns: a.conns[k], hedges: a.hedges[k], won: a.won[k],
 			failed: a.failed[k], canceled: a.canceled[k], rateLimits: a.rateLimits[k],
+			deferred: a.deferred[k],
 		}
 		a.n[k], a.pos[k], a.conns[k], a.hedges[k], a.won[k], a.requests[k] = 0, 0, 0, 0, 0, 0
 		a.failed[k], a.canceled[k], a.rateLimits[k] = 0, 0, 0
+		a.deferred[k] = 0
 	}
 	return batches
 }
@@ -274,7 +286,7 @@ func (a *timingAggregator) snapshot() [kindCount]timingBatch {
 func (a *timingAggregator) flush() {
 	for k, batch := range a.snapshot() {
 		n := len(batch.samples)
-		if n == 0 && batch.requests == 0 && batch.hedges == 0 && batch.won == 0 && batch.failed == 0 && batch.canceled == 0 && batch.rateLimits == 0 {
+		if n == 0 && batch.requests == 0 && batch.hedges == 0 && batch.won == 0 && batch.failed == 0 && batch.canceled == 0 && batch.rateLimits == 0 && batch.deferred == 0 {
 			continue
 		}
 		total := make([]time.Duration, 0, n)
@@ -327,6 +339,7 @@ func (a *timingAggregator) flush() {
 			" server p50 ", percentile(server, .5),
 			" body p50 ", percentile(body, .5),
 			" newconns=", batch.conns, " hedges=", batch.hedges, " won=", batch.won,
+			" hedge-deferrals=", batch.deferred,
 			" send-p50/p95/max=", percentile(send, .5), "/", percentile(send, .95), "/", percentile(send, 1),
 			" pool-p95/max=", percentile(pool, .95), "/", percentile(pool, 1),
 			" connection-p95/max=", percentile(conn, .95), "/", percentile(conn, 1),

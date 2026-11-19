@@ -33,7 +33,7 @@ type driveMediaKey struct{}
 type mediaHeadKey struct{}
 type mediaPromotionKey struct{}
 
-// Promotion is diagnostic only: range shape and in-flight requests stay intact.
+// Promotion observes head eligibility without reshaping or restarting a primary.
 func mediaHead(ctx context.Context) bool {
 	if ctx.Value(mediaHeadKey{}) != nil {
 		return true
@@ -185,6 +185,8 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	var timer *time.Timer
 	var hedgeAt <-chan time.Time
 	var dispatched <-chan struct{}
+	var promoted <-chan struct{}
+	promotion, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
 	if slotBodyHedge > 0 {
 		dispatched = primary.dispatched
 	}
@@ -212,6 +214,14 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			remaining, _ := primary.remaining(slotBodyHedge)
 			timer = time.NewTimer(max(0, remaining))
 			hedgeAt = timer.C
+		case <-promoted:
+			promoted = nil
+			remaining, active := primary.remaining(slotBodyHedge)
+			if active {
+				// Use the existing stall age, not another two-second delay.
+				timer.Reset(max(0, remaining))
+				hedgeAt = timer.C
+			}
 		case <-hedgeAt:
 			helper := r
 			helper.rescue = true
@@ -227,6 +237,15 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			if remaining > 0 {
 				timer.Reset(remaining)
 				hedgeAt = timer.C
+				continue
+			}
+			if promotion != nil && !mediaHead(ctx) {
+				// Keep the primary running, but reserve duplicate work for a
+				// frame that blocks delivery. Missing/nil tracking stays legacy.
+				promoted = promotion
+				if s.timing != nil {
+					s.timing.noteDeferredHedge(kindBodyRead)
+				}
 				continue
 			}
 			if !s.readHedgeAllowed(context.WithValue(ctx, driveMediaKey{}, &helper)) || !s.takeMediaHedgeToken() {
