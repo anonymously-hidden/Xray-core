@@ -7,15 +7,23 @@ connections sharing that stream also share its head-of-line delays.
 Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);
 prefetched non-head frames use one range per 512 KiB, capped at four. After two
-seconds without progress, a pending range may race one duplicate on the separate
-bulk connection. Completed ranges are retained. Moving transfers do not trigger
-duplicates. Generic slot-body reads also have a two-second hedge; Drive frame
+seconds without progress after dispatch, a pending range may race one duplicate
+on the separate bulk connection. Headers and body bytes reset this clock;
+token/permit/connection waits do not start it. Completed ranges are retained.
+Moving transfers do not trigger duplicates. Generic slot-body reads also have a
+two-second hedge; Drive frame
 reads use the per-range layer rather than duplicating the entire frame. Priority
 description reads have a 900 ms no-progress hedge starting at dispatch, not while
 queued. Speculative descriptions do not hedge. Description recovery allows one
 concurrent hedge per session, one dispatch per hedge, and no hedges for one minute
 after a confirmed live rate limit. Each layer has a bounded hedge budget. Recent
 403/429 rate limits also suppress media hedges and reduce new frames to one range.
+Media duplicates likewise get one dispatch, not their own retry loop. All Drive
+read duplicates recheck primary progress at dispatch admission, so known progress
+or retry recovery can suppress a queued duplicate. Primary retries are unchanged,
+but later retry attempts do not acquire another hedge; recovery latency after a
+failed first attempt can therefore differ. A spent timer does not wait for new
+hedge tokens or the end of a cooldown.
 
 Heads and watermarks use a separate pooled control connection so speculative
 reads and uploads do not share their HTTP connection. This adds a connection
@@ -50,8 +58,13 @@ and unchanged.
 ## Capacity and diagnostics
 
 For browsing, distant description lookahead backs off after repeated misses,
-while head promotion and near-head admission still interrupt that wait. During
-cooldown and for five seconds after a rate limit, the slot reader admits only
+while head promotion and near-head admission still interrupt that wait. A primary
+metadata read starts immediately; extra overlapping head reads wait 1.5 times the
+smoothed completed-description latency (250 ms initially, bounded to 100 ms–1 s).
+Promotion and write wakeups retain an outstanding read's launch age instead of
+starting more copies at each 25 ms tick. This trades more aggressive speculative
+visibility for fewer discarded reads; stalled heads retain bounded overlap.
+During cooldown and for five seconds after a rate limit, the slot reader admits only
 one metadata hunt at a time per slot instead of three overlapping hunts. These
 changes reduce wasted stale-frame reads without changing framing or poll settings.
 If a metadata-only lazy create is retried and the existing description already
@@ -80,6 +93,10 @@ Debug `xdrive read` lines report `discover` (time until the expected frame was
 first seen), `body` (time in media downloads, including failed rounds), and
 `blocked` (time a completed segment waited behind its predecessors). `fetch`
 also includes prefetch admission and polling waits; it is not an HTTP timeout.
+`head-wait` measures the time from the ordered reader's first wait for that head
+until it was ready (zero if prefetched already). It separates actual delivery
+waiting from prefetch age. `overlap-delay` reports the current metadata overlap
+threshold. Neither is a website response-time measurement.
 Per-minute timing lines report `requests` and estimated `units` for all sent
 attempts, including retries/cancelled hedges. `n` remains the capped latency
 sample count. `failed` and `canceled` count transport/body failures, while
@@ -99,3 +116,13 @@ credential rejection fails immediately.
 To verify live, compare body latency, blocking episodes, player buffer health,
 and request units over the same video workload. A high `discover` with low
 `body` requires peer-side timing to distinguish slow uploads from discovery.
+
+### November 19 browsing baseline (resume.43)
+
+The supplied 08:15:58–08:25:13 log contains nine full timing windows: 3,320
+head-read dispatches, of which 1,781 were canceled; 9,769 other metadata dispatches;
+and 830 media dispatches with ten duplicates and no duplicate wins. There were no
+confirmed rate limits or failed attempts in those windows. Completed metadata
+reads were typically around 330 ms. These observations motivate latency-aware
+overlap and dispatch-aware media recovery; they do not prove a speedup for the
+next changes or establish a like-for-like comparison with an older workload.

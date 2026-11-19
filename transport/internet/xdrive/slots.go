@@ -991,6 +991,10 @@ type slotReader struct {
 	lazy         bool
 	seen         []bool
 	wmCreated    bool
+
+	// Completed description latency, including store waits, guards only head
+	// overlap admission; primary reads and the polling tick are unchanged.
+	descriptionLatency time.Duration // guarded by mu
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
@@ -1079,6 +1083,7 @@ type slotFetch struct {
 	end       bool
 	err       error
 	born      time.Time
+	headAt    time.Time // run's first wait for this head, not prefetch admission
 	readyAt   time.Time
 	visibleAt time.Time
 	bodyTime  time.Duration
@@ -1132,6 +1137,9 @@ func (r *slotReader) run() {
 		}
 
 		f := fetches[head]
+		if f.headAt.IsZero() {
+			f.headAt = time.Now()
+		}
 		select {
 		case <-f.ready:
 		case <-r.grow:
@@ -1157,7 +1165,8 @@ func (r *slotReader) run() {
 			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body),
 			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
-			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime)
+			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
+			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay())
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1419,6 +1428,7 @@ type slotDescriptionResult struct {
 type slotDescriptionHunt struct {
 	results      chan slotDescriptionResult
 	outstanding  int
+	lastLaunch   time.Time // retained across observations and tail promotion
 	last         slotDescriptionResult
 	seen         bool
 	err          error
@@ -1449,6 +1459,19 @@ func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int
 	defer cancel()
 	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	return r.huntSlotDescription(ctx, id, seq, promoted, &hunt)
+}
+
+func (r *slotReader) headOverlapDelay() time.Duration {
+	r.mu.Lock()
+	latency := r.descriptionLatency
+	r.mu.Unlock()
+	delay := 250 * time.Millisecond
+	if latency > 0 {
+		delay = latency + latency/2
+	}
+	// Allow a normal request to finish before duplicating it, but retain
+	// bounded recovery when requests stall or the latency estimate is cold.
+	return min(max(delay, max(4*r.huntCeiling, 100*time.Millisecond)), time.Second)
 }
 
 func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}, pending *slotDescriptionHunt) (string, error) {
@@ -1499,6 +1522,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	defer observationTimer.Stop()
 	launch := func() {
 		pending.outstanding++
+		pending.lastLaunch = time.Now()
 		readCtx := ctx
 		role := head
 		if head {
@@ -1514,13 +1538,31 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			} else {
 				r.tailReads.Add(1)
 			}
+			began := time.Now()
 			description, err := r.store.readDescription(readCtx, id)
+			if elapsed := time.Since(began); elapsed > 0 && (err == nil || err == errNotFound) && ctx.Err() == nil {
+				// Empty/stale frames and 404s are completed observations too;
+				// cancelled siblings and errors must not train the estimate.
+				r.mu.Lock()
+				if r.descriptionLatency == 0 {
+					r.descriptionLatency = elapsed
+				} else {
+					r.descriptionLatency += (elapsed - r.descriptionLatency) / 8
+				}
+				r.mu.Unlock()
+			}
 			results <- slotDescriptionResult{description, err}
 		}()
 	}
-	if pending.outstanding < budget() {
-		launch()
+	admit := func() {
+		// Never hold back a primary. Every additional head read waits from
+		// the latest launch, including a pending tail read on promotion, so
+		// observation yields and Wake cannot refill the overlap at 25ms.
+		if pending.outstanding < budget() && (pending.outstanding == 0 || head && time.Since(pending.lastLaunch) >= r.headOverlapDelay()) {
+			launch()
+		}
 	}
+	admit()
 	for {
 		select {
 		case res := <-pending.results:
@@ -1562,6 +1604,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			// Keep the pending tail read in the head's overlap budget rather
 			// than waiting for it to finish before starting the head hunt.
 			hunt()
+			admit()
 		case <-ticks:
 			r.mu.Lock()
 			idle := time.Since(r.activeAt) > r.eagerWindow
@@ -1571,14 +1614,12 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 				err := pending.err
 				pending.err = nil
 				return pending.last.description, err
-			case !idle && pending.outstanding < budget():
-				launch()
+			case !idle:
+				admit()
 			}
 		case <-wake:
 			hunt()
-			if pending.outstanding < budget() {
-				launch()
-			}
+			admit()
 		case <-observationTimer.C:
 			if pending.seen {
 				err := pending.err

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -127,21 +126,12 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 
 // A hedge races only the missing range on the separate bulk connection, never
 // redownloads completed ranges, and never cancels a primary that is progressing.
-// Its stall clock is per range, so an earlier slow full-body download cannot
-// inflate recovery delays for every later segment.
+// Its per-range stall clock starts at dispatch, follows headers/body progress,
+// and stops when the primary starts its own retry recovery.
 func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driveMediaRequest) ([]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var progress struct {
-		sync.Mutex
-		at time.Time
-	}
-	progress.at = time.Now()
-	ctx = context.WithValue(ctx, bodyProgressKey{}, func() {
-		progress.Lock()
-		progress.at = time.Now()
-		progress.Unlock()
-	})
+	primary := &driveReadProgress{dispatched: make(chan struct{})}
 	type result struct {
 		body  []byte
 		err   error
@@ -150,12 +140,17 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	results := make(chan result, 2)
 	launch := func(hedge bool) {
 		request := r
+		requestCtx := ctx
 		if hedge {
 			request.client = s.bulkClient
 			request.rescue = true
+			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, readHedgeGate{primary: primary, delay: slotBodyHedge})
+		} else {
+			requestCtx = context.WithValue(requestCtx, readProgressKey{}, primary)
+			requestCtx = context.WithValue(requestCtx, bodyProgressKey{}, primary.progress)
 		}
 		go func() {
-			status, body, err := s.do(context.WithValue(ctx, driveMediaKey{}, &request), http.MethodGet, target, "", nil)
+			status, body, err := s.do(context.WithValue(requestCtx, driveMediaKey{}, &request), http.MethodGet, target, "", nil)
 			if err == nil {
 				switch status {
 				case http.StatusOK, http.StatusPartialContent:
@@ -173,15 +168,13 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	// The hedge delay is that of slot body reads; the budget is the media one.
 	var timer *time.Timer
 	var hedgeAt <-chan time.Time
+	var dispatched <-chan struct{}
 	if slotBodyHedge > 0 {
-		timer = time.NewTimer(slotBodyHedge)
-		defer timer.Stop()
-		hedgeAt = timer.C
+		dispatched = primary.dispatched
 	}
-	hedged, won := false, false
 	defer func() {
-		if hedged && s.timing != nil {
-			s.timing.noteHedge(kindBodyRead, won)
+		if timer != nil {
+			timer.Stop()
 		}
 	}()
 	for {
@@ -190,30 +183,39 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			pending--
 			if res.err == nil {
 				s.noteMediaRange()
-				won = res.hedge
+				if res.hedge && s.timing != nil {
+					s.timing.noteHedgeWin(kindBodyRead)
+				}
 				return res.body, nil
 			}
 			if pending == 0 || isAuthError(res.err) {
 				return nil, res.err
 			}
+		case <-dispatched:
+			dispatched = nil
+			remaining, _ := primary.remaining(slotBodyHedge)
+			timer = time.NewTimer(max(0, remaining))
+			hedgeAt = timer.C
 		case <-hedgeAt:
+			helper := r
+			helper.rescue = true
+			// A spent timer does not chase future quota/budget or race retries.
+			hedgeAt = nil
 			if s.bulkClient == nil || r.client == nil || r.client == s.bulkClient {
 				continue
 			}
-			progress.Lock()
-			remaining := slotBodyHedge - time.Since(progress.at)
-			progress.Unlock()
+			remaining, active := primary.remaining(slotBodyHedge)
+			if !active {
+				continue
+			}
 			if remaining > 0 {
 				timer.Reset(remaining)
+				hedgeAt = timer.C
 				continue
 			}
-			if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second || !s.takeMediaHedgeToken() {
-				// The timer is spent; re-arm it so the hedge can still start
-				// once the cooldown ends or the budget has refilled.
-				timer.Reset(slotBodyHedge)
+			if !s.readHedgeAllowed(context.WithValue(ctx, driveMediaKey{}, &helper)) || !s.takeMediaHedgeToken() {
 				continue
 			}
-			hedged = true
 			pending++
 			launch(true)
 		case <-ctx.Done():
