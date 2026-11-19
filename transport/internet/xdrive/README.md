@@ -64,9 +64,18 @@ smoothed completed-description latency (250 ms initially, bounded to 100 ms–1 
 Promotion and write wakeups retain an outstanding read's launch age instead of
 starting more copies at each 25 ms tick. This trades more aggressive speculative
 visibility for fewer discarded reads; stalled heads retain bounded overlap.
+After at least three misses, a distant read that returns a valid older-lap frame
+may use a 2 s backoff ceiling if the observed description frontier has not advanced
+for `eagerWindow`. The existing exponential calculation remains (typically
+1.2 s at the 300 ms pace floor), not a forced 2 s sleep. Absent/new slots,
+invalid frames, errors, and head/near schedules are unchanged. This reduces
+repeated old-frame speculation during quiet peer periods. Promotion still wakes
+the wait, but frontier progress alone does not: far-future visibility and body
+prefetch timing can be delayed, even though prefetch-window sizes are unchanged.
 During cooldown and for five seconds after a rate limit, the slot reader admits only
 one metadata hunt at a time per slot instead of three overlapping hunts. These
-changes reduce wasted stale-frame reads without changing framing or poll settings.
+changes reduce wasted stale-frame reads without changing framing or ordinary
+head/near poll settings.
 If a metadata-only lazy create is retried and the existing description already
 matches, recovery skips the redundant PATCH. Media creates still update the body.
 They cannot eliminate the peer's upload time; compare both peers' logs before
@@ -97,10 +106,30 @@ also includes prefetch admission and polling waits; it is not an HTTP timeout.
 until it was ready (zero if prefetched already). It separates actual delivery
 waiting from prefetch age. `overlap-delay` reports the current metadata overlap
 threshold. Neither is a website response-time measurement.
+`quiet-tail-backoffs` counts scheduled waits extended beyond the ordinary tail
+ceiling. These waits can be interrupted; the counter is not saved requests or
+quota units.
 Per-minute timing lines report `requests` and estimated `units` for all sent
 attempts, including retries/cancelled hedges. `n` remains the capped latency
 sample count. `failed` and `canceled` count transport/body failures, while
 `rate-limits` counts confirmed 429 or rate-limit 403 responses, not timeouts.
+Phase-tail fields add p95/max for permit/connection waits, post-send first-byte
+wait (`server`), and response-body retrieval. `send-p50/p95/max` measures dispatch
+admission to the completed request write, including headers and any upload body;
+it is not a pure wire-throughput measurement. Percentiles/maxima use the capped
+completed-attempt reservoir, not every request counted by `requests`.
+Transport/body failures generally lack phase samples; outer retry sleeps are
+excluded, and internally replayed attempts retain the latest dispatch snapshot.
+Debug `xdrive slow timing` lines report individual completed HTTP attempts taking
+at least 2 s, even before the next minute flush, with HTTP status and outer attempt
+number so retry/error responses are distinguishable. Media lines include sequence,
+range (exclusive end), whole-frame and requested-range byte sizes, rescue status,
+and head-marker/promotion state at dispatch and HTTP completion. The head state
+is sticky once promoted, not evidence of HTTP priority or the current head after
+a losing rescue outlives its primary. Promotion tracking is diagnostic only; it
+does not reprioritize or restart requests. These details add no API calls and do
+not themselves improve download speed. Unobserved phases are reported as
+unavailable (`-1ns`).
 Sum units across operation types and peers when comparing usage
 with the project's effective quota. These are estimates using the published
 per-method model, not measurements of a grandfathered project's quota charges.
@@ -126,3 +155,28 @@ confirmed rate limits or failed attempts in those windows. Completed metadata
 reads were typically around 330 ms. These observations motivate latency-aware
 overlap and dispatch-aware media recovery; they do not prove a speedup for the
 next changes or establish a like-for-like comparison with an older workload.
+
+### November 19 follow-up (resume.44)
+
+The 09:10:35–09:17:46 log contains six reported timing windows: 553 head dispatches
+with 22 cancellations (4.0%, versus 53.6% in the preceding log), and 6,206 other
+metadata dispatches. Inline `head-wait` is 18 ms at p50 and 762 ms at p95, but has a
+7.7 s outlier; media has a 7.4 s head-wait outlier. The workloads differ, so these
+are not matched throughput or website-latency benchmarks. Eleven request failures
+came from one shared-socket remote reset and recovered through existing retries;
+there were no confirmed rate limits. Valid old-frame speculation motivates the
+quiet-frontier backoff, not more head overlap or additional media requests.
+Peer-side timing is still needed to explain the long inline discovery gaps;
+whole-frame body waits do not by themselves prove a stalled network transfer.
+
+The supplied server excerpt covers only 05:46:13–05:47:13 and contains 496 XDrive
+transport lines. Matching 337 downlink and 139 uplink frames bounds the constant
+client-minus-server clock offset to approximately 12,632.6–12,633.8 s; simply
+adding 3 h 30 min would misalign these logs. For downlink frame 1685, the server
+PUT took 1.55 s with negligible credit wait, while the client body phase took
+7.48 s and blocked the ordered reader for 7.43 s. Server media PUT p50/p95 were
+1.36/1.67 s, with no failures or rate limits in its reported window. This points
+to media retrieval for that episode, but does not distinguish local queueing,
+first-byte delay, or a moving slow transfer. The excerpt does not cover the
+earlier inline discovery gaps. Phase-tail diagnostics are added before changing
+media scheduling, concurrency, or range counts on this evidence.

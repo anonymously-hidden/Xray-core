@@ -31,9 +31,25 @@ type driveMediaKey struct{}
 
 // mediaHeadKey marks a body read for the frame the reader is delivering next.
 type mediaHeadKey struct{}
+type mediaPromotionKey struct{}
+
+// Promotion is diagnostic only: range shape and in-flight requests stay intact.
+func mediaHead(ctx context.Context) bool {
+	if ctx.Value(mediaHeadKey{}) != nil {
+		return true
+	}
+	promoted, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
+	select {
+	case <-promoted:
+		return true
+	default:
+		return false
+	}
+}
 
 type driveMediaRequest struct {
 	start, end, size int // end is exclusive
+	seq              int64
 	client           *http.Client
 	rescue           bool
 }
@@ -76,7 +92,7 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	}
 	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
 	if parts == 1 {
-		r := driveMediaRequest{end: frame.size, size: frame.size}
+		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq}
 		if len(s.mediaClients) > 0 {
 			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
 		}
@@ -97,7 +113,7 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	}
 	results := make(chan result, parts)
 	for i := range parts {
-		r := driveMediaRequest{start: i * width, end: min((i+1)*width, frame.size), size: frame.size}
+		r := driveMediaRequest{start: i * width, end: min((i+1)*width, frame.size), size: frame.size, seq: frame.seq}
 		if len(s.mediaClients) > 0 {
 			r.client = s.mediaClients[int((first+uint32(i))%uint32(len(s.mediaClients)))]
 		}

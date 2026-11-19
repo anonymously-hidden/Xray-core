@@ -838,15 +838,21 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		var tr struct {
 			mu                                                 sync.Mutex
 			connAt, connStart, connDone, tlsDone, wrote, first time.Time
+			admitted                                           time.Time
+			wroteOK                                            bool
 			reused, gotConn                                    bool
 			dispatchWait                                       time.Duration
 		}
 		var dispatched, admissionFailed atomic.Bool
+		var headAtDispatch atomic.Bool
 		admit := func(dispatchCtx context.Context) error {
 			start := time.Now()
 			err := s.waitDispatch(dispatchCtx, cleanupPool != nil && method == http.MethodDelete)
 			tr.mu.Lock()
 			tr.dispatchWait += time.Since(start)
+			if err == nil {
+				tr.admitted = time.Now()
+			}
 			tr.mu.Unlock()
 			if err != nil {
 				admissionFailed.Store(true)
@@ -855,6 +861,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				}
 			}
 			if err == nil {
+				if media != nil {
+					headAtDispatch.Store(mediaHead(ctx))
+				}
 				previous := dispatched.Swap(true)
 				if createOnce && previous {
 					cancel()
@@ -904,9 +913,10 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				tr.tlsDone = time.Now()
 				tr.mu.Unlock()
 			},
-			WroteRequest: func(httptrace.WroteRequestInfo) {
+			WroteRequest: func(info httptrace.WroteRequestInfo) {
 				tr.mu.Lock()
 				tr.wrote = time.Now()
+				tr.wroteOK = info.Err == nil
 				tr.mu.Unlock()
 			},
 			GotFirstResponseByte: func() {
@@ -1002,6 +1012,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		// Keep the permits until EOF/Close, including media response bodies.
 		releasePermit()
 		bodyEnd := time.Now()
+		headAtCompletion := media != nil && mediaHead(ctx)
 		if primary != nil {
 			primary.finish()
 		}
@@ -1035,16 +1046,19 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			waitToken: waitTokenDur,
 			waitConn:  max(0, tr.connAt.Sub(began)-tr.dispatchWait),
 			dialTLS:   dialEnd(tr.tlsDone, tr.connDone).Sub(tr.connStart),
+			send:      max(0, tr.wrote.Sub(tr.admitted)),
 			server:    tr.first.Sub(tr.wrote),
 			body:      bodyEnd.Sub(maxTime(tr.first, respAt)),
 			reused:    tr.reused,
 			newConn:   tr.gotConn && !tr.reused,
 			hasConn:   tr.gotConn,
 			hasDial:   !tr.connStart.IsZero(),
+			hasSend:   tr.wroteOK && !tr.admitted.IsZero() && !tr.wrote.IsZero() && !tr.wrote.Before(tr.admitted),
 			hasServer: !tr.wrote.IsZero() && !tr.first.IsZero(),
 		}
 		tr.mu.Unlock()
 		s.recordTiming(kind, sample)
+		s.logSlowRequest(ctx, kind, req.URL.Path, sample, media, headAtDispatch.Load(), headAtCompletion, resp.StatusCode, attempt+1)
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)

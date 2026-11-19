@@ -41,6 +41,7 @@ type timingSample struct {
 	waitToken time.Duration
 	waitConn  time.Duration
 	dialTLS   time.Duration
+	send      time.Duration
 	server    time.Duration
 	body      time.Duration
 	reused    bool
@@ -49,12 +50,14 @@ type timingSample struct {
 	won       bool
 	hasConn   bool
 	hasDial   bool
+	hasSend   bool
 	hasServer bool
 }
 
 const (
-	timingWindow = 60 * time.Second
-	timingRing   = 512
+	timingWindow      = 60 * time.Second
+	timingRing        = 512
+	slowRequestTiming = 2 * time.Second
 )
 
 type timingAggregator struct {
@@ -163,7 +166,7 @@ func (a *timingAggregator) noteHedge(kind int, won bool) {
 	}
 }
 
-// Description hedges are counted at dispatch, with the win published later.
+// Read hedges are counted at dispatch, with the win published later.
 func (a *timingAggregator) noteHedgeWin(kind int) {
 	a.mu.Lock()
 	a.won[kind]++
@@ -212,6 +215,40 @@ func (s *driveStorage) recordTiming(kind int, sample timingSample) {
 	s.timing.record(kind, sample)
 }
 
+// Immediate slow-attempt detail complements the capped minute sample, including
+// bursts near the end of an uploaded log. It never issues another API request.
+func (s *driveStorage) logSlowRequest(ctx context.Context, kind int, path string, sample timingSample, media *driveMediaRequest, headAtDispatch, headAtCompletion bool, status, attempt int) {
+	if kind < 0 || kind >= kindCount || sample.total < slowRequestTiming {
+		return
+	}
+	send, server, connection := time.Duration(-1), time.Duration(-1), time.Duration(-1)
+	if sample.hasSend {
+		send = sample.send
+	}
+	if sample.hasServer {
+		server = sample.server
+	}
+	if sample.hasConn {
+		connection = sample.waitConn
+	}
+	if media != nil {
+		errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),
+			" status=", status, " attempt=", attempt,
+			" seq=", media.seq, " range=", media.start, "-", media.end,
+			" frame-bytes=", media.size, " requested-bytes=", media.end-media.start,
+			" total=", sample.total, " pool=", sample.waitPool, " cool=", sample.waitCool,
+			" token=", sample.waitToken, " connection=", connection, " send=", send,
+			" server=", server, " body=", sample.body, " rescue=", media.rescue,
+			" head-at-dispatch=", headAtDispatch, " head-at-completion=", headAtCompletion)
+		return
+	}
+	errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),
+		" status=", status, " attempt=", attempt,
+		" total=", sample.total, " pool=", sample.waitPool, " cool=", sample.waitCool,
+		" token=", sample.waitToken, " connection=", connection, " send=", send,
+		" server=", server, " body=", sample.body)
+}
+
 type timingBatch struct {
 	samples                      []timingSample
 	requests, conns, hedges, won int
@@ -246,6 +283,7 @@ func (a *timingAggregator) flush() {
 		token := make([]time.Duration, 0, n)
 		conn := make([]time.Duration, 0, n)
 		dial := make([]time.Duration, 0, n)
+		send := make([]time.Duration, 0, n)
 		server := make([]time.Duration, 0, n)
 		body := make([]time.Duration, 0, n)
 		for _, s := range batch.samples {
@@ -259,6 +297,9 @@ func (a *timingAggregator) flush() {
 			if s.hasDial {
 				dial = append(dial, s.dialTLS)
 			}
+			if s.hasSend {
+				send = append(send, s.send)
+			}
 			if s.hasServer {
 				server = append(server, s.server)
 			}
@@ -270,6 +311,7 @@ func (a *timingAggregator) flush() {
 		sort.Slice(token, func(i, j int) bool { return token[i] < token[j] })
 		sort.Slice(conn, func(i, j int) bool { return conn[i] < conn[j] })
 		sort.Slice(dial, func(i, j int) bool { return dial[i] < dial[j] })
+		sort.Slice(send, func(i, j int) bool { return send[i] < send[j] })
 		sort.Slice(server, func(i, j int) bool { return server[i] < server[j] })
 		sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
 		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
@@ -284,7 +326,12 @@ func (a *timingAggregator) flush() {
 			" dial+tls p50 ", percentile(dial, .5),
 			" server p50 ", percentile(server, .5),
 			" body p50 ", percentile(body, .5),
-			" newconns=", batch.conns, " hedges=", batch.hedges, " won=", batch.won)
+			" newconns=", batch.conns, " hedges=", batch.hedges, " won=", batch.won,
+			" send-p50/p95/max=", percentile(send, .5), "/", percentile(send, .95), "/", percentile(send, 1),
+			" pool-p95/max=", percentile(pool, .95), "/", percentile(pool, 1),
+			" connection-p95/max=", percentile(conn, .95), "/", percentile(conn, 1),
+			" server-p95/max=", percentile(server, .95), "/", percentile(server, 1),
+			" body-p95/max=", percentile(body, .95), "/", percentile(body, 1))
 	}
 }
 

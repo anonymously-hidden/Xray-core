@@ -51,11 +51,12 @@ const (
 var (
 	// the head is asked for between slotHuntFloor and slotHuntCeiling, a segment
 	// behind it at about the pace that segments come
-	slotHuntFloor   = 10 * time.Millisecond
-	slotHuntCeiling = 25 * time.Millisecond
-	slotTailMin     = 150 * time.Millisecond
-	slotTailMax     = 800 * time.Millisecond
-	slotFetchAhead  = 12
+	slotHuntFloor    = 10 * time.Millisecond
+	slotHuntCeiling  = 25 * time.Millisecond
+	slotTailMin      = 150 * time.Millisecond
+	slotTailMax      = 800 * time.Millisecond
+	slotTailQuietMax = 2 * time.Second
+	slotFetchAhead   = 12
 
 	slotAckRetry     = 30 * time.Millisecond
 	slotWatermarkTTL = 100 * time.Millisecond
@@ -964,33 +965,35 @@ type slotReader struct {
 	// hitAt is when a segment last came and gap the time between them, activeAt
 	// when a segment came, was seen coming or Wake. Nothing for the eager window
 	// is idle, and active is closed when that ends
-	hitAt    time.Time
-	gap      time.Duration
-	activeAt time.Time
-	active   chan struct{}
-	frontier int64
-	err      error
-	stop     context.CancelFunc
-	reads    atomic.Int64
+	hitAt      time.Time
+	gap        time.Duration
+	activeAt   time.Time
+	active     chan struct{}
+	frontier   int64
+	frontierAt time.Time // last advance of the observed description frontier
+	err        error
+	stop       context.CancelFunc
+	reads      atomic.Int64
 	// headReads and tailReads split reads by the role the fetch had when the
 	// walk started; staleReads counts valid frames of another lap, the normal
 	// not-ready answer of a ring slot; emptyReads counts 404 and empty
 	// descriptions. They are diagnostic only.
-	headReads    atomic.Int64
-	tailReads    atomic.Int64
-	staleReads   atomic.Int64
-	emptyReads   atomic.Int64
-	tailMin      time.Duration
-	tailMax      time.Duration
-	huntFloor    time.Duration
-	huntCeiling  time.Duration
-	ackRetry     time.Duration
-	stallTimeout time.Duration
-	ackDelay     time.Duration
-	bodyRate     float64
-	lazy         bool
-	seen         []bool
-	wmCreated    bool
+	headReads         atomic.Int64
+	tailReads         atomic.Int64
+	staleReads        atomic.Int64
+	emptyReads        atomic.Int64
+	quietTailBackoffs atomic.Int64
+	tailMin           time.Duration
+	tailMax           time.Duration
+	huntFloor         time.Duration
+	huntCeiling       time.Duration
+	ackRetry          time.Duration
+	stallTimeout      time.Duration
+	ackDelay          time.Duration
+	bodyRate          float64
+	lazy              bool
+	seen              []bool
+	wmCreated         bool
 
 	// Completed description latency, including store waits, guards only head
 	// overlap admission; primary reads and the polling tick are unchanged.
@@ -1016,6 +1019,7 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 		acks:         make(chan struct{}, 1),
 		grow:         make(chan struct{}, 1),
 		frontier:     -1,
+		frontierAt:   time.Now(),
 		hitAt:        time.Now(),
 		activeAt:     time.Now(),
 		active:       make(chan struct{}),
@@ -1166,7 +1170,8 @@ func (r *slotReader) run() {
 			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
 			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
-			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay())
+			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(),
+			" quiet-tail-backoffs=", r.quietTailBackoffs.Load())
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1203,6 +1208,7 @@ func (r *slotReader) reach(seq int64) {
 	grown := seq > r.frontier
 	if grown {
 		r.frontier = seq
+		r.frontierAt = time.Now()
 	}
 	r.mu.Unlock()
 	if grown {
@@ -1302,7 +1308,8 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					return
 				}
 				began := time.Now()
-				body, bodyErr := r.readMediaBody(ctx, id, seq, frame)
+				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+				body, bodyErr := r.readMediaBody(bodyCtx, id, seq, frame)
 				f.bodyTime += time.Since(began)
 				if isAuthError(bodyErr) {
 					f.err = bodyErr
@@ -1396,22 +1403,40 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			wait, a, b, backoff = 0, f.promoted, active, r.huntFloor
 		default:
 			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, r.huntFloor
+			extended := false
 			// Repeated misses far ahead are predictions, not a stalled head.
 			// Back these off instead of spending quota on the same old frame;
 			// promotion/near admission still interrupts the wait immediately.
 			r.mu.Lock()
 			distant := seq > max(r.head, r.frontier)+slotReadAhead
+			quietFrontier := time.Since(r.frontierAt) > r.eagerWindow
 			r.mu.Unlock()
 			if distant && tailMisses > 1 {
-				wait = min(wait*time.Duration(1<<(tailMisses-1)), r.tailMax)
+				ceiling := r.tailMax
+				if tailMisses >= 3 && quietFrontier && err == nil && ok && frame.seq < seq {
+					// Writes can keep a session eager even when the peer has no
+					// new frames. Only valid older-lap predictions slow down;
+					// absent/new slots and errors keep their existing schedule.
+					// Head/near promotion still interrupts this wait.
+					ceiling = max(ceiling, slotTailQuietMax)
+				}
+				wait = min(wait*time.Duration(1<<(tailMisses-1)), ceiling)
+				extended = wait > r.tailMax
 			}
 			select {
 			case <-f.near:
 				b = nil
+				// Near admission may race the distant snapshot above. Never
+				// carry a far-future extension into the ordinary near schedule.
+				wait = min(wait, r.tailMax)
+				extended = false
 				if r.bursting() {
 					wait = slotReadAheadPoll
 				}
 			default:
+			}
+			if extended {
+				r.quietTailBackoffs.Add(1)
 			}
 		}
 		if !r.hold(ctx, wait, a, b) {
