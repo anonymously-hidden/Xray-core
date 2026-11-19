@@ -35,6 +35,9 @@ const (
 	driveMaxInflight      = 64
 	driveReservedInflight = 8
 	driveInlineLimit      = 12000
+	// A quota window must be quiet before spending requests on description
+	// recovery. The ordinary request retry/cooldown policy remains unchanged.
+	driveDescriptionHedgeQuiet = time.Minute
 	// driveTimeout ends a request that makes no progress for that long
 	driveTimeout = 60 * time.Second
 )
@@ -82,10 +85,55 @@ type laneKey struct{}
 // small reads/acks off the connection saturated by large transfers.
 type bodyKey struct{}
 
-// bodyProgressKey carries the callback for a media read's hedge timer.
+// bodyProgressKey carries the callback for a read's hedge timer.
 type bodyProgressKey struct{}
 
 type attemptKey struct{}
+
+// Description hedges recover only a stalled first dispatch. Token,
+// connection and permit waits, and the primary's retries, are not hedgeable.
+type descriptionPrimaryKey struct{}
+type descriptionHedgeKey struct{}
+
+type descriptionPrimary struct {
+	mu         sync.Mutex
+	dispatched chan struct{}
+	started    bool
+	pending    bool
+	progressAt time.Time
+}
+
+func (p *descriptionPrimary) dispatch() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.started {
+		p.started, p.pending = true, true
+		p.progressAt = time.Now()
+		close(p.dispatched)
+	}
+}
+
+func (p *descriptionPrimary) progress() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pending {
+		p.progressAt = time.Now()
+	}
+}
+
+func (p *descriptionPrimary) finish() {
+	p.mu.Lock()
+	p.pending = false
+	p.mu.Unlock()
+}
+
+func (p *descriptionPrimary) remaining(delay time.Duration) (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return delay - time.Since(p.progressAt), p.pending
+}
+
+var errDescriptionHedgeSkipped = errors.New("Drive description hedge is no longer admitted")
 
 // cleanupKey marks session-cleanup requests (the child deletions of Delete and
 // the Listener's drop/collect) so a rate limit they hit does not cool live
@@ -123,20 +171,23 @@ func isCleanupRateLimited(err error) bool {
 type driveStorage struct {
 	*driveShared
 	// a session has a client and inflight of its own, see session
-	client       *http.Client
-	bulkClient   *http.Client
-	mediaClients []*http.Client
-	inflight     chan struct{}
-	reserved     chan struct{}
-	mediaRescue  chan struct{}
-	mediaRanges  chan struct{}
-	release      func()
+	client         *http.Client
+	priorityClient *http.Client
+	bulkClient     *http.Client
+	mediaClients   []*http.Client
+	inflight       chan struct{}
+	reserved       chan struct{}
+	readRescue     chan struct{}
+	mediaRescue    chan struct{}
+	mediaRanges    chan struct{}
+	release        func()
 	// readHedge/budget are copied per instance so tests never mutate globals
 	// that other goroutines read.
 	readHedge       time.Duration
 	readHedgeMu     sync.Mutex
 	readHedgeTokens int
 	readHedgeCount  int
+	readHedgeActive atomic.Bool
 	// Media range hedges have a budget of their own: description hedges win
 	// far less often and must not leave the head frame's ranges without one.
 	mediaHedgeTokens int
@@ -148,18 +199,21 @@ type driveStorage struct {
 
 // driveShared is what the sessions of a storage have in common
 type driveShared struct {
-	conns        *connPool
-	bulkConns    *connPool
-	mediaConns   [driveMediaLanes]*connPool
-	folder       string
-	clientID     string
-	clientSecret string
-	refreshToken string
-	tokenClient  *http.Client
-	tokenURL     string
-	filesURL     string
-	uploadURL    string
-	backoff      time.Duration
+	conns *connPool
+	// Heads and watermarks have a connection as well as reserved permits of
+	// their own, so speculative descriptions and uploads cannot queue them.
+	priorityConns *connPool
+	bulkConns     *connPool
+	mediaConns    [driveMediaLanes]*connPool
+	folder        string
+	clientID      string
+	clientSecret  string
+	refreshToken  string
+	tokenClient   *http.Client
+	tokenURL      string
+	filesURL      string
+	uploadURL     string
+	backoff       time.Duration
 
 	tokenMu       sync.Mutex
 	token         string
@@ -239,6 +293,9 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 			}),
+			priorityConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight)
+			}),
 			bulkConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 			}),
@@ -262,8 +319,10 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			cleanupMaxRetries: cleanupMaxRetries,
 		},
 		client:           client,
+		priorityClient:   newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight),
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),
+		readRescue:       make(chan struct{}, 1),
 		mediaRescue:      make(chan struct{}, driveMediaLanes),
 		mediaRanges:      make(chan struct{}, driveMediaInflight),
 		readHedge:        slotReadHedge,
@@ -295,6 +354,7 @@ func (s *driveStorage) session() Storage {
 		bulkClient:       &http.Client{Transport: bulkTransport},
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),
+		readRescue:       make(chan struct{}, 1),
 		mediaRescue:      make(chan struct{}, driveMediaLanes),
 		mediaRanges:      make(chan struct{}, driveMediaInflight),
 		readHedge:        s.readHedge,
@@ -302,6 +362,11 @@ func (s *driveStorage) session() Storage {
 		mediaHedgeTokens: 3,
 	}
 	transports := []*sessionTransport{transport, bulkTransport}
+	if s.priorityConns != nil {
+		t := &sessionTransport{pool: s.priorityConns}
+		transports = append(transports, t)
+		st.priorityClient = &http.Client{Transport: t}
+	}
 	for _, pool := range s.mediaConns {
 		if pool == nil {
 			continue
@@ -635,6 +700,19 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	defer finish()
 	defer s.noteRequest(ctx)
 	createOnce := method == http.MethodPost && ctx.Value(createOnceKey{}) != nil
+	descriptionHedge := method == http.MethodGet && ctx.Value(descriptionHedgeKey{}) != nil
+	if descriptionHedge && !s.descriptionHedgeAllowed() {
+		return 0, nil, errDescriptionHedgeSkipped
+	}
+	primary, _ := ctx.Value(descriptionPrimaryKey{}).(*descriptionPrimary)
+	if primary != nil {
+		defer primary.finish()
+	}
+	maxAttempts := driveMaxAttempts
+	if descriptionHedge {
+		// Recovery must not start another retry/refund loop beside the primary.
+		maxAttempts = 1
+	}
 	backoff := s.backoff
 	var lastErr error
 	kind := -1
@@ -646,7 +724,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	firstTry := time.Now()
 	refunded := 0
 	rejected := 0
-	for attempt := 0; attempt-refunded < driveMaxAttempts; attempt++ {
+	for attempt := 0; attempt-refunded < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -675,6 +753,10 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		pool := s.inflight
 		if ctx.Value(laneKey{}) != nil {
 			pool = s.reserved
+		}
+		if descriptionHedge && s.readRescue != nil {
+			// A stalled priority window must not queue its own recovery.
+			pool = s.readRescue
 		}
 		if media != nil && !media.rescue && s.mediaRanges != nil {
 			// Ranges of a long download must not queue slot writes or tail
@@ -725,7 +807,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
 		if d, ok := ctx.Value(attemptKey{}).(time.Duration); ok {
 			attemptCtx, cancel = context.WithTimeout(ctx, d)
-		} else if createOnce {
+		} else if createOnce || descriptionHedge {
 			attemptCtx, cancel = context.WithCancel(ctx)
 		}
 		req, err := http.NewRequestWithContext(attemptCtx, method, target, reader)
@@ -761,6 +843,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			tr.mu.Unlock()
 			if err != nil {
 				admissionFailed.Store(true)
+				if descriptionHedge {
+					cancel()
+				}
 			}
 			if err == nil {
 				previous := dispatched.Swap(true)
@@ -768,9 +853,25 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 					cancel()
 					return createAmbiguityError{err: errors.New("transport attempted a second creation dispatch")}
 				}
+				if descriptionHedge && previous {
+					cancel()
+					return errDescriptionHedgeSkipped
+				}
+				if primary != nil {
+					if previous {
+						// A transport replay is recovery already, not a stalled
+						// first dispatch that should also acquire a hedge.
+						primary.finish()
+					} else {
+						primary.dispatch()
+					}
+				}
 			}
 			if err == nil && s.timing != nil {
 				s.timing.request(kind)
+				if descriptionHedge {
+					s.timing.noteHedge(kind, false)
+				}
 			}
 			return err
 		}
@@ -805,11 +906,17 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				tr.mu.Lock()
 				tr.first = time.Now()
 				tr.mu.Unlock()
+				if primary != nil {
+					primary.progress()
+				}
 			},
 		}
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
 		httpc := s.client
+		if ctx.Value(laneKey{}) != nil && !descriptionHedge && s.priorityClient != nil {
+			httpc = s.priorityClient
+		}
 		if ctx.Value(bodyKey{}) != nil && s.bulkClient != nil {
 			httpc = s.bulkClient
 		}
@@ -843,6 +950,12 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			}
 		}
 		if err != nil {
+			if primary != nil {
+				primary.finish()
+			}
+			if dispatched.Load() && s.timing != nil {
+				s.timing.noteFailure(kind, ctx.Err() != nil)
+			}
 			releasePermit()
 			noteTimeout()
 			cancel()
@@ -855,6 +968,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			}
 			if createOnce && dispatched.Load() {
 				return 0, nil, createAmbiguityError{err: lastErr}
+			}
+			if descriptionHedge {
+				return 0, nil, lastErr
 			}
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
 				attempt+1, " of ", driveMaxAttempts)
@@ -870,12 +986,18 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		payload, err := readResponse(resp.Body, limit, resp.ContentLength)
 		if err != nil {
 			noteTimeout()
+			if dispatched.Load() && s.timing != nil {
+				s.timing.noteFailure(kind, ctx.Err() != nil)
+			}
 		}
 		resp.Body.Close()
 		cancel()
 		// Keep the permits until EOF/Close, including media response bodies.
 		releasePermit()
 		bodyEnd := time.Now()
+		if primary != nil {
+			primary.finish()
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
@@ -884,6 +1006,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests && !(resp.StatusCode == http.StatusForbidden && rateLimited(payload)) {
 				if createOnce {
 					return 0, nil, createAmbiguityError{err: lastErr}
+				}
+				if descriptionHedge {
+					return 0, nil, lastErr
 				}
 				continue
 			}
@@ -917,6 +1042,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
 			lastErr = errors.New("Drive rejected the access token")
+			if descriptionHedge {
+				return 0, nil, lastErr
+			}
 			// One retry with a freshly fetched token can ride out a token that
 			// expired early. A second rejection means the answer will not
 			// change: stop instead of fetching a token for every attempt.
@@ -926,6 +1054,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden && rateLimited(payload) {
+			if s.timing != nil {
+				s.timing.noteRateLimit(kind)
+			}
 			if ctx.Value(cleanupKey{}) != nil {
 				return 0, nil, cleanupRateLimited{detail: string(payload)}
 			}
@@ -935,6 +1066,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				" bytes, body read ", strings.Contains(target, "alt=media"),
 				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
+			if descriptionHedge {
+				return 0, nil, lastErr
+			}
 			if refund, stop := driveQuotaRetry(time.Since(firstTry)); refund {
 				refunded++
 			} else if stop {
@@ -947,6 +1081,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
 			if createOnce {
 				return 0, nil, createAmbiguityError{err: lastErr}
+			}
+			if descriptionHedge {
+				return 0, nil, lastErr
 			}
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
@@ -976,6 +1113,9 @@ func readResponse(r io.Reader, limit, announced int64) ([]byte, error) {
 
 func (s *driveStorage) waitDispatch(ctx context.Context, cleanupDelete bool) error {
 	for {
+		if ctx.Value(descriptionHedgeKey{}) != nil && !s.descriptionHedgeAllowed() {
+			return errDescriptionHedgeSkipped
+		}
 		if err := s.waitCool(ctx); err != nil {
 			return err
 		}
@@ -983,6 +1123,9 @@ func (s *driveStorage) waitDispatch(ctx context.Context, cleanupDelete bool) err
 			if err := s.waitCleanupSlot(ctx); err != nil {
 				return err
 			}
+		}
+		if ctx.Value(descriptionHedgeKey{}) != nil && !s.descriptionHedgeAllowed() {
+			return errDescriptionHedgeSkipped
 		}
 		if !s.cooling() {
 			return ctx.Err()
@@ -1771,11 +1914,12 @@ func (s *driveStorage) Close() error {
 	s.closeOnce.Do(func() {
 		s.cancelWork()
 		s.conns.Close()
+		s.priorityConns.Close()
 		s.bulkConns.Close()
 		for _, pool := range s.mediaConns {
 			pool.Close()
 		}
-		for _, client := range append([]*http.Client{s.client, s.bulkClient, s.tokenClient}, s.mediaClients...) {
+		for _, client := range append([]*http.Client{s.client, s.priorityClient, s.bulkClient, s.tokenClient}, s.mediaClients...) {
 			if client != nil {
 				client.CloseIdleConnections()
 			}
@@ -1829,9 +1973,9 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	return nil
 }
 
-// noteDescriptionRead accrues one hedge token per twenty description reads,
-// capped at six. Tokens are spent when a hedge timer fires, not when a read
-// starts, so a stalled read among fast ones can still be hedged.
+// noteDescriptionRead accrues one hedge token per twenty completed priority
+// description reads, capped at six. Speculative tails cannot fund or spend the
+// head's recovery budget, and cancelled/failed reads do not refill it.
 func (s *driveStorage) noteDescriptionRead() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
@@ -1877,17 +2021,29 @@ func spendHedgeToken(tokens *int) bool {
 	return false
 }
 
-// readDescHedged issues a description GET; if it is still pending after
-// readHedge and a budget token is available, one identical GET goes over the
-// bulk connection. Reads are idempotent, so a duplicate GET carries no
-// stale-write hazard. The first definitive answer (200 or 404) wins and the
-// loser's context is cancelled; if both fail the last error is returned. A
-// primary that finishes (error included) before the timer fires is returned as
-// is with no hedge.
-func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, []byte, error) {
-	s.noteDescriptionRead()
-	if s.readHedge <= 0 || s.bulkClient == nil ||
-		s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+func (s *driveStorage) descriptionHedgeAllowed() bool {
+	s.coolMu.Lock()
+	defer s.coolMu.Unlock()
+	now := time.Now()
+	return !now.Before(s.coolUntil) && (s.lastRateLimit.IsZero() || now.Sub(s.lastRateLimit) > driveDescriptionHedgeQuiet)
+}
+
+// readDescHedged recovers only head/watermark reads, with at most one concurrent
+// hedge per session and one dispatch per hedge. Its timer starts at dispatch and
+// follows response progress, never token/permit waits or retry backoff. A spent
+// timer does not wait for future budget tokens or the end of a quota window.
+// The first 200/404 still wins; the slot reader validates sequence/checksum, so
+// mutable descriptions are neither cached nor coalesced here.
+func (s *driveStorage) readDescHedged(ctx context.Context, target string) (status int, payload []byte, err error) {
+	if ctx.Value(laneKey{}) == nil {
+		return s.do(ctx, http.MethodGet, target, "", nil)
+	}
+	defer func() {
+		if err == nil && (status == http.StatusOK || status == http.StatusNotFound) {
+			s.noteDescriptionRead()
+		}
+	}()
+	if s.readHedge <= 0 || (s.priorityClient == nil && s.bulkClient == nil) || !s.descriptionHedgeAllowed() {
 		return s.do(ctx, http.MethodGet, target, "", nil)
 	}
 	type res struct {
@@ -1897,13 +2053,23 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 		hedge   bool
 	}
 	ch := make(chan res, 2)
-	ctx1, cancel1 := context.WithCancel(ctx)
+	primary := &descriptionPrimary{dispatched: make(chan struct{})}
+	ctx1, cancel1 := context.WithCancel(context.WithValue(ctx, descriptionPrimaryKey{}, primary))
 	defer cancel1()
+	ctx1 = context.WithValue(ctx1, bodyProgressKey{}, primary.progress)
 	go func() {
 		st, pl, e := s.do(ctx1, http.MethodGet, target, "", nil)
 		ch <- res{st, pl, e, false}
 	}()
-	timer := time.NewTimer(s.readHedge)
+	select {
+	case r := <-ch:
+		return r.status, r.payload, r.err
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	case <-primary.dispatched:
+	}
+	delay, _ := primary.remaining(s.readHedge)
+	timer := time.NewTimer(max(0, delay))
 	defer timer.Stop()
 	for {
 		select {
@@ -1913,42 +2079,53 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (int, 
 			return 0, nil, ctx.Err()
 		case <-timer.C:
 		}
-		if !s.cooling() && time.Since(s.lastRateLimitAt()) > 5*time.Second && s.takeHedgeToken() {
-			break
+		remaining, pending := primary.remaining(s.readHedge)
+		if pending && remaining > 0 {
+			timer.Reset(remaining)
+			continue
 		}
-		timer.Reset(s.readHedge)
+		if pending && s.descriptionHedgeAllowed() && s.readHedgeActive.CompareAndSwap(false, true) {
+			if s.takeHedgeToken() {
+				break
+			}
+			s.readHedgeActive.Store(false)
+		}
+		// No repeated timer/budget chasing beside a queued or retrying primary.
+		select {
+		case r := <-ch:
+			return r.status, r.payload, r.err
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		}
 	}
-	kind := kindOtherRead
-	if ctx.Value(laneKey{}) != nil {
-		kind = kindHeadRead
+	hedgeCtx := context.WithValue(ctx, descriptionHedgeKey{}, true)
+	if s.priorityClient == nil {
+		// Fallback for storages without a separate priority connection.
+		hedgeCtx = context.WithValue(hedgeCtx, bodyKey{}, true)
 	}
-	ctx2, cancel2 := context.WithCancel(context.WithValue(ctx, bodyKey{}, true))
+	ctx2, cancel2 := context.WithCancel(hedgeCtx)
 	defer cancel2()
 	go func() {
+		defer s.readHedgeActive.Store(false)
 		st, pl, e := s.do(ctx2, http.MethodGet, target, "", nil)
 		ch <- res{st, pl, e, true}
 	}()
 	var last res
-	won := false
 	for i := 0; i < 2; i++ {
 		var r res
 		select {
 		case r = <-ch:
 		case <-ctx.Done():
-			if s.timing != nil {
-				s.timing.noteHedge(kind, false)
-			}
 			return 0, nil, ctx.Err()
 		}
 		if r.err == nil && (r.status == http.StatusOK || r.status == http.StatusNotFound) {
-			won = r.hedge
+			if r.hedge && s.timing != nil {
+				s.timing.noteHedgeWin(kindHeadRead)
+			}
 			last = r
 			break
 		}
 		last = r
-	}
-	if s.timing != nil {
-		s.timing.noteHedge(kind, won)
 	}
 	return last.status, last.payload, last.err
 }

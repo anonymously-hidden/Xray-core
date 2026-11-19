@@ -10,9 +10,16 @@ prefetched non-head frames use one range per 512 KiB, capped at four. After two
 seconds without progress, a pending range may race one duplicate on the separate
 bulk connection. Completed ranges are retained. Moving transfers do not trigger
 duplicates. Generic slot-body reads also have a two-second hedge; Drive frame
-reads use the per-range layer rather than duplicating the entire frame. Description
-reads have their own 900 ms hedge. Each layer has a bounded hedge budget. Recent
-403/429 rate limits suppress hedges and reduce newly started frames to one range.
+reads use the per-range layer rather than duplicating the entire frame. Priority
+description reads have a 900 ms no-progress hedge starting at dispatch, not while
+queued. Speculative descriptions do not hedge. Description recovery allows one
+concurrent hedge per session, one dispatch per hedge, and no hedges for one minute
+after a confirmed live rate limit. Each layer has a bounded hedge budget. Recent
+403/429 rate limits also suppress media hedges and reduce new frames to one range.
+
+Heads and watermarks use a separate pooled control connection so speculative
+reads and uploads do not share their HTTP connection. This adds a connection
+pool, not polling or keep-warm API requests.
 
 Range offsets, lengths and the complete frame CRC are checked before delivery
 or acknowledgement. Servers that ignore Range can return a full-sized body.
@@ -42,6 +49,16 @@ and unchanged.
 
 ## Capacity and diagnostics
 
+For browsing, distant description lookahead backs off after repeated misses,
+while head promotion and near-head admission still interrupt that wait. During
+cooldown and for five seconds after a rate limit, the slot reader admits only
+one metadata hunt at a time per slot instead of three overlapping hunts. These
+changes reduce wasted stale-frame reads without changing framing or poll settings.
+If a metadata-only lazy create is retried and the existing description already
+matches, recovery skips the redundant PATCH. Media creates still update the body.
+They cannot eliminate the peer's upload time; compare both peers' logs before
+attributing `discover` latency to the network alone.
+
 Google's [published limits](https://developers.google.com/workspace/drive/api/guides/limits)
 (checked November 2026) are 1,000,000 units/minute/project and 325,000
 units/minute/user/project. Metadata GETs cost 5 units, edits 50, lists 100, and
@@ -65,7 +82,9 @@ first seen), `body` (time in media downloads, including failed rounds), and
 also includes prefetch admission and polling waits; it is not an HTTP timeout.
 Per-minute timing lines report `requests` and estimated `units` for all sent
 attempts, including retries/cancelled hedges. `n` remains the capped latency
-sample count. Sum units across operation types and peers when comparing usage
+sample count. `failed` and `canceled` count transport/body failures, while
+`rate-limits` counts confirmed 429 or rate-limit 403 responses, not timeouts.
+Sum units across operation types and peers when comparing usage
 with the project's effective quota. These are estimates using the published
 per-method model, not measurements of a grandfathered project's quota charges.
 

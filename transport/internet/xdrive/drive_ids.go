@@ -323,12 +323,17 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 	ce, ok := err.(createError)
 	if ok && ce.status >= 400 && ce.status < 500 && ce.status != http.StatusUnauthorized &&
 		ce.status != http.StatusTooManyRequests && !(ce.status == http.StatusForbidden && rateLimited(ce.payload)) {
-		if _, derr := s.readDescription(ctx, id); derr == nil {
-			s.fallbackLogOnce.Do(func() {
-				errors.LogInfo(ctx, "xdrive: create with pre-generated id fell back to update")
-			})
-			if err := s.setSlot(ctx, id, description, body); err != nil {
-				return err
+		if existing, derr := s.readDescription(ctx, id); derr == nil {
+			// A successful metadata-only create whose reply was lost needs no
+			// second write when its description already matches. A matching
+			// media description alone cannot confirm that the body was stored.
+			if body != nil || existing != description {
+				s.fallbackLogOnce.Do(func() {
+					errors.LogInfo(ctx, "xdrive: create with pre-generated id fell back to update")
+				})
+				if err := s.setSlot(ctx, id, description, body); err != nil {
+					return err
+				}
 			}
 			s.rememberID(flat, id, nil)
 			return nil

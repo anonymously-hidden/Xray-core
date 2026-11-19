@@ -58,17 +58,40 @@ const (
 )
 
 type timingAggregator struct {
-	mu       sync.Mutex
-	started  bool
-	stopOnce sync.Once
-	done     chan struct{}
-	n        [kindCount]int
-	pos      [kindCount]int
-	ring     [kindCount][timingRing]timingSample
-	conns    [kindCount]int
-	hedges   [kindCount]int
-	won      [kindCount]int
-	requests [kindCount]int
+	mu         sync.Mutex
+	started    bool
+	stopOnce   sync.Once
+	done       chan struct{}
+	n          [kindCount]int
+	pos        [kindCount]int
+	ring       [kindCount][timingRing]timingSample
+	conns      [kindCount]int
+	hedges     [kindCount]int
+	won        [kindCount]int
+	requests   [kindCount]int
+	failed     [kindCount]int
+	canceled   [kindCount]int
+	rateLimits [kindCount]int
+}
+
+// Transport/body failures and cancelled attempts often have no latency sample.
+// Keep their counters outside the reservoir so low percentiles cannot hide
+// discarded API work.
+func (a *timingAggregator) noteFailure(kind int, canceled bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if canceled {
+		a.canceled[kind]++
+	} else {
+		a.failed[kind]++
+	}
+}
+
+// Only a confirmed 429 or rate-limit 403 counts, not an arbitrary 403 or timeout.
+func (a *timingAggregator) noteRateLimit(kind int) {
+	a.mu.Lock()
+	a.rateLimits[kind]++
+	a.mu.Unlock()
 }
 
 // Count every sent API attempt, including retries and cancelled hedges. The
@@ -140,6 +163,13 @@ func (a *timingAggregator) noteHedge(kind int, won bool) {
 	}
 }
 
+// Description hedges are counted at dispatch, with the win published later.
+func (a *timingAggregator) noteHedgeWin(kind int) {
+	a.mu.Lock()
+	a.won[kind]++
+	a.mu.Unlock()
+}
+
 func (a *timingAggregator) loop() {
 	t := time.NewTicker(timingWindow)
 	defer t.Stop()
@@ -185,6 +215,7 @@ func (s *driveStorage) recordTiming(kind int, sample timingSample) {
 type timingBatch struct {
 	samples                      []timingSample
 	requests, conns, hedges, won int
+	failed, canceled, rateLimits int
 }
 
 func (a *timingAggregator) snapshot() [kindCount]timingBatch {
@@ -195,8 +226,10 @@ func (a *timingAggregator) snapshot() [kindCount]timingBatch {
 		batches[k] = timingBatch{
 			samples:  append([]timingSample(nil), a.ring[k][:a.n[k]]...),
 			requests: a.requests[k], conns: a.conns[k], hedges: a.hedges[k], won: a.won[k],
+			failed: a.failed[k], canceled: a.canceled[k], rateLimits: a.rateLimits[k],
 		}
 		a.n[k], a.pos[k], a.conns[k], a.hedges[k], a.won[k], a.requests[k] = 0, 0, 0, 0, 0, 0
+		a.failed[k], a.canceled[k], a.rateLimits[k] = 0, 0, 0
 	}
 	return batches
 }
@@ -204,7 +237,7 @@ func (a *timingAggregator) snapshot() [kindCount]timingBatch {
 func (a *timingAggregator) flush() {
 	for k, batch := range a.snapshot() {
 		n := len(batch.samples)
-		if n == 0 && batch.requests == 0 && batch.hedges == 0 {
+		if n == 0 && batch.requests == 0 && batch.hedges == 0 && batch.won == 0 && batch.failed == 0 && batch.canceled == 0 && batch.rateLimits == 0 {
 			continue
 		}
 		total := make([]time.Duration, 0, n)
@@ -242,6 +275,7 @@ func (a *timingAggregator) flush() {
 		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
 			" n=", n,
 			" requests=", batch.requests, " units=", batch.requests*driveQuotaCost(k),
+			" failed=", batch.failed, " canceled=", batch.canceled, " rate-limits=", batch.rateLimits,
 			" total p50/p95/max ", percentile(total, .5), "/", percentile(total, .95), "/", percentile(total, 1),
 			" wait-pool p50 ", percentile(pool, .5),
 			" wait-cool p50 ", percentile(cool, .5),

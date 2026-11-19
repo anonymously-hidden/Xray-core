@@ -1226,6 +1226,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	defer func() { cancelDescription() }()
 	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
+	tailMisses := 0
 	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
 	for {
 		observations, present := hunt.observations, hunt.present
@@ -1238,6 +1239,11 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		frame, ok := decodeSlot(description)
 		missing := err != nil || !ok || frame.seq != seq
+		if missing {
+			tailMisses = min(tailMisses+1, 3)
+		} else {
+			tailMisses = 0
+		}
 		r.mu.Lock()
 		progressPastHead := r.head == seq && r.frontier > seq
 		r.mu.Unlock()
@@ -1381,6 +1387,15 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			wait, a, b, backoff = 0, f.promoted, active, r.huntFloor
 		default:
 			wait, a, b, backoff = min(max(r.pace(), r.tailMin), r.tailMax), f.promoted, f.near, r.huntFloor
+			// Repeated misses far ahead are predictions, not a stalled head.
+			// Back these off instead of spending quota on the same old frame;
+			// promotion/near admission still interrupts the wait immediately.
+			r.mu.Lock()
+			distant := seq > max(r.head, r.frontier)+slotReadAhead
+			r.mu.Unlock()
+			if distant && tailMisses > 1 {
+				wait = min(wait*time.Duration(1<<(tailMisses-1)), r.tailMax)
+			}
 			select {
 			case <-f.near:
 				b = nil
@@ -1464,6 +1479,18 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	if head {
 		hunt()
 	}
+	// Drive already hedges individual slow metadata requests. During quota
+	// recovery, overlapping three hunts multiplies attempts without helping
+	// visibility; leave existing requests alone but admit only one new read.
+	budget := func() int {
+		if s, ok := r.store.(interface {
+			cooling() bool
+			lastRateLimitAt() time.Time
+		}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
+			return 1
+		}
+		return 3
+	}
 
 	// Yield observations for fetch's stall checks without canceling or
 	// restarting sibling requests. Their lifetime belongs to the description round.
@@ -1491,7 +1518,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			results <- slotDescriptionResult{description, err}
 		}()
 	}
-	if pending.outstanding < 3 {
+	if pending.outstanding < budget() {
 		launch()
 	}
 	for {
@@ -1544,12 +1571,12 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 				err := pending.err
 				pending.err = nil
 				return pending.last.description, err
-			case !idle && pending.outstanding < 3:
+			case !idle && pending.outstanding < budget():
 				launch()
 			}
 		case <-wake:
 			hunt()
-			if pending.outstanding < 3 {
+			if pending.outstanding < budget() {
 				launch()
 			}
 		case <-observationTimer.C:
