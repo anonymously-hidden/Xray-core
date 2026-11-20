@@ -316,6 +316,9 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 		"parents":     []string{s.folder},
 		"description": description,
 	}
+	if properties := s.streamingProperties(); properties != nil {
+		metadata["properties"] = properties
+	}
 	err := s.createWithID(ctx, metadata, body)
 	if err == nil {
 		return nil

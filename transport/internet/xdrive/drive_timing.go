@@ -32,6 +32,8 @@ var kindNames = [kindCount]string{
 	"head-read", "other-read", "body-read", "delete", "list", "token-fetch",
 }
 
+type watermarkWriteKey struct{}
+
 // timingSample is the per-attempt breakdown. Parts the transport cannot
 // observe stay zero and are reported as unavailable via the has* flags.
 type timingSample struct {
@@ -356,6 +358,9 @@ func classifyDriveRequest(ctx context.Context, method, target, contentType strin
 	case "POST":
 		return kindCreate
 	case "PATCH":
+		if ctx.Value(watermarkWriteKey{}) != nil {
+			return kindWatermark
+		}
 		mediaType, _, err := mime.ParseMediaType(contentType)
 		if err == nil && mediaType == "multipart/related" {
 			return kindSlotMedia

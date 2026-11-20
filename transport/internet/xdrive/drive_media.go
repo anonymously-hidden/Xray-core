@@ -52,6 +52,7 @@ type driveMediaRequest struct {
 	seq              int64
 	client           *http.Client
 	rescue           bool
+	stream           *driveRangeStream
 }
 
 func (r *driveMediaRequest) extract(status int, contentRange string, body []byte) ([]byte, error) {

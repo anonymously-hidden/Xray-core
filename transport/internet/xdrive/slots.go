@@ -95,17 +95,20 @@ type throttleStore interface {
 // slotFrame is what the description of a slot says: which segment it holds,
 // and either the segment itself or the size and checksum of the body that does
 type slotFrame struct {
-	seq  int64
-	mode byte
-	size int
-	crc  uint32
-	data []byte
+	seq    int64
+	mode   byte
+	size   int
+	crc    uint32
+	data   []byte
+	blocks []uint32 // per-block CRCs; rooted against crc before streamed delivery
 }
 
 func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
 	f := slotFrame{seq: seq, mode: mode, size: len(data), crc: crc32.ChecksumIEEE(data)}
 	if mode == slotInline {
 		f.data = data
+	} else if mode == slotStream {
+		f.blocks = streamBlockChecksums(data)
 	}
 	return f
 }
@@ -117,7 +120,12 @@ func (f slotFrame) encode() string {
 	b[16] = f.mode
 	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
 	binary.BigEndian.PutUint32(b[21:], f.crc)
-	return base64.StdEncoding.EncodeToString(append(b, f.data...))
+	if f.mode == slotStream {
+		b = appendStreamChecksums(b, f.blocks)
+	} else {
+		b = append(b, f.data...)
+	}
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 func decodeSlot(description string) (slotFrame, bool) {
@@ -142,6 +150,12 @@ func decodeSlot(description string) (slotFrame, bool) {
 		}
 	case slotMedia:
 		if f.size == 0 || len(b) != slotHeaderLen {
+			return slotFrame{}, false
+		}
+	case slotStream:
+		var ok bool
+		f.blocks, ok = decodeStreamChecksums(f.size, f.crc, b[slotHeaderLen:])
+		if !ok {
 			return slotFrame{}, false
 		}
 	case slotEnd, slotErr:
@@ -172,10 +186,11 @@ type slotTable struct {
 // ring is what a client announces a session with, the tables are named from
 // its side. Lazy rings create their slots on first write instead of up front.
 type ring struct {
-	Up    slotTable `json:"u"`
-	Down  slotTable `json:"d"`
-	First []byte    `json:"first,omitempty"`
-	Lazy  bool      `json:"lazy,omitempty"`
+	Up            slotTable `json:"u"`
+	Down          slotTable `json:"d"`
+	First         []byte    `json:"first,omitempty"`
+	Lazy          bool      `json:"lazy,omitempty"`
+	StreamVersion uint32    `json:"stream,omitempty"` // receiver capability, not a v1 watermark change
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -632,6 +647,8 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	mode := byte(slotMedia)
 	if len(chunk) <= slotInlineLimit {
 		mode = slotInline
+	} else if s, ok := w.store.(interface{ streamingEnabled() bool }); ok && s.streamingEnabled() {
+		mode = slotStream
 	}
 	w.prefetchWatermark(seq)
 	began := time.Now()
@@ -667,7 +684,7 @@ func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
 	}
 	f := newSlotFrame(seq, mode, data)
 	var body []byte
-	if mode == slotMedia {
+	if mode == slotMedia || mode == slotStream {
 		body = data
 	}
 	id := w.slotID(seq)
@@ -1078,7 +1095,10 @@ func (r *slotReader) slotID(seq int64) string {
 }
 
 type slotFetch struct {
-	ready chan struct{}
+	ready        chan struct{}
+	streamReady  chan struct{}
+	stream       *slotStreamBuffer
+	firstBlockAt time.Time // run-owned first verified delivery, before whole-frame ACK
 	// promoted is closed when the segment becomes the head
 	promoted  chan struct{}
 	near      chan struct{}
@@ -1120,7 +1140,7 @@ func (r *slotReader) run() {
 		for i := range window {
 			seq := head + int64(i)
 			if fetches[seq] == nil {
-				fetches[seq] = &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{}), born: time.Now()}
+				fetches[seq] = &slotFetch{ready: make(chan struct{}), streamReady: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{}), born: time.Now()}
 				if int64(i) <= slotReadAhead {
 					fetches[seq].enter()
 				}
@@ -1146,10 +1166,25 @@ func (r *slotReader) run() {
 		}
 		select {
 		case <-f.ready:
+		case <-f.streamReady:
 		case <-r.grow:
 			continue
 		case <-ctx.Done():
 			return
+		}
+		streamed := false
+		select {
+		case <-f.streamReady:
+			complete, err := r.deliverStream(ctx, f)
+			if err != nil {
+				r.setErr(err)
+				return
+			}
+			if !complete {
+				continue
+			}
+			streamed = true
+		default:
 		}
 		delete(fetches, head)
 		if f.err != nil {
@@ -1165,13 +1200,19 @@ func (r *slotReader) run() {
 		r.head++
 		r.started = true
 		r.mu.Unlock()
+		size := len(f.body)
+		firstBlockWait := time.Duration(0)
+		if streamed {
+			size = f.stream.frame.size
+			firstBlockWait = max(0, f.firstBlockAt.Sub(f.headAt))
+		}
 		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
-			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", len(f.body),
+			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", size,
 			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
 			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
 			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(),
-			" quiet-tail-backoffs=", r.quietTailBackoffs.Load())
+			" quiet-tail-backoffs=", r.quietTailBackoffs.Load(), " first-block-wait=", firstBlockWait)
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1183,10 +1224,12 @@ func (r *slotReader) run() {
 		default:
 		}
 
-		select {
-		case r.ch <- f.body:
-		case <-ctx.Done():
-			return
+		if !streamed {
+			select {
+			case r.ch <- f.body:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
@@ -1223,7 +1266,7 @@ func (r *slotReader) reach(seq int64) {
 // behind it soon after it was asked for, then at the pace that segments come
 func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFetch) {
 	defer func() {
-		if len(f.body) == 0 && !f.end && f.err == nil {
+		if len(f.body) == 0 && f.stream == nil && !f.end && f.err == nil {
 			f.err = ctx.Err()
 		}
 		f.readyAt = time.Now()
@@ -1301,6 +1344,36 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				f.body = frame.data
 				r.hit()
 				return
+			case slotStream:
+				if store, ok := r.store.(interface {
+					readFrameStream(context.Context, string, slotFrame, func(int, []byte) error) error
+				}); ok {
+					f.stream = newSlotStreamBuffer(frame)
+					close(f.streamReady)
+					select {
+					case <-f.media:
+					case <-ctx.Done():
+						f.err = ctx.Err()
+						return
+					}
+					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+					if r.isHead(seq) {
+						bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
+					}
+					began := time.Now()
+					f.err = store.readFrameStream(bodyCtx, id, frame, f.stream.offer)
+					f.bodyTime = time.Since(began)
+					if f.err == nil && !f.stream.complete() {
+						f.err = errors.New("streamed slot ended without every verified block")
+					}
+					if f.err == nil {
+						r.hit()
+					} else {
+						r.setErr(f.err)
+					}
+					return
+				}
+				fallthrough
 			case slotMedia:
 				select {
 				case <-f.media:
@@ -1823,6 +1896,7 @@ func (r *slotReader) ackLoop() {
 	writeWM := func(want int64) error {
 		var err error
 		ctx := context.WithValue(r.ctx, laneKey{}, true)
+		ctx = context.WithValue(ctx, watermarkWriteKey{}, true)
 		if r.lazy {
 			r.mu.Lock()
 			created := r.wmCreated

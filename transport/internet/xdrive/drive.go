@@ -176,6 +176,7 @@ func isCleanupRateLimited(err error) bool {
 
 type driveStorage struct {
 	*driveShared
+	streamCaps atomic.Pointer[driveStreamCaps]
 	// a session has a client and inflight of its own, see session
 	client         *http.Client
 	priorityClient *http.Client
@@ -1000,7 +1001,12 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if progress, ok := ctx.Value(bodyProgressKey{}).(func()); ok {
 			resp.Body = &progressBody{ReadCloser: resp.Body, alive: progress}
 		}
-		payload, err := readResponse(resp.Body, limit, resp.ContentLength)
+		var payload []byte
+		if media != nil && media.stream != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+			payload, err = media.stream.read(*media, resp.StatusCode, resp.Header.Get("Content-Range"), resp.ContentLength, io.LimitReader(resp.Body, limit+1))
+		} else {
+			payload, err = readResponse(resp.Body, limit, resp.ContentLength)
+		}
 		if err != nil {
 			noteTimeout()
 			if dispatched.Load() && s.timing != nil {
@@ -1110,7 +1116,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				", attempt ", attempt+1, " of ", driveMaxAttempts)
 			continue
 		}
-		if media != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+		if media != nil && media.stream == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
 		}
 		return resp.StatusCode, payload, err
@@ -1970,7 +1976,11 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	} else {
 		ctx = context.WithValue(ctx, bodyKey{}, true)
 	}
-	metadata, err := json.Marshal(map[string]string{"description": description})
+	fields := map[string]interface{}{"description": description}
+	if properties := s.streamingProperties(); properties != nil {
+		fields["properties"] = properties
+	}
+	metadata, err := json.Marshal(fields)
 	if err != nil {
 		return errors.New("failed to build the slot metadata").Base(err)
 	}
@@ -2180,7 +2190,7 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 // readDescription implements slotStore
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
 	ctx = context.WithValue(ctx, attemptKey{}, driveSlotRead)
-	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true")
+	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields="+s.streamingFields()+"&supportsAllDrives=true")
 	switch {
 	case err != nil:
 		return "", err
@@ -2191,11 +2201,13 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	}
 
 	var parsed struct {
-		Description string `json:"description"`
+		Description string            `json:"description"`
+		Properties  map[string]string `json:"properties"`
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return "", errors.New("failed to parse the description of ", id).Base(err)
 	}
+	s.observeStreamingProperties(parsed.Properties)
 	return parsed.Description, nil
 }
 

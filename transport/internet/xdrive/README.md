@@ -1,8 +1,43 @@
 # Drive media latency
 
-The slot reader delivers one ordered byte stream. A large media frame must be
-downloaded and CRC-checked before later inline frames can be delivered. Mux
-connections sharing that stream also share its head-of-line delays.
+The slot reader delivers one ordered byte stream. Legacy media frames are fully
+downloaded and CRC-checked before delivery. Negotiated streaming frames can
+deliver verified portions sooner, but later frames still cannot overtake missing
+earlier bytes. This is incremental delivery, not per-mux-stream isolation.
+
+## Negotiated verified media streaming
+
+New Drive peers advertise reader support in the existing ring announcement.
+The accepting server acknowledges it through version/session properties on its
+normal slot or watermark updates; clients never publish their own acceptance.
+Markers are session-bound public file properties so different OAuth applications
+can see them. Missing, stale, or unsupported acceptance leaves the writer on the
+legacy format. This negotiation adds metadata bytes, not extra API calls or files.
+
+Streaming mode (`mode=5`) adds CRC32 checksums for fixed 32 KiB blocks. Their
+combined CRC must match the frame CRC before delivery starts; each block must
+then pass its own checksum. Blocks are delivered in byte order, and delivered
+blocks are not replayed by retries or hedges. Slot reuse/ACK waits for every range
+to finish exact length and EOF validation and for all verified blocks to be queued.
+Primary GET counts and existing range/hedge budgets are retained. Streamed range
+boundaries are block-aligned; legacy range behavior and polling floors are unchanged.
+
+CRC32 is corruption detection, not authentication. Existing VLESS encryption and
+its byte order are unchanged. A later bad block, truncated response, or EOF error
+can terminate a connection after a valid prefix has already been delivered;
+those prefix bytes cannot be retracted. No all-or-nothing delivery guarantee is
+claimed for streaming frames. Prefetch bounds remain in place, and consumed
+block buffers are released while their deduplication bits are retained.
+
+Use upgraded endpoints on both sides to enable streaming. Mixed-version peers
+remain compatible but use legacy media. No mux-resume feature, external transport
+dependency, configuration change, or polling-floor reduction is required.
+
+For streaming read logs, `first-block-wait` measures the time until the first
+verified block is queued to the connection reader. `head-wait` still describes
+whole-frame completion waiting, so it is not the first-byte delay for mode 5.
+The first-block field is zero/not applicable for legacy frames. Slow HTTP/body
+timings include local checksum processing; they are not pure wire measurements.
 
 Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);
@@ -41,8 +76,9 @@ pool, not polling or keep-warm API requests.
 
 Range offsets, lengths and the complete frame CRC are checked before delivery
 or acknowledgement. Servers that ignore Range can return a full-sized body.
-For these Drive media changes, the frame and announcement formats are unchanged:
-a client-only upgrade works with existing servers. The template WAL upgrade below
+The older range/hedge changes leave legacy formats unchanged. The streaming
+extension above is negotiated per session; a client-only upgrade still works with
+existing servers without enabling streaming. The template WAL upgrade below
 has a different compatibility requirement. No server setting can be increased by
 changing the client.
 

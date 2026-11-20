@@ -480,6 +480,10 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	p = paramsForStorage(config, storage)
 
 	slots, ok := storage.(slotStore)
+	capable, streams := storage.(interface{ configureStreaming(string, bool) })
+	if ok && streams {
+		capable.configureStreaming(session, false)
+	}
 	ls, canAllocate := storage.(interface {
 		takeIDs(context.Context, int, int) ([]string, error)
 	})
@@ -525,6 +529,9 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, err
 	}
 	if ok {
+		if streams {
+			r.StreamVersion = 1
+		}
 		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
 		}
@@ -917,6 +924,9 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 	}
 	if slots, ok := storage.(slotStore); ok {
 		if r, ok := decodeRing(announce); ok {
+			if capable, ok := storage.(interface{ configureStreaming(string, bool) }); ok {
+				capable.configureStreaming(session, r.StreamVersion == 1)
+			}
 			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
 			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
 			errors.LogInfo(logCtx, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
