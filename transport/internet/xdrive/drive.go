@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -176,7 +177,8 @@ func isCleanupRateLimited(err error) bool {
 
 type driveStorage struct {
 	*driveShared
-	streamCaps atomic.Pointer[driveStreamCaps]
+	streamCaps       atomic.Pointer[driveStreamCaps]
+	streamHeadRanges int // immutable owner snapshot; zero means the unchanged default
 	// a session has a client and inflight of its own, see session
 	client         *http.Client
 	priorityClient *http.Client
@@ -291,9 +293,14 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			return nil, errors.New("Google Drive secret ", i, " is empty")
 		}
 	}
+	headRanges, validHeadRanges := parseStreamHeadRanges(os.Getenv(streamHeadRangesEnv))
 
 	h1Hosts := new(sync.Map)
 	workCtx, workCancel := context.WithCancel(context.Background())
+	if !validHeadRanges {
+		errors.LogWarning(workCtx, "invalid ", streamHeadRangesEnv, "; retaining default head range limit 4")
+	}
+	errors.LogInfo(workCtx, "xdrive streamed head range limit=", headRanges, " (2 is experimental; default 4)")
 	client := newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 	st := &driveStorage{
 		driveShared: &driveShared{
@@ -326,6 +333,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			cleanupMaxRetries: cleanupMaxRetries,
 		},
 		client:           client,
+		streamHeadRanges: headRanges,
 		priorityClient:   newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight),
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),
@@ -358,6 +366,7 @@ func (s *driveStorage) session() Storage {
 	st := &driveStorage{
 		driveShared:      s.driveShared,
 		client:           &http.Client{Transport: transport},
+		streamHeadRanges: s.streamHeadRanges,
 		bulkClient:       &http.Client{Transport: bulkTransport},
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),

@@ -39,6 +39,38 @@ whole-frame completion waiting, so it is not the first-byte delay for mode 5.
 The first-block field is zero/not applicable for legacy frames. Slow HTTP/body
 timings include local checksum processing; they are not pure wire measurements.
 
+## Optional two-range streaming-head experiment
+
+The production default remains four media ranges for a large initially headed
+streaming frame. An explicit process environment setting can cap those MODE5
+head plans at two ranges for an A/B experiment:
+
+```powershell
+$env:XRAY_XDRIVE_STREAM_HEAD_RANGES = "2"
+# Start the core with your existing configuration.
+```
+
+Use `"4"` or remove the setting to return to the default, and restart the core
+between runs. Only `2` and `4` are accepted; invalid values warn and retain four.
+The setting is captured when the Drive storage owner is created and copied into
+its sessions, not re-read during traffic. For downstream browsing, change the
+client reader's environment. No configuration-schema or dependency change is needed.
+
+This affects only initially head-marked MODE5 primary range planning. Legacy
+MODE2, nonhead planning, connection pools, promotion, polling floors, permit limits,
+hedge policy, and checksum/EOF/ACK requirements are unchanged. A prefetched
+single-range request is not split or relaunched when it later becomes the head.
+Two ranges may save quota but can worsen later block gaps, completion time, or
+connection-diversity recovery. Fewer completed ranges also replenish the existing
+hedge-token budget more slowly; no compensation is applied during this experiment.
+It is not a claimed fix for slow first-byte responses or a new production default.
+
+Match direction, frame size, load and connection warmth when comparing 4 versus
+2. Compare actual `requests`/`units`, throughput, first-block waits, subsequent
+missing-block gaps, completion and recovery—not only planned range counts. The
+owner startup log and split plan's `head-limit` show the effective setting. Read
+logs append the physical `slot` tag so plans and slow requests can be correlated.
+
 ## Queue and streaming-gap observations
 
 Write logs add `buffer-episode-age`, `upload-permit-wait`, `upload-queue`, and
@@ -92,6 +124,25 @@ from the writer's HTTP reply alone: the reader does not wait for that reply.
 Smaller tiers, faster ACKs, or a new metadata-prefix mode are not introduced on
 these assumptions. A prefix would add bandwidth to repeated metadata reads and
 does not by itself guarantee a complete encrypted record.
+
+### November 20 rerun (resume.48)
+
+The saved client 09:39:39–09:44:51 log contains 574 streaming frames and 124
+prefix handoffs over 100 ms before completion, with a maximum lead of 5.62 s.
+Five media hedge races won; whole-range win counts still cannot account for every
+useful early block. Local reader enqueue p95 is about 2 ms, and the maximum
+completion fence after queued blocks is about 5 ms. Significant first-byte/body
+outliers remain: frame 730 waited 9.54 s for headers and 2.49 s for body retrieval,
+while later prefetched requests took about 15 s without local HTTP queue waits.
+Long admission waits belong to bounded future-frame prefetching and do not by
+themselves justify increasing that window.
+
+Server upload-permit waits reached 1.10 s and reuse waits 1.49 s, but p95 reuse
+wait is only about 47 microseconds. No window/ACK change is introduced. Split plans
+contained thirty four-range and eight three-range heads; applying a two-range
+cap to those same plans would remove 68 primary GETs (13,600 estimated units).
+That is a planned counterfactual, not measured savings. It motivates only the
+explicit opt-in experiment above, with the default unchanged.
 
 Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);

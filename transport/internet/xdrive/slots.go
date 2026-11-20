@@ -1285,7 +1285,7 @@ func (r *slotReader) run() {
 			" missing-block-gaps=", f.delivery.missingCount,
 			" missing-block-wait=", f.delivery.missingTotal, " missing-block-max=", f.delivery.missingMax,
 			" enqueue-wait=", f.delivery.enqueueTotal, " enqueue-max=", f.delivery.enqueueMax,
-			" completion-after-blocks=", f.delivery.completionWait(f.readyAt))
+			" completion-after-blocks=", f.delivery.completionWait(f.readyAt), " slot=", slotTag(r.slotID(head)))
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
