@@ -19,14 +19,18 @@ type streamReaderFixture struct {
 }
 
 func newStreamReaderFixture(data []byte) *streamReaderFixture {
-	return &streamReaderFixture{data: data, frame: newSlotFrame(0, slotStream, data),
-		tail: make(chan struct{}), eof: make(chan struct{}), acks: make(chan int64, 8)}
+	return &streamReaderFixture{
+		data: data, frame: newSlotFrame(0, slotStream, data),
+		tail: make(chan struct{}), eof: make(chan struct{}), acks: make(chan int64, 8),
+	}
 }
 
 func (s *streamReaderFixture) makeSlot(context.Context, string) (string, error) { return "unused", nil }
+
 func (s *streamReaderFixture) createSlot(ctx context.Context, id, name, description string, body []byte) error {
 	return s.setSlot(ctx, id, description, body)
 }
+
 func (s *streamReaderFixture) setSlot(ctx context.Context, id, description string, body []byte) error {
 	if id == "wm" {
 		value, err := strconv.ParseInt(description, 10, 64)
@@ -41,6 +45,7 @@ func (s *streamReaderFixture) setSlot(ctx context.Context, id, description strin
 	}
 	return nil
 }
+
 func (s *streamReaderFixture) readDescription(ctx context.Context, id string) (string, error) {
 	switch id {
 	case "in0":
@@ -54,9 +59,11 @@ func (s *streamReaderFixture) readDescription(ctx context.Context, id string) (s
 		return "", nil
 	}
 }
+
 func (s *streamReaderFixture) readBody(context.Context, string) ([]byte, error) {
 	return bytes.Clone(s.data), nil
 }
+
 func (s *streamReaderFixture) readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error {
 	if err := emit(0, bytes.Clone(s.data[:streamBlockSize(frame.size, 0)])); err != nil {
 		return err
@@ -81,9 +88,11 @@ func (s *streamReaderFixture) readFrameStream(ctx context.Context, id string, fr
 }
 
 func streamReaderParams() params {
-	return params{concurrency: 2, segmentBytes: 512 << 10, flushInterval: 10 * time.Millisecond,
+	return params{
+		concurrency: 2, segmentBytes: 512 << 10, flushInterval: 10 * time.Millisecond,
 		minPollInterval: 50 * time.Millisecond, maxPollInterval: 200 * time.Millisecond,
-		eagerWindow: 2 * time.Second, holeTimeout: 30 * time.Second, sessionTTL: time.Minute}
+		eagerWindow: 2 * time.Second, holeTimeout: 30 * time.Second, sessionTTL: time.Minute,
+	}
 }
 
 func receiveStreamChunk(t *testing.T, reader *slotReader) []byte {

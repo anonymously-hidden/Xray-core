@@ -824,8 +824,24 @@ func TestDriveXmuxConnections(t *testing.T) {
 	prepareDrive(t, settings, server.URL+"/token", server.URL+"/files", server.URL+"/upload")
 
 	runSessions(t, settings, 3)
-	if got := server.conns.Load(); got != 4 {
-		t.Errorf("6 ends of sessions with 3 connections and the listener took %d connections", got)
+	storage, err := newStorage(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storage.Close()
+	s := storage.(*leasedDriveStorage).driveStorage
+	want := 1 // listener and token share the owner's connection to this host
+	for _, pool := range []*connPool{s.conns, s.priorityConns} {
+		pool.connMu.Lock()
+		n := len(pool.conns)
+		pool.connMu.Unlock()
+		if n < 1 || n > 3 || pool == s.conns && n != 3 {
+			t.Errorf("XMUX pool used %d connections with maxConnections 3", n)
+		}
+		want += n
+	}
+	if got := server.conns.Load(); got != int32(want) {
+		t.Errorf("listener/token and separate ordinary/priority pools took %d connections, want %d", got, want)
 	}
 
 	drive.mu.Lock()

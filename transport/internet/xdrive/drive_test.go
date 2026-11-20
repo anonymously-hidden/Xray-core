@@ -1420,7 +1420,7 @@ func TestDriveDescriptionHedgeCancellationDoesNotJoinRPCs(t *testing.T) {
 		s := memoryDrive(rt)
 		s.bulkClient = &http.Client{Transport: rt}
 		s.readHedge, s.readHedgeTokens = time.Millisecond, 1
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), laneKey{}, true))
 		done := make(chan error, 1)
 		go func() { _, _, err := s.readDescHedged(ctx, "http://drive.invalid/files/item"); done <- err }()
 		<-entered
@@ -1915,13 +1915,13 @@ func TestDriveQuotaBudgetStopsLateRateLimit(t *testing.T) {
 	})
 }
 
-func TestDriveDescriptionRescueRearms(t *testing.T) {
+func TestDriveDescriptionRescueBudgetDoesNotRearmPendingRead(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var hedges atomic.Int32
-		primaryDone := make(chan struct{})
+		primaryDone := make(chan struct{}, 2)
 		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
 			<-r.Context().Done()
-			close(primaryDone)
+			primaryDone <- struct{}{}
 			return nil, r.Context().Err()
 		}))
 		s.readHedge = time.Second
@@ -1929,9 +1929,11 @@ func TestDriveDescriptionRescueRearms(t *testing.T) {
 			hedges.Add(1)
 			return memoryResponse(http.StatusOK, "rescued"), nil
 		})}
+		ctx, cancel := context.WithCancel(context.WithValue(context.Background(), laneKey{}, true))
+		defer cancel()
 		done := make(chan error, 1)
 		go func() {
-			status, body, err := s.readDescHedged(context.Background(), "http://drive.invalid/files/item")
+			status, body, err := s.readDescHedged(ctx, "http://drive.invalid/files/item")
 			if err == nil && (status != http.StatusOK || string(body) != "rescued") {
 				err = fmt.Errorf("unexpected rescue result")
 			}
@@ -1946,8 +1948,20 @@ func TestDriveDescriptionRescueRearms(t *testing.T) {
 		s.readHedgeMu.Lock()
 		s.readHedgeTokens = 1
 		s.readHedgeMu.Unlock()
-		if err := <-done; err != nil {
-			t.Fatal(err)
+		synctest.Wait()
+		if hedges.Load() != 0 {
+			t.Fatal("a spent description timer chased replenished tokens")
+		}
+		cancel()
+		if err := <-done; err != context.Canceled {
+			t.Fatalf("pending read did not honor cancellation: %v", err)
+		}
+		<-primaryDone
+		synctest.Wait()
+		// A subsequent head read may spend the token; the old pending read may not.
+		status, body, err := s.readDescHedged(context.WithValue(context.Background(), laneKey{}, true), "http://drive.invalid/files/item")
+		if err != nil || status != http.StatusOK || string(body) != "rescued" {
+			t.Fatalf("next read did not use available rescue credit: status=%d body=%q err=%v", status, body, err)
 		}
 		<-primaryDone
 		synctest.Wait()

@@ -30,8 +30,10 @@ const (
 type driveMediaKey struct{}
 
 // mediaHeadKey marks a body read for the frame the reader is delivering next.
-type mediaHeadKey struct{}
-type mediaPromotionKey struct{}
+type (
+	mediaHeadKey      struct{}
+	mediaPromotionKey struct{}
+)
 
 // mediaDeliveryKey carries a tracked slot stream's ordered delivery frontier:
 // the next required byte, a broadcast generation, and when its reader started

@@ -1741,7 +1741,7 @@ func TestSlotCloseUsesDrainProgress(t *testing.T) {
 	}
 }
 
-func TestSlotIdleHeadWakeStartsUrgentReadWithoutWaiting(t *testing.T) {
+func TestSlotIdleHeadWakeRespectsOverlapDelay(t *testing.T) {
 	for _, seq := range []int64{0, 1} {
 		t.Run(strconv.FormatInt(seq, 10), func(t *testing.T) {
 			driveClock(t, func(t *testing.T) {
@@ -1769,15 +1769,33 @@ func TestSlotIdleHeadWakeStartsUrgentReadWithoutWaiting(t *testing.T) {
 					}
 					return
 				}
-				if len(entered) != 1 || !<-entered || time.Now() != started {
-					t.Fatal("idle head wake waited for its pending read instead of launching an urgent sibling")
+				if len(entered) != 0 || r.reads.Load() != 1 || time.Now() != started {
+					t.Fatal("idle head wake bypassed the pending read's overlap delay")
+				}
+				delay := r.headOverlapDelay()
+				time.Sleep(delay)
+				synctest.Wait()
+				if len(entered) != 1 || !<-entered || time.Since(started) != delay {
+					t.Fatal("idle head did not launch a sibling at its overlap deadline")
 				}
 				for range 5 {
 					r.Wake()
 					synctest.Wait()
 				}
-				if r.reads.Load() != 3 || time.Now() != started {
-					t.Fatal("wake changed the overlap cap or introduced a wait")
+				if r.reads.Load() != 2 || len(entered) != 0 || time.Since(started) != delay {
+					t.Fatal("repeated wakes bypassed the next overlap delay")
+				}
+				time.Sleep(delay)
+				synctest.Wait()
+				if r.reads.Load() != 3 || len(entered) != 1 || !<-entered {
+					t.Fatal("head did not fill its bounded overlap budget")
+				}
+				for range 5 {
+					r.Wake()
+					synctest.Wait()
+				}
+				if r.reads.Load() != 3 || len(entered) != 0 || time.Since(started) != 2*delay {
+					t.Fatal("wake changed the overlap cap")
 				}
 			})
 		})

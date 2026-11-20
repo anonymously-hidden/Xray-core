@@ -93,9 +93,11 @@ type attemptKey struct{}
 
 // Read hedges recover only a stalled first dispatch. Token,
 // connection and permit waits, and the primary's retries, are not hedgeable.
-type readProgressKey struct{}
-type descriptionHedgeKey struct{}
-type readHedgeGateKey struct{}
+type (
+	readProgressKey     struct{}
+	descriptionHedgeKey struct{}
+	readHedgeGateKey    struct{}
+)
 
 type readHedgeGate struct {
 	primary   *driveReadProgress

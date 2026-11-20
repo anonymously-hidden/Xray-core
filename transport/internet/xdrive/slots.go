@@ -1826,7 +1826,9 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 				err := pending.err
 				pending.err = nil
 				return pending.last.description, err
-			case !idle:
+			case !idle || !pending.seen:
+				// A blocked first observation still needs bounded recovery even
+				// after the eager window expires; otherwise it can hide all data.
 				admit()
 			}
 		case <-wake:

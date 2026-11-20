@@ -590,12 +590,19 @@ func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f
 // "hKeepAlivePeriod" of XMUX sets when an idle h2 connection pings, -1 never,
 // and h3 keeps alive only when it is set
 func TestServiceClientKeepAlive(t *testing.T) {
-	for period, want := range map[int64]time.Duration{0: xnet.ChromeH2KeepAlivePeriod, 20: 20 * time.Second, -1: 0} {
+	for period, want := range map[int64]time.Duration{0: 1500 * time.Millisecond, 20: 20 * time.Second, -1: 0} {
 		settings := &internet.MemoryStreamConfig{ProtocolSettings: &Config{Xmux: &splithttp.XmuxConfig{HKeepAlivePeriod: period}}}
 		client := newServiceClient(context.Background(), new(sync.Map), settings, 5*time.Second, 8)
 		h2 := client.Transport.(*serviceTransport).secure.(*secureTransport).h2.(*http.Transport)
 		if got := h2.HTTP2.SendPingTimeout; got != want {
 			t.Errorf("hKeepAlivePeriod %d pings after %v, want %v", period, got, want)
+		}
+		var pingWait time.Duration
+		if period == 0 {
+			pingWait = 2500 * time.Millisecond
+		}
+		if got := h2.HTTP2.PingTimeout; got != pingWait {
+			t.Errorf("hKeepAlivePeriod %d waits %v for ping, want %v", period, got, pingWait)
 		}
 	}
 	for period, want := range map[int64]time.Duration{0: 0, 20: 20 * time.Second, -1: 0} {
@@ -903,7 +910,8 @@ func TestDriveOverH3(t *testing.T) {
 	rec := new(recorder)
 	settings := server.settings(&tls.Config{})
 	settings.ProtocolSettings = driveSettings().ProtocolSettings
-	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: 4, To: 4}}
+	const xmuxConnections = 4
+	settings.ProtocolSettings.(*Config).Xmux = &splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: xmuxConnections, To: xmuxConnections}}
 	masks := []finalmask.UDPMask{&noise.Config{Items: []*noise.Item{{Packet: []byte("noise")}}}}
 	settings.FinalMask = finalmask.NewFinalMask(nil, masks, nil, nil, rec.dialUDP, nil)
 	prepareDrive(t, settings, "https://oauth2.googleapis.com/token", "https://www.googleapis.com/files", "https://www.googleapis.com/upload")
@@ -942,9 +950,10 @@ func TestDriveOverH3(t *testing.T) {
 	// oauth2.googleapis.com and one of XMUX for each end of the session; the
 	// 300 KB burst needs more than the free tokens of inline frames, so it goes
 	// as media and may add upload/recovery bulk connections and up to four
-	// independent range-download connections on the receiving end.
-	if n := len(rec.conns); n < 4 || n > 6+driveMediaLanes {
-		t.Errorf("%d connections went through the mask, want 4 to %d", n, 6+driveMediaLanes)
+	// independent range-download connections on the receiving end. Head reads
+	// also use their own priority pool, bounded by maxConnections.
+	if n := len(rec.conns); n < 4 || n > 6+xmuxConnections+driveMediaLanes {
+		t.Errorf("%d connections went through the mask, want 4 to %d", n, 6+xmuxConnections+driveMediaLanes)
 	}
 	for i, conn := range rec.conns {
 		conn.mu.Lock()
