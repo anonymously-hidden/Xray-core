@@ -21,6 +21,50 @@ type slotStreamBuffer struct {
 	updates  chan struct{}
 }
 
+// These observations belong to run, not the HTTP workers. Missing-block waits
+// exclude downstream channel backpressure and persist across frontier yields.
+type streamDeliveryTiming struct {
+	waitSince    time.Time
+	lastQueued   time.Time
+	blocks       int
+	missingCount int
+	missingTotal time.Duration
+	missingMax   time.Duration
+	enqueueTotal time.Duration
+	enqueueMax   time.Duration
+}
+
+func (d *streamDeliveryTiming) beginMissing(now time.Time) {
+	if d.blocks > 0 && d.waitSince.IsZero() {
+		d.waitSince = now
+	}
+}
+
+func (d *streamDeliveryTiming) blockReady(now time.Time) {
+	if !d.waitSince.IsZero() {
+		wait := max(0, now.Sub(d.waitSince))
+		d.missingCount++
+		d.missingTotal += wait
+		d.missingMax = max(d.missingMax, wait)
+		d.waitSince = time.Time{}
+	}
+}
+
+func (d *streamDeliveryTiming) queued(start, now time.Time) {
+	wait := max(0, now.Sub(start))
+	d.enqueueTotal += wait
+	d.enqueueMax = max(d.enqueueMax, wait)
+	d.lastQueued = now
+	d.blocks++
+}
+
+func (d *streamDeliveryTiming) completionWait(readyAt time.Time) time.Duration {
+	if d.lastQueued.IsZero() {
+		return 0
+	}
+	return max(0, readyAt.Sub(d.lastQueued))
+}
+
 func newSlotStreamBuffer(frame slotFrame) *slotStreamBuffer {
 	return &slotStreamBuffer{
 		frame:   frame,
@@ -82,11 +126,15 @@ func (r *slotReader) deliverStream(ctx context.Context, f *slotFetch) (bool, err
 		}
 		data, all := f.stream.take()
 		if data != nil {
+			start := time.Now()
+			f.delivery.blockReady(start)
 			select {
 			case r.ch <- data:
+				now := time.Now()
 				if f.firstBlockAt.IsZero() {
-					f.firstBlockAt = time.Now()
+					f.firstBlockAt = now
 				}
+				f.delivery.queued(start, now)
 			case <-ctx.Done():
 				return false, ctx.Err()
 			}
@@ -102,6 +150,7 @@ func (r *slotReader) deliverStream(ctx context.Context, f *slotFetch) (bool, err
 				return false, ctx.Err()
 			}
 		}
+		f.delivery.beginMissing(time.Now())
 		select {
 		case <-f.stream.updates:
 		case <-f.ready:

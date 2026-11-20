@@ -39,6 +39,60 @@ whole-frame completion waiting, so it is not the first-byte delay for mode 5.
 The first-block field is zero/not applicable for legacy frames. Slow HTTP/body
 timings include local checksum processing; they are not pure wire measurements.
 
+## Queue and streaming-gap observations
+
+Write logs add `buffer-episode-age`, `upload-permit-wait`, `upload-queue`, and
+`prefetch-setup` before the existing `await` and `put` phases. The buffer episode
+begins on an empty-to-nonempty append and persists across extracted suffixes, so
+its age is an upper bound, not exact per-byte residence time. Permit waits include
+reacquiring the writer mutex after a full upload window. Queue time measures
+assignment to worker entry; prefetch setup covers the synchronous preparation
+before reuse waiting starts, not the background watermark HTTP request duration.
+These durations can overlap and must not simply be
+added to infer end-to-end latency. They are logged only for successful writes.
+
+`local-outstanding-bytes` snapshots buffered plus assigned/incomplete upload bytes
+at assignment, including the selected frame. It is not remote unacknowledged data
+or the exact bytes ahead of an interactive message. `buffer-bytes` is the buffer
+size before extraction, not a queue position. Unavailable observations report
+`-1`; none of these observations change batching, admission, or storage traffic.
+
+Read logs separate `media-admission` (cumulative wait at the body-prefetch gate)
+from HTTP retrieval. For streaming frames, `missing-block-gaps`,
+`missing-block-wait`, and `missing-block-max` describe reader-observed waits for
+the next required block after the first delivery. They exclude downstream
+reader-channel backpressure, which is recorded separately as `enqueue-wait` and
+`enqueue-max`. `completion-after-blocks` describes the remaining completion
+fence after the last block was queued; it can include range EOF/validation and
+worker joining, not just network EOF. Ready/prefetched blocks do not create
+missing-block gaps. These are transport observations, not website benchmarks.
+
+Split streaming reads additionally emit a debug `xdrive stream plan` with the
+sequence, frame size, range count, and head/prefetch role. It measures planned
+geometry, not successful requests or quota savings. The current geometry is
+unchanged; the plan helps assess whether a two-range experiment is worthwhile.
+
+### November 20 follow-up (resume.47)
+
+The client 08:22:00–08:27:43 log contains 434 media frames, all using streaming
+mode 5. In 98 frames the first block was queued more than 100 ms before full-frame
+completion, with a maximum within-frame lead of 1.32 s. That is direct evidence
+of earlier transport handoff, not a matched browser-speed comparison. Five timing
+windows report two media hedges with no wins and 15 deferred opportunities.
+Most server reuse waits are microseconds, although there are roughly one-second
+outliers. The major matched inline delay is therefore not explained by a general
+reuse bottleneck; local writer queue observations are needed before changing
+window or ACK policies.
+
+The writer already overrides the large-burst rule with inline fan-out when its
+available window can cover the buffer (up to about 252 KiB with an empty default
+12-upload window). A grown segment size does not mean every subsequent burst
+uses media. A single multipart request also does not establish visibility timing
+from the writer's HTTP reply alone: the reader does not wait for that reply.
+Smaller tiers, faster ACKs, or a new metadata-prefix mode are not introduced on
+these assumptions. A prefix would add bandwidth to repeated metadata reads and
+does not by itself guarantee a complete encrypted record.
+
 Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);
 prefetched non-head frames use one range per 512 KiB, capped at four. After two

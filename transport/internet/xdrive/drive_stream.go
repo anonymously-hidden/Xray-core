@@ -128,6 +128,10 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
 		parts = 1
 	}
+	if parts > 1 {
+		errors.LogDebug(ctx, "xdrive stream plan slot=", slotTag(id), " seq=", frame.seq,
+			" bytes=", frame.size, " parts=", parts, " head=", ctx.Value(mediaHeadKey{}) != nil)
+	}
 	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
 	stream := &driveRangeStream{frame: frame, emit: emit}
 	defer func() {

@@ -284,6 +284,38 @@ var errWriteStopped = errors.New("write stopped")
 type slotWriteResult struct {
 	done chan struct{}
 	err  error // published before done closes
+
+	// These observations are immutable once the upload worker is assigned.
+	// The buffer episode can outlive extracted prefixes, so its age bounds
+	// the selected bytes' residence time rather than measuring each byte.
+	bufferEpisodeAt       time.Time
+	selectedAt            time.Time
+	assignedAt            time.Time
+	permitWait            time.Duration // cumulative full-window waits, including mu reacquisition
+	bufferBytes           int           // input buffer before extracting this chunk
+	localOutstandingBytes int           // buffered plus assigned/not-yet-completed upload bytes
+	accountedBytes        int
+	accounted             bool // direct upload callers may not have enqueued/accounted this result
+}
+
+func slotWriteElapsed(start, end time.Time) time.Duration {
+	if start.IsZero() || end.IsZero() {
+		return -1
+	}
+	return max(0, end.Sub(start))
+}
+
+// Buffer episode age overlaps admission wait; these observations are not an
+// additive latency breakdown. Unknown assignment timestamps remain unavailable.
+func (r *slotWriteResult) durations(workerAt, prefetchAt, awaitAt time.Time) (bufferEpisodeAge, permitWait, queueWait, prefetchSetup time.Duration) {
+	bufferEpisodeAge = slotWriteElapsed(r.bufferEpisodeAt, r.selectedAt)
+	permitWait = -1
+	if !r.assignedAt.IsZero() {
+		permitWait = r.permitWait
+	}
+	queueWait = slotWriteElapsed(r.assignedAt, workerAt)
+	prefetchSetup = slotWriteElapsed(prefetchAt, awaitAt)
+	return
 }
 
 type slotWriter struct {
@@ -301,26 +333,28 @@ type slotWriter struct {
 	closeErr  error
 	closeDone chan struct{}
 
-	mu           sync.Mutex
-	buf          []byte
-	bufBase      []byte
-	seq          int64
-	size         int
-	full         int
-	lastSize     int
-	held         int
-	flushing     bool          // a flush is waiting for a token with mu released
-	available    chan struct{} // closed when an upload permit is returned; guarded by mu
-	failed       chan struct{}
-	bulkSegments int
-	bulkLimited  bool
-	throttles    int64
-	closed       bool
-	err          error
-	first        chan []byte
-	lazy         bool
-	created      []bool
-	gates        []*slotWriteResult // completion and result of the last assigned physical write
+	mu                 sync.Mutex
+	buf                []byte
+	bufBase            []byte
+	bufEpisodeAt       time.Time // reset only when nonempty input is appended to an empty buffer
+	pendingUploadBytes int       // assigned upload bytes; guarded by mu, not remote unacknowledged bytes
+	seq                int64
+	size               int
+	full               int
+	lastSize           int
+	held               int
+	flushing           bool          // a flush is waiting for a token with mu released
+	available          chan struct{} // closed when an upload permit is returned; guarded by mu
+	failed             chan struct{}
+	bulkSegments       int
+	bulkLimited        bool
+	throttles          int64
+	closed             bool
+	err                error
+	first              chan []byte
+	lazy               bool
+	created            []bool
+	gates              []*slotWriteResult // completion and result of the last assigned physical write
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -413,6 +447,9 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 }
 
 func (w *slotWriter) appendBufferLocked(p []byte) {
+	if len(w.buf) == 0 && len(p) > 0 {
+		w.bufEpisodeAt = time.Now()
+	}
 	if w.bufBase == nil {
 		w.bufBase = w.buf[:0]
 	}
@@ -537,9 +574,11 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	if !allowClosed {
 		stop = w.flushStop
 	}
+	var permitWait time.Duration
 	for len(w.slots) >= w.writeWindow() {
 		available := w.available
 		w.flushing = true
+		waitAt := time.Now()
 		w.mu.Unlock()
 		var stopped error
 		select {
@@ -554,6 +593,7 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 			stopped = errWriteStopped
 		}
 		w.mu.Lock()
+		permitWait += time.Since(waitAt)
 		w.flushing = false
 		if stopped != nil {
 			return stopped
@@ -604,6 +644,7 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 		w.bulkSegments = 0
 	}
 
+	selectedAt, bufferEpisodeAt, bufferBytes := time.Now(), w.bufEpisodeAt, len(w.buf)
 	chunk := bytes.Clone(w.buf[:n])
 	if w.bufBase == nil {
 		w.bufBase = w.buf[:0]
@@ -624,7 +665,18 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	w.held = 0
 
 	idx := int(seq % int64(len(w.table.Slots)))
-	prev, result := w.gates[idx], &slotWriteResult{done: make(chan struct{})}
+	w.pendingUploadBytes += n
+	prev, result := w.gates[idx], &slotWriteResult{
+		done:                  make(chan struct{}),
+		bufferEpisodeAt:       bufferEpisodeAt,
+		selectedAt:            selectedAt,
+		assignedAt:            time.Now(),
+		permitWait:            permitWait,
+		bufferBytes:           bufferBytes,
+		localOutstandingBytes: len(w.buf) + w.pendingUploadBytes,
+		accountedBytes:        n,
+		accounted:             true,
+	}
 	w.gates[idx] = result
 	w.wg.Add(1)
 	go w.upload(seq, chunk, prev, result)
@@ -636,9 +688,13 @@ func (w *slotWriter) slotID(seq int64) string {
 }
 
 func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResult) {
+	workerAt := time.Now()
 	defer w.wg.Done()
 	defer func() {
 		w.mu.Lock()
+		if result.accounted {
+			w.pendingUploadBytes -= result.accountedBytes
+		}
 		w.releaseSlotLocked()
 		w.mu.Unlock()
 	}()
@@ -650,6 +706,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	} else if s, ok := w.store.(interface{ streamingEnabled() bool }); ok && s.streamingEnabled() {
 		mode = slotStream
 	}
+	prefetchAt := time.Now()
 	w.prefetchWatermark(seq)
 	began := time.Now()
 	if err := w.awaitPrevious(seq, prev); err != nil {
@@ -667,8 +724,17 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		result.err = err
 		return
 	}
+	put := time.Since(putAt)
+	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)
+	localOutstandingBytes, bufferBytes := -1, -1
+	if !result.assignedAt.IsZero() {
+		localOutstandingBytes, bufferBytes = result.localOutstandingBytes, result.bufferBytes
+	}
 	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
-		" mode=", mode, " await=", awaited, " put=", time.Since(putAt))
+		" mode=", mode, " await=", awaited, " put=", put,
+		" buffer-episode-age=", bufferEpisodeAge, " upload-permit-wait=", permitWait,
+		" upload-queue=", queueWait, " prefetch-setup=", prefetchSetup,
+		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes)
 }
 
 func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
@@ -1099,19 +1165,21 @@ type slotFetch struct {
 	streamReady  chan struct{}
 	stream       *slotStreamBuffer
 	firstBlockAt time.Time // run-owned first verified delivery, before whole-frame ACK
+	delivery     streamDeliveryTiming
 	// promoted is closed when the segment becomes the head
-	promoted  chan struct{}
-	near      chan struct{}
-	media     chan struct{} // body prefetch admission, independent of description discovery
-	body      []byte
-	end       bool
-	err       error
-	born      time.Time
-	headAt    time.Time // run's first wait for this head, not prefetch admission
-	readyAt   time.Time
-	visibleAt time.Time
-	bodyTime  time.Duration
-	mode      byte
+	promoted      chan struct{}
+	near          chan struct{}
+	media         chan struct{} // body prefetch admission, independent of description discovery
+	body          []byte
+	end           bool
+	err           error
+	born          time.Time
+	headAt        time.Time // run's first wait for this head, not prefetch admission
+	readyAt       time.Time
+	visibleAt     time.Time
+	bodyTime      time.Duration
+	bodyAdmission time.Duration
+	mode          byte
 }
 
 func (f *slotFetch) enter() {
@@ -1212,7 +1280,12 @@ func (r *slotReader) run() {
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
 			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
 			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(),
-			" quiet-tail-backoffs=", r.quietTailBackoffs.Load(), " first-block-wait=", firstBlockWait)
+			" quiet-tail-backoffs=", r.quietTailBackoffs.Load(), " first-block-wait=", firstBlockWait,
+			" media-admission=", f.bodyAdmission, " stream-blocks=", f.delivery.blocks,
+			" missing-block-gaps=", f.delivery.missingCount,
+			" missing-block-wait=", f.delivery.missingTotal, " missing-block-max=", f.delivery.missingMax,
+			" enqueue-wait=", f.delivery.enqueueTotal, " enqueue-max=", f.delivery.enqueueMax,
+			" completion-after-blocks=", f.delivery.completionWait(f.readyAt))
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1350,12 +1423,14 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				}); ok {
 					f.stream = newSlotStreamBuffer(frame)
 					close(f.streamReady)
+					admissionAt := time.Now()
 					select {
 					case <-f.media:
 					case <-ctx.Done():
 						f.err = ctx.Err()
 						return
 					}
+					f.bodyAdmission += time.Since(admissionAt)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 					if r.isHead(seq) {
 						bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
@@ -1375,11 +1450,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				}
 				fallthrough
 			case slotMedia:
+				admissionAt := time.Now()
 				select {
 				case <-f.media:
 				case <-ctx.Done():
 					return
 				}
+				f.bodyAdmission += time.Since(admissionAt)
 				began := time.Now()
 				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 				body, bodyErr := r.readMediaBody(bodyCtx, id, seq, frame)
