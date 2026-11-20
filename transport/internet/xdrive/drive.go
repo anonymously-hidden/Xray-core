@@ -328,10 +328,10 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	client := newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 	st := &driveStorage{
 		driveShared: &driveShared{
-			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+			conns: newConnPool(xmuxWithConnections(config.Xmux, defaultPoolConnections), func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 			}),
-			priorityConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+			priorityConns: newConnPool(xmuxWithConnections(config.Xmux, defaultPoolConnections), func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight)
 			}),
 			bulkConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
@@ -759,6 +759,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	}
 	backoff := s.backoff
 	var lastErr error
+	// the connection of the last failed attempt: the retry goes over another one
+	var failedConn *poolConn
 	kind := -1
 	if s.timing != nil {
 		// the same for every attempt, and it may decode the body
@@ -986,6 +988,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		var selected atomic.Pointer[poolConn]
 		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, selected.Store))
+		if _, spread := req.Context().Value(avoidConnKey{}).(*connSpread); !spread && failedConn != nil {
+			req = req.WithContext(context.WithValue(req.Context(), avoidConnKey{}, &connSpread{used: []*poolConn{failedConn}}))
+		}
 		began := time.Now()
 		dispatchClient := *httpc
 		dispatchClient.Transport = dispatchTransport{next: httpc.Transport}
@@ -993,12 +998,18 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		respAt := time.Now()
 		noteTimeout := func() {
 			if ctx.Err() == nil && dispatched.Load() && !admissionFailed.Load() && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
-				s.throttle.Add(1)
-				s.coolMu.Lock()
-				s.lastThrottle = time.Now()
-				s.coolMu.Unlock()
+				// A connection that served nothing since the request began is
+				// dead, not Drive throttling: replace it without shrinking the
+				// write window or cooling the readers.
+				dead := false
 				if t, ok := httpc.Transport.(*sessionTransport); ok {
-					t.stalled(began, selected.Load())
+					dead = t.stalled(began, selected.Load())
+				}
+				if !dead {
+					s.throttle.Add(1)
+					s.coolMu.Lock()
+					s.lastThrottle = time.Now()
+					s.coolMu.Unlock()
 				}
 			}
 		}
@@ -1011,6 +1022,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			}
 			releasePermit()
 			noteTimeout()
+			failedConn = selected.Load()
 			cancel()
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
@@ -1061,6 +1073,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if ctx.Err() != nil {
 				return 0, nil, ctx.Err()
 			}
+			failedConn = selected.Load()
 			lastErr = errors.New("failed to read the Drive response").Base(err)
 			if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests && !(resp.StatusCode == http.StatusForbidden && rateLimited(payload)) {
 				if createOnce {

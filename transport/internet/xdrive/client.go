@@ -236,7 +236,11 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		tlsConfig *tls.Config
 		sockopt   *internet.SocketConfig
 		fronting  *net.Destination
-		keepAlive = net.ChromeH2KeepAlivePeriod
+		// A silently dead h2 connection must be found in seconds, not after
+		// the 45 s Chrome period (net.ChromeH2KeepAlivePeriod). Pings go out only after no frame at all has
+		// arrived, so bulk transfers are not affected. An explicit Xmux
+		// keep-alive setting overrides this.
+		h2Idle, h2PingWait = 1500 * time.Millisecond, 2500 * time.Millisecond
 		// h3 keeps alive only when asked to, see below
 		h3KeepAlive time.Duration
 	)
@@ -247,10 +251,10 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		if config, ok := streamSettings.ProtocolSettings.(*Config); ok && config.Xmux != nil {
 			switch period := config.Xmux.HKeepAlivePeriod; {
 			case period > 0:
-				keepAlive = time.Duration(period) * time.Second
-				h3KeepAlive = keepAlive
+				h3KeepAlive = time.Duration(period) * time.Second
+				h2Idle, h2PingWait = h3KeepAlive, 0
 			case period < 0:
-				keepAlive = 0
+				h2Idle, h2PingWait = 0, 0
 			}
 		}
 	}
@@ -348,7 +352,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 			MaxIdleConns:        maxConns,
 			MaxIdleConnsPerHost: maxConns,
 			MaxConnsPerHost:     connsPerHost,
-			HTTP2:               &http.HTTP2Config{SendPingTimeout: keepAlive},
+			HTTP2:               &http.HTTP2Config{SendPingTimeout: h2Idle, PingTimeout: h2PingWait},
 		}
 	}
 
@@ -490,6 +494,10 @@ func (t *secureTransport) CloseIdleConnections() {
 }
 
 var errSessionClosed = errors.New("the session is closed")
+
+// errNoSpread means no spread connection was available; the request then
+// takes the session's own connection
+var errNoSpread = errors.New("no other connection to spread over")
 
 // connPool hands the sessions of a storage the connections of XMUX, each a
 // client of its own made by newClient
@@ -653,6 +661,113 @@ var stalledGrace = 12 * time.Second
 
 type poolConnKey struct{}
 
+// defaultPoolConnections is how many connections the normal and head-read
+// pools may hold when the config sets no Xmux maxConnections, as XHTTP does.
+const defaultPoolConnections = 4
+
+// xmuxWithConnections returns c, or a copy of it with maxConnections set to n
+// when the config gives none. Built field by field, not copied by value.
+func xmuxWithConnections(c *splithttp.XmuxConfig, n int32) *splithttp.XmuxConfig {
+	if c != nil && c.MaxConnections != nil && c.MaxConnections.To > 0 {
+		return c
+	}
+	out := &splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: n, To: n}}
+	if c != nil {
+		out.MaxConcurrency, out.CMaxReuseTimes = c.MaxConcurrency, c.CMaxReuseTimes
+		out.HMaxRequestTimes, out.HMaxReusableSecs = c.HMaxRequestTimes, c.HMaxReusableSecs
+		out.HKeepAlivePeriod = c.HKeepAlivePeriod
+	}
+	return out
+}
+
+// avoidConnKey carries a *connSpread: requests that carry it are sent over an
+// established connection of the pool that none of the spread's other requests
+// is using, so one dead connection cannot hold all of them.
+type avoidConnKey struct{}
+
+type connSpread struct {
+	mu   sync.Mutex
+	used []*poolConn
+}
+
+func (s *connSpread) has(c *poolConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.used, c)
+}
+
+func (s *connSpread) add(c *poolConn) {
+	s.mu.Lock()
+	s.used = append(s.used, c)
+	s.mu.Unlock()
+}
+
+func (s *connSpread) remove(c *poolConn) {
+	s.mu.Lock()
+	if i := slices.Index(s.used, c); i >= 0 {
+		s.used = slices.Delete(s.used, i, i+1)
+	}
+	s.mu.Unlock()
+}
+
+// spreadTrip sends r over a connection of the pool that sp does not use,
+// preferring established ones and dialing a new one only while the pool is
+// below maxConnections. It does not move the session's own connection.
+func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread) (*http.Response, error) {
+	t.mu.Lock()
+	closed := t.closed
+	t.mu.Unlock()
+	if closed || t.pool.ctx.Err() != nil {
+		return nil, errSessionClosed
+	}
+	var client *splithttp.XmuxClient
+	var conn *poolConn
+	t.pool.mu.Lock()
+	if t.pool.closed {
+		t.pool.mu.Unlock()
+		return nil, errSessionClosed
+	}
+	for try := 0; try < 6 && client == nil; try++ {
+		c := t.pool.xmux.GetExistingXmuxClient(r.Context())
+		if c == nil {
+			break
+		}
+		if pc := c.XmuxConn.(*poolConn); !sp.has(pc) && pc.acquire() {
+			client, conn = c, pc
+		}
+	}
+	for try := 0; try < 3 && client == nil; try++ {
+		c := t.pool.xmux.GetXmuxClient(r.Context())
+		if pc := c.XmuxConn.(*poolConn); pc.acquire() {
+			client, conn = c, pc
+		}
+	}
+	if client != nil {
+		client.AddRunning()
+		client.LeftRequests.Add(-1)
+	}
+	t.pool.mu.Unlock()
+	if client == nil {
+		return nil, errNoSpread
+	}
+	sp.add(conn)
+	release := sync.OnceFunc(func() { sp.remove(conn); client.DoneRunning() })
+	if selected, ok := r.Context().Value(poolConnKey{}).(func(*poolConn)); ok {
+		selected(conn)
+	}
+	resp, err := conn.roundTrip(r)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	resp.Body = &servedBody{ReadCloser: &doneBody{ReadCloser: resp.Body, done: release}, ctx: r.Context(), served: sync.OnceFunc(func() {
+		conn.mu.Lock()
+		conn.servedAt = maxTime(conn.servedAt, time.Now())
+		conn.mu.Unlock()
+	})}
+	return resp, nil
+}
+
 // sessionTransport sends the requests of one session over a connection of
 // XMUX, and over another once that one has no requests or time left
 type sessionTransport struct {
@@ -668,6 +783,11 @@ type sessionTransport struct {
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if sp, ok := r.Context().Value(avoidConnKey{}).(*connSpread); ok {
+		if resp, err := t.spreadTrip(r, sp); err != errNoSpread {
+			return resp, err
+		}
+	}
 	t.mu.Lock()
 	if t.closed || t.pool.ctx.Err() != nil {
 		t.mu.Unlock()
@@ -773,18 +893,31 @@ func (b *servedBody) Close() error {
 	return err
 }
 
-func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {
+// stalled reports whether the connection had served nothing since the request
+// began, that is, was dead rather than merely slow.
+func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(selected) > 0 {
-		if selected[0] == nil || t.client == nil || t.client.XmuxConn != selected[0] {
-			return
+		if selected[0] == nil {
+			return false
+		}
+		if t.client == nil || t.client.XmuxConn != selected[0] {
+			// a spread connection: dead when it served nothing since began
+			c := selected[0]
+			c.mu.Lock()
+			dead := !c.servedAt.After(began)
+			c.mu.Unlock()
+			if dead {
+				c.Close()
+			}
+			return dead
 		}
 	} else if began.Before(t.movedAt) {
-		return
+		return false
 	}
 	if t.client == nil {
-		return
+		return false
 	}
 	conn := t.client.XmuxConn.(*poolConn)
 	conn.mu.Lock()
@@ -795,7 +928,7 @@ func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {
 	conn.mu.Unlock()
 	now := time.Now()
 	if servedAt.IsZero() && now.Sub(t.takenAt) < stalledGrace {
-		return
+		return false
 	}
 	// A connection that has served nothing since this request began is dead
 	// already, so its first stall retires it. One that still served other
@@ -804,11 +937,12 @@ func (t *sessionTransport) stalled(began time.Time, selected ...*poolConn) {
 		slow := now.Sub(t.slowAt) < 3*time.Second
 		t.slowAt = now
 		if !slow || now.Sub(t.retiredAt) < 2*time.Second {
-			return
+			return false
 		}
 	}
 	t.retiredAt = now
 	t.client.XmuxConn.(*poolConn).Close()
+	return !servedAt.After(began)
 }
 
 func (t *sessionTransport) Close() {

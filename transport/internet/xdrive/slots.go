@@ -1636,7 +1636,8 @@ type slotDescriptionResult struct {
 type slotDescriptionHunt struct {
 	results      chan slotDescriptionResult
 	outstanding  int
-	lastLaunch   time.Time // retained across observations and tail promotion
+	lastLaunch   time.Time  // retained across observations and tail promotion
+	spread       connSpread // keeps overlapped head reads on different connections
 	last         slotDescriptionResult
 	seen         bool
 	err          error
@@ -1675,10 +1676,12 @@ func (r *slotReader) headOverlapDelay() time.Duration {
 	r.mu.Unlock()
 	delay := 250 * time.Millisecond
 	if latency > 0 {
-		delay = latency + latency/2
+		// Stagger up to three head polls across one request latency so the
+		// head is sampled about every latency/3, not once per latency.
+		delay = latency / 3
 	}
-	// Allow a normal request to finish before duplicating it, but retain
-	// bounded recovery when requests stall or the latency estimate is cold.
+	// The 100 ms floor keeps the overlap from multiplying requests; the cap
+	// bounds recovery when requests stall or the latency estimate is cold.
 	return min(max(delay, max(4*r.huntCeiling, 100*time.Millisecond)), time.Second)
 }
 
@@ -1735,6 +1738,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		role := head
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
+			readCtx = context.WithValue(readCtx, avoidConnKey{}, &pending.spread)
 		}
 		results := pending.results
 		r.wg.Add(1)
