@@ -152,6 +152,18 @@ func (p *driveReadProgress) remaining(delay time.Duration) (time.Duration, bool)
 	return delay - time.Since(p.progressAt), p.pending
 }
 
+// Adaptive media recovery uses the latency of an entire dispatched range.
+// Unverified wire progress cannot postpone it; eligibility still belongs to
+// the ordered delivery frontier and retries/replays still disable recovery.
+func (p *driveReadProgress) remainingSinceDispatch(delay time.Duration) (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.started || p.dispatchAt.IsZero() {
+		return delay, false
+	}
+	return delay - time.Since(p.dispatchAt), p.pending
+}
+
 // A verified-block wait may recover a trickling body, but never count time spent
 // locally queued before this dispatch. Headers/body bytes do not reset dispatchAt.
 func (p *driveReadProgress) remainingForBlock(delay time.Duration, waitAt time.Time) (time.Duration, bool) {
@@ -271,6 +283,7 @@ type driveShared struct {
 	lastThrottle  time.Time
 	lastRateLimit time.Time
 	throttle      atomic.Int64
+	mediaLatency  [2]rangeLatency // shared by sessions; small and large primary ranges
 	timing        *timingAggregator
 	idPoolState
 
@@ -883,7 +896,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			reused, gotConn                                    bool
 			dispatchWait                                       time.Duration
 		}
-		var dispatched, admissionFailed atomic.Bool
+		var dispatched, admissionFailed, replayed atomic.Bool
 		var headAtDispatch atomic.Bool
 		admit := func(dispatchCtx context.Context) error {
 			start := time.Now()
@@ -905,6 +918,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 					headAtDispatch.Store(mediaHead(ctx))
 				}
 				previous := dispatched.Swap(true)
+				if previous {
+					replayed.Store(true)
+				}
 				if createOnce && previous {
 					cancel()
 					return createAmbiguityError{err: errors.New("transport attempted a second creation dispatch")}
@@ -1096,21 +1112,25 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		tr.mu.Lock()
 		sample := timingSample{
-			total:     bodyEnd.Sub(attemptStart),
-			waitCool:  waitCoolDur + tr.dispatchWait,
-			waitPool:  waitPoolDur,
-			waitToken: waitTokenDur,
-			waitConn:  max(0, tr.connAt.Sub(began)-tr.dispatchWait),
-			dialTLS:   dialEnd(tr.tlsDone, tr.connDone).Sub(tr.connStart),
-			send:      max(0, tr.wrote.Sub(tr.admitted)),
-			server:    tr.first.Sub(tr.wrote),
-			body:      bodyEnd.Sub(maxTime(tr.first, respAt)),
-			reused:    tr.reused,
-			newConn:   tr.gotConn && !tr.reused,
-			hasConn:   tr.gotConn,
-			hasDial:   !tr.connStart.IsZero(),
-			hasSend:   tr.wroteOK && !tr.admitted.IsZero() && !tr.wrote.IsZero() && !tr.wrote.Before(tr.admitted),
-			hasServer: !tr.wrote.IsZero() && !tr.first.IsZero(),
+			total:       bodyEnd.Sub(attemptStart),
+			waitCool:    waitCoolDur + tr.dispatchWait,
+			waitPool:    waitPoolDur,
+			waitToken:   waitTokenDur,
+			waitConn:    max(0, tr.connAt.Sub(began)-tr.dispatchWait),
+			dialTLS:     dialEnd(tr.tlsDone, tr.connDone).Sub(tr.connStart),
+			send:        max(0, tr.wrote.Sub(tr.admitted)),
+			server:      tr.first.Sub(tr.wrote),
+			body:        bodyEnd.Sub(maxTime(tr.first, respAt)),
+			reused:      tr.reused,
+			newConn:     tr.gotConn && !tr.reused,
+			hasConn:     tr.gotConn,
+			hasDial:     !tr.connStart.IsZero(),
+			hasSend:     tr.wroteOK && !tr.admitted.IsZero() && !tr.wrote.IsZero() && !tr.wrote.Before(tr.admitted),
+			hasServer:   !tr.wrote.IsZero() && !tr.first.IsZero(),
+			hasDispatch: !tr.admitted.IsZero(),
+		}
+		if sample.hasDispatch {
+			sample.dispatch = bodyEnd.Sub(tr.admitted)
 		}
 		tr.mu.Unlock()
 		s.recordTiming(kind, sample)
@@ -1168,6 +1188,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		if media != nil && media.stream == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
+		}
+		if ctx.Err() == nil {
+			s.observeMediaLatency(media, sample, resp.StatusCode, attempt, replayed.Load(), err)
 		}
 		return resp.StatusCode, payload, err
 	}
@@ -2166,7 +2189,7 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 		return s.descriptionHedgeAllowed()
 	}
 	if media, ok := ctx.Value(driveMediaKey{}).(*driveMediaRequest); ok && media.rescue {
-		if promotion, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{}); promotion != nil && !mediaHead(ctx) {
+		if !mediaHead(ctx) {
 			return false
 		}
 		s.coolMu.Lock()

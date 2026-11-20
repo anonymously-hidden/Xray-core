@@ -150,38 +150,45 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 }
 
 // mediaDeliveryRemaining admits only the ordered next block's range. Available
-// blocks do not trigger recovery; EOF keeps the existing wire-progress clock.
+// blocks do not trigger recovery. Once required, a range's adaptive deadline is
+// measured from actual dispatch, not from trickling wire bytes or a later wait.
 func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r driveMediaRequest, delay time.Duration, delivery func() (int, <-chan struct{}, time.Time)) (time.Duration, bool, <-chan struct{}) {
 	next, changed, waitAt := delivery()
 	if !mediaHead(ctx) {
 		return 0, false, changed
 	}
 	if next == r.size {
-		remaining, active := primary.remaining(delay)
+		remaining, active := primary.remainingSinceDispatch(delay)
 		return remaining, active, changed
 	}
 	if next < r.start || next >= r.end || waitAt.IsZero() {
 		return 0, false, changed
 	}
-	remaining, active := primary.remainingForBlock(delay, waitAt)
+	remaining, active := primary.remainingSinceDispatch(delay)
 	return remaining, active, changed
 }
 
 // A hedge races only an unfinished original range on the separate bulk
-// connection. Legacy reads follow wire progress; tracked head streams may also
-// recover a verified-block gap despite trickling bytes. Neither reshapes ranges
-// nor expands the token budget, and both stop when the primary starts recovery.
+// connection, only when it is a head read. Tracked streams must also be waiting
+// for this range's next verified block. The adaptive dispatch-to-EOF deadline
+// neither reshapes ranges nor expands the budget and stops on primary recovery.
 func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driveMediaRequest) ([]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	primary := &driveReadProgress{dispatched: make(chan struct{})}
 	delivery, tracked := ctx.Value(mediaDeliveryKey{}).(func() (int, <-chan struct{}, time.Time))
 	tracked = tracked && delivery != nil && r.stream != nil && r.stream.frame.mode == slotStream
-	gate := readHedgeGate{primary: primary, delay: slotBodyHedge}
+	hedgeDelay := slotBodyHedge
+	gate := readHedgeGate{primary: primary, delay: hedgeDelay}
 	if tracked {
 		gate.remaining = func() (time.Duration, bool) {
-			remaining, eligible, _ := mediaDeliveryRemaining(ctx, primary, r, slotBodyHedge, delivery)
+			remaining, eligible, _ := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
 			return remaining, eligible
+		}
+	} else {
+		gate.remaining = func() (time.Duration, bool) {
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
+			return remaining, active && mediaHead(ctx)
 		}
 	}
 	type result struct {
@@ -217,7 +224,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	}
 	launch(false)
 	pending := 1
-	// The hedge delay is that of slot body reads; the budget is the media one.
+	// Freeze the learned threshold for this primary; the media budget is unchanged.
 	var timer *time.Timer
 	var hedgeAt <-chan time.Time
 	var dispatched <-chan struct{}
@@ -225,7 +232,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	var frontier, budgetChanged <-chan struct{}
 	var recoveryStopped, hedged bool
 	promotion, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
-	if slotBodyHedge > 0 {
+	if hedgeDelay > 0 {
 		dispatched = primary.dispatched
 	}
 	defer func() {
@@ -234,7 +241,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		}
 	}()
 	// Generation changes are local wakeups, not polling or new API work. Only
-	// tracked actual heads wait for budget; legacy one-shot timers are unchanged.
+	// tracked actual heads wait for budget; untracked heads keep one-shot budgets.
 	armTracked := func() {
 		if timer != nil {
 			timer.Stop()
@@ -243,7 +250,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		if recoveryStopped || hedged {
 			return
 		}
-		if _, active := primary.remaining(slotBodyHedge); !active {
+		if _, active := primary.remainingSinceDispatch(hedgeDelay); !active {
 			recoveryStopped = true
 			return
 		}
@@ -251,7 +258,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			promoted = promotion
 			return
 		}
-		remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, slotBodyHedge, delivery)
+		remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
 		frontier = changed
 		if !eligible {
 			return
@@ -279,11 +286,17 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			}
 		case <-dispatched:
 			dispatched = nil
+			hedgeDelay = s.mediaHedgeDelay(r)
+			gate.delay = hedgeDelay
 			if tracked {
 				armTracked()
 				continue
 			}
-			remaining, _ := primary.remaining(slotBodyHedge)
+			if !mediaHead(ctx) {
+				promoted = promotion
+				continue
+			}
+			remaining, _ := primary.remainingSinceDispatch(hedgeDelay)
 			timer = time.NewTimer(max(0, remaining))
 			hedgeAt = timer.C
 		case <-promoted:
@@ -292,10 +305,14 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				armTracked()
 				continue
 			}
-			remaining, active := primary.remaining(slotBodyHedge)
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
 			if active {
-				// Use the existing stall age, not another two-second delay.
-				timer.Reset(max(0, remaining))
+				// Promotion does not restart the dispatch-age deadline.
+				if timer == nil {
+					timer = time.NewTimer(max(0, remaining))
+				} else {
+					timer.Reset(max(0, remaining))
+				}
 				hedgeAt = timer.C
 			}
 		case <-frontier:
@@ -316,7 +333,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				continue
 			}
 			if tracked {
-				remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, slotBodyHedge, delivery)
+				remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
 				if !eligible || remaining > 0 {
 					armTracked()
 					continue
@@ -340,7 +357,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				launch(true)
 				continue
 			}
-			remaining, active := primary.remaining(slotBodyHedge)
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
 			if !active {
 				continue
 			}
@@ -349,9 +366,9 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				hedgeAt = timer.C
 				continue
 			}
-			if promotion != nil && !mediaHead(ctx) {
+			if !mediaHead(ctx) {
 				// Keep the primary running, but reserve duplicate work for a
-				// frame that blocks delivery. Missing/nil tracking stays legacy.
+				// frame that blocks delivery. Unmarked callers never race.
 				promoted = promotion
 				if s.timing != nil {
 					s.timing.noteDeferredHedge(kindBodyRead)
@@ -361,6 +378,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			if !s.readHedgeAllowed(context.WithValue(ctx, driveMediaKey{}, &helper)) || !s.takeMediaHedgeToken() {
 				continue
 			}
+			hedged = true
 			pending++
 			launch(true)
 		case <-ctx.Done():

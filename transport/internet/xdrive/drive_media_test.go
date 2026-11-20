@@ -400,7 +400,7 @@ func startMediaTestHedge(t *testing.T, statuses [2]int) *mediaTestHedgeFlight {
 	flight.storage.mediaRanges = make(chan struct{}, 1)
 	flight.storage.mediaRescue = make(chan struct{}, 1)
 	flight.storage.mediaHedgeTokens = 1
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), mediaHeadKey{}, true))
 	flight.cancel = cancel
 	go func() {
 		body, err := flight.storage.readFrameBody(ctx, "item", newSlotFrame(1, slotMedia, flight.payload))

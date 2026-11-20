@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"mime"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -37,30 +38,96 @@ type watermarkWriteKey struct{}
 // timingSample is the per-attempt breakdown. Parts the transport cannot
 // observe stay zero and are reported as unavailable via the has* flags.
 type timingSample struct {
-	total     time.Duration
-	waitCool  time.Duration
-	waitPool  time.Duration
-	waitToken time.Duration
-	waitConn  time.Duration
-	dialTLS   time.Duration
-	send      time.Duration
-	server    time.Duration
-	body      time.Duration
-	reused    bool
-	newConn   bool
-	hedge     bool
-	won       bool
-	hasConn   bool
-	hasDial   bool
-	hasSend   bool
-	hasServer bool
+	total       time.Duration
+	waitCool    time.Duration
+	waitPool    time.Duration
+	waitToken   time.Duration
+	waitConn    time.Duration
+	dialTLS     time.Duration
+	send        time.Duration
+	server      time.Duration
+	body        time.Duration
+	reused      bool
+	newConn     bool
+	hedge       bool
+	won         bool
+	hasConn     bool
+	hasDial     bool
+	hasSend     bool
+	hasServer   bool
+	dispatch    time.Duration // actual dispatch to response EOF, excluding local admission
+	hasDispatch bool
 }
 
 const (
 	timingWindow      = 60 * time.Second
 	timingRing        = 512
 	slowRequestTiming = 2 * time.Second
+	rangeLatencyRing  = 32
+	rangeLatencyMin   = 12
+	mediaHedgeFloor   = 900 * time.Millisecond
 )
+
+// Successful first-attempt primary ranges train the same dispatch-to-EOF clock
+// used by the hedge. Keep it outside the reporting reservoir, which is flushed
+// each minute, and separate small head ranges from larger speculative ranges.
+type rangeLatency struct {
+	mu   sync.Mutex
+	n    int
+	pos  int
+	ring [rangeLatencyRing]time.Duration
+}
+
+func (l *rangeLatency) note(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ring[l.pos] = d
+	l.pos = (l.pos + 1) % rangeLatencyRing
+	l.n = min(l.n+1, rangeLatencyRing)
+}
+
+func (l *rangeLatency) median() (time.Duration, bool) {
+	l.mu.Lock()
+	if l.n < rangeLatencyMin {
+		l.mu.Unlock()
+		return 0, false
+	}
+	v := append([]time.Duration(nil), l.ring[:l.n]...)
+	l.mu.Unlock()
+	sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+	return percentile(v, .5), true
+}
+
+func rangeClass(r driveMediaRequest) int {
+	if r.end-r.start <= driveMediaPart {
+		return 0
+	}
+	return 1
+}
+
+// Use 1.3 times the recent first-primary p50 for this requested size class,
+// bounded by 900ms and the existing 2s timeout. Cold classes retain 2s.
+func (s *driveStorage) mediaHedgeDelay(r driveMediaRequest) time.Duration {
+	median, ok := s.mediaLatency[rangeClass(r)].median()
+	if !ok {
+		return slotBodyHedge
+	}
+	if median >= slotBodyHedge {
+		return slotBodyHedge
+	}
+	return min(max(median*13/10, mediaHedgeFloor), slotBodyHedge)
+}
+
+func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSample, status, attempt int, replayed bool, err error) {
+	if r == nil || r.rescue || attempt != 0 || replayed || err != nil || !sample.hasDispatch ||
+		(status != http.StatusOK && status != http.StatusPartialContent) {
+		return
+	}
+	s.mediaLatency[rangeClass(*r)].note(sample.dispatch)
+}
 
 type timingAggregator struct {
 	mu         sync.Mutex
@@ -232,7 +299,7 @@ func (s *driveStorage) logSlowRequest(ctx context.Context, kind int, path string
 	if kind < 0 || kind >= kindCount || sample.total < slowRequestTiming {
 		return
 	}
-	send, server, connection := time.Duration(-1), time.Duration(-1), time.Duration(-1)
+	send, server, connection, dispatch := time.Duration(-1), time.Duration(-1), time.Duration(-1), time.Duration(-1)
 	if sample.hasSend {
 		send = sample.send
 	}
@@ -242,12 +309,16 @@ func (s *driveStorage) logSlowRequest(ctx context.Context, kind int, path string
 	if sample.hasConn {
 		connection = sample.waitConn
 	}
+	if sample.hasDispatch {
+		dispatch = sample.dispatch
+	}
 	if media != nil {
 		errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),
 			" status=", status, " attempt=", attempt,
 			" seq=", media.seq, " range=", media.start, "-", media.end,
 			" frame-bytes=", media.size, " requested-bytes=", media.end-media.start,
 			" total=", sample.total, " pool=", sample.waitPool, " cool=", sample.waitCool,
+			" dispatch-to-eof=", dispatch,
 			" token=", sample.waitToken, " connection=", connection, " send=", send,
 			" server=", server, " body=", sample.body, " rescue=", media.rescue,
 			" head-at-dispatch=", headAtDispatch, " head-at-completion=", headAtCompletion)
@@ -300,6 +371,7 @@ func (a *timingAggregator) flush() {
 		send := make([]time.Duration, 0, n)
 		server := make([]time.Duration, 0, n)
 		body := make([]time.Duration, 0, n)
+		dispatch := make([]time.Duration, 0, n)
 		for _, s := range batch.samples {
 			total = append(total, s.total)
 			pool = append(pool, s.waitPool)
@@ -318,6 +390,9 @@ func (a *timingAggregator) flush() {
 				server = append(server, s.server)
 			}
 			body = append(body, s.body)
+			if s.hasDispatch {
+				dispatch = append(dispatch, s.dispatch)
+			}
 		}
 		sort.Slice(total, func(i, j int) bool { return total[i] < total[j] })
 		sort.Slice(pool, func(i, j int) bool { return pool[i] < pool[j] })
@@ -328,6 +403,7 @@ func (a *timingAggregator) flush() {
 		sort.Slice(send, func(i, j int) bool { return send[i] < send[j] })
 		sort.Slice(server, func(i, j int) bool { return server[i] < server[j] })
 		sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
+		sort.Slice(dispatch, func(i, j int) bool { return dispatch[i] < dispatch[j] })
 		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
 			" n=", n,
 			" requests=", batch.requests, " units=", batch.requests*driveQuotaCost(k),
@@ -347,6 +423,10 @@ func (a *timingAggregator) flush() {
 			" connection-p95/max=", percentile(conn, .95), "/", percentile(conn, 1),
 			" server-p95/max=", percentile(server, .95), "/", percentile(server, 1),
 			" body-p95/max=", percentile(body, .95), "/", percentile(body, 1))
+		if k == kindBodyRead {
+			errors.LogInfo(context.Background(), "xdrive timing body-read dispatch-to-eof p50/p90/max ",
+				percentile(dispatch, .5), "/", percentile(dispatch, .9), "/", percentile(dispatch, 1))
+		}
 	}
 }
 
