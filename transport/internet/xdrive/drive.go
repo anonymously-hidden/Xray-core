@@ -98,8 +98,9 @@ type descriptionHedgeKey struct{}
 type readHedgeGateKey struct{}
 
 type readHedgeGate struct {
-	primary *driveReadProgress
-	delay   time.Duration
+	primary   *driveReadProgress
+	delay     time.Duration
+	remaining func() (time.Duration, bool) // optional tracked-stream eligibility/clock
 }
 
 type driveReadProgress struct {
@@ -107,17 +108,26 @@ type driveReadProgress struct {
 	dispatched chan struct{}
 	started    bool
 	pending    bool
+	dispatchAt time.Time
 	progressAt time.Time
 }
 
 func (p *driveReadProgress) dispatch() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.dispatchAt = time.Now()
 	if !p.started {
 		p.started, p.pending = true, true
-		p.progressAt = time.Now()
+		p.progressAt = p.dispatchAt
 		close(p.dispatched)
 	}
+}
+
+func (p *driveReadProgress) replay() {
+	p.mu.Lock()
+	p.dispatchAt = time.Now()
+	p.pending = false // transport recovery is already running; do not also hedge it
+	p.mu.Unlock()
 }
 
 func (p *driveReadProgress) progress() {
@@ -138,6 +148,19 @@ func (p *driveReadProgress) remaining(delay time.Duration) (time.Duration, bool)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return delay - time.Since(p.progressAt), p.pending
+}
+
+// A verified-block wait may recover a trickling body, but never count time spent
+// locally queued before this dispatch. Headers/body bytes do not reset dispatchAt.
+func (p *driveReadProgress) remainingForBlock(delay time.Duration, waitAt time.Time) (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	remaining := delay - now.Sub(p.progressAt)
+	if !waitAt.IsZero() && !p.dispatchAt.IsZero() {
+		remaining = min(remaining, delay-now.Sub(maxTime(waitAt, p.dispatchAt)))
+	}
+	return remaining, p.pending
 }
 
 var errReadHedgeSkipped = errors.New("Drive read hedge is no longer admitted")
@@ -199,8 +222,9 @@ type driveStorage struct {
 	readHedgeActive atomic.Bool
 	// Media range hedges have a budget of their own: description hedges win
 	// far less often and must not leave the head frame's ranges without one.
-	mediaHedgeTokens int
-	mediaHedgeCount  int
+	mediaHedgeTokens  int
+	mediaHedgeCount   int
+	mediaHedgeChanged chan struct{} // replenishment broadcast, guarded by readHedgeMu
 	// mediaNext rotates frames over mediaClients so a stalled connection does
 	// not carry every single-range frame.
 	mediaNext atomic.Uint32
@@ -719,6 +743,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	descriptionHedge := method == http.MethodGet && ctx.Value(descriptionHedgeKey{}) != nil
 	media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
 	readHedgeAttempt := descriptionHedge || method == http.MethodGet && media != nil && media.rescue
+	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
 		return 0, nil, errReadHedgeSkipped
 	}
@@ -727,8 +752,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		defer primary.finish()
 	}
 	maxAttempts := driveMaxAttempts
-	if readHedgeAttempt {
-		// Recovery must not start another retry/refund loop beside the primary.
+	if singleAttempt {
+		// Recovery must not start another retry/refund loop beside the primary;
+		// an idle socket probe also has no payload worth retrying for.
 		maxAttempts = 1
 	}
 	backoff := s.backoff
@@ -887,7 +913,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 					if previous {
 						// A transport replay is recovery already, not a stalled
 						// first dispatch that should also acquire a hedge.
-						primary.finish()
+						primary.replay()
 					} else {
 						primary.dispatch()
 					}
@@ -996,7 +1022,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if createOnce && dispatched.Load() {
 				return 0, nil, createAmbiguityError{err: lastErr}
 			}
-			if readHedgeAttempt {
+			if singleAttempt {
 				return 0, nil, lastErr
 			}
 			errors.LogWarningInner(ctx, err, "retrying a failed Drive request, attempt ",
@@ -1040,7 +1066,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				if createOnce {
 					return 0, nil, createAmbiguityError{err: lastErr}
 				}
-				if readHedgeAttempt {
+				if singleAttempt {
 					return 0, nil, lastErr
 				}
 				continue
@@ -1078,7 +1104,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
 			lastErr = errors.New("Drive rejected the access token")
-			if readHedgeAttempt {
+			if singleAttempt {
 				return 0, nil, lastErr
 			}
 			// One retry with a freshly fetched token can ride out a token that
@@ -1102,7 +1128,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				" bytes, body read ", strings.Contains(target, "alt=media"),
 				", lane ", ctx.Value(laneKey{}) != nil, ": ", string(payload[:min(len(payload), 300)]))
 			s.cool()
-			if readHedgeAttempt {
+			if singleAttempt {
 				return 0, nil, lastErr
 			}
 			if refund, stop := driveQuotaRetry(time.Since(firstTry)); refund {
@@ -1118,7 +1144,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if createOnce {
 				return 0, nil, createAmbiguityError{err: lastErr}
 			}
-			if readHedgeAttempt {
+			if singleAttempt {
 				return 0, nil, lastErr
 			}
 			errors.LogWarning(ctx, "retrying after Drive answered ", resp.StatusCode,
@@ -1395,29 +1421,45 @@ func (s *driveStorage) cachedFiles(flat string, descendants bool) map[string]dri
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
 	found := make(map[string]driveFile)
-	for name, id := range s.ids {
-		if name == flat || descendants && strings.HasPrefix(name, flat+flatSeparator) {
-			if len(s.missingIDs[name]) == 0 {
-				found[name] = driveFile{id: id, extra: append([]string(nil), s.dupIDs[name]...)}
-				continue
-			}
-			file := driveFile{}
-			for _, candidate := range append([]string{id}, s.dupIDs[name]...) {
-				if _, missing := s.missingIDs[name][candidate]; missing {
-					continue
-				}
-				if file.id == "" {
-					file.id = candidate
-				} else {
-					file.extra = append(file.extra, candidate)
-				}
-			}
+	if !descendants {
+		if file := s.cachedFileLocked(flat); file.id != "" {
+			found[flat] = file
+		}
+		return found
+	}
+	prefix := flat + flatSeparator
+	for name := range s.ids {
+		if name == flat || strings.HasPrefix(name, prefix) {
+			file := s.cachedFileLocked(name)
 			if file.id != "" {
 				found[name] = file
 			}
 		}
 	}
 	return found
+}
+
+// cachedFileLocked snapshots one name with idMu held, excluding missing ids.
+func (s *driveStorage) cachedFileLocked(name string) driveFile {
+	id := s.ids[name]
+	if id == "" {
+		return driveFile{}
+	}
+	if len(s.missingIDs[name]) == 0 {
+		return driveFile{id: id, extra: append([]string(nil), s.dupIDs[name]...)}
+	}
+	file := driveFile{}
+	for _, candidate := range append([]string{id}, s.dupIDs[name]...) {
+		if _, missing := s.missingIDs[name][candidate]; missing {
+			continue
+		}
+		if file.id == "" {
+			file.id = candidate
+		} else {
+			file.extra = append(file.extra, candidate)
+		}
+	}
+	return file
 }
 
 func mergeDriveFile(first, next driveFile) driveFile {
@@ -2034,13 +2076,32 @@ func (s *driveStorage) takeHedgeToken() bool {
 func (s *driveStorage) noteMediaRange() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
+	before := s.mediaHedgeTokens
 	accrueHedgeToken(&s.mediaHedgeCount, &s.mediaHedgeTokens)
+	if s.mediaHedgeTokens > before && s.mediaHedgeChanged != nil {
+		close(s.mediaHedgeChanged)
+		s.mediaHedgeChanged = nil
+	}
 }
 
 func (s *driveStorage) takeMediaHedgeToken() bool {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
 	return spendHedgeToken(&s.mediaHedgeTokens)
+}
+
+// Only a tracked, currently required head range waits for replenishment. Taking
+// or subscribing under the same lock avoids missing a completion's broadcast.
+func (s *driveStorage) takeMediaHedgeTokenOrWait() (bool, <-chan struct{}) {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	if spendHedgeToken(&s.mediaHedgeTokens) {
+		return true, nil
+	}
+	if s.mediaHedgeChanged == nil {
+		s.mediaHedgeChanged = make(chan struct{})
+	}
+	return false, s.mediaHedgeChanged
 }
 
 func accrueHedgeToken(count, tokens *int) {
@@ -2072,9 +2133,17 @@ func (s *driveStorage) descriptionHedgeAllowed() bool {
 // timer fires. Ordinary reads keep their existing cooldown/retry behavior.
 func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 	if gate, ok := ctx.Value(readHedgeGateKey{}).(readHedgeGate); ok {
-		if remaining, pending := gate.primary.remaining(gate.delay); !pending || remaining > 0 {
-			// A duplicate queued for a permit or connection is unnecessary once
-			// its primary progresses or enters its own retry recovery.
+		var remaining time.Duration
+		var pending bool
+		if gate.remaining != nil {
+			remaining, pending = gate.remaining()
+		} else {
+			remaining, pending = gate.primary.remaining(gate.delay)
+		}
+		if !pending || remaining > 0 {
+			// Recheck queued duplicates against their actual recovery target.
+			// Tracked streams can remain blocked despite unverified wire bytes;
+			// every gate still excludes primary retry/transport recovery.
 			return false
 		}
 	}

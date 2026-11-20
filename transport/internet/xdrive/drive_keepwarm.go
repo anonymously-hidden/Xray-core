@@ -11,6 +11,10 @@ import (
 
 type keeperKey struct{}
 
+// Socket probes are disposable maintenance, unlike token and ID refills.
+// A failed probe can wait for the next tick rather than spending API retries.
+type keeperProbeKey struct{}
+
 func (s *driveShared) noteTraffic() {
 	s.trafficMu.Lock()
 	s.lastTraffic = time.Now()
@@ -98,6 +102,7 @@ func (s *driveShared) keeperStorage() *driveStorage {
 }
 
 func (s *driveStorage) keepWarmConnection(ctx context.Context, target string) error {
+	ctx = context.WithValue(ctx, keeperProbeKey{}, true)
 	status, _, err := s.do(ctx, http.MethodGet, target, "", nil)
 	if err == nil && status != http.StatusOK {
 		err = errors.New("Drive keep-warm answered ", status)

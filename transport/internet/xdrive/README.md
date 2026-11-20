@@ -39,6 +39,43 @@ whole-frame completion waiting, so it is not the first-byte delay for mode 5.
 The first-block field is zero/not applicable for legacy frames. Slow HTTP/body
 timings include local checksum processing; they are not pure wire measurements.
 
+## Recovery for stalled ordered blocks
+
+The matched v48 session shows two different retrieval stalls: frame 730 waited
+9.22 s for its first verified block, while frames 866 and 869 had later block gaps
+of 5.36 s and 3.06 s. A ready 101-byte frame then spent 18.44 s behind preceding
+bulk frames. The roughly 15 s admission ages of later prefetched frames were not
+15 s of waiting at the delivery head; increasing permits on that evidence would
+target the wrong phase.
+
+Tracked streaming slot reads identify the next block actually awaited by the
+ordered reader. Only the headed range containing that block spends scarce rescue
+budget; stalled later ranges wait for frontier advancement. Recovery can consider
+a two-second verified-block gap as well as the existing wire-progress clock, so
+partial bytes need not indefinitely suppress recovery of a missing verified block.
+The wait excludes speculative age and downstream enqueue backpressure, and cannot
+start before the primary's actual dispatch. Reaching the terminal block frontier
+still leaves downstream enqueue and unfinished range EOF/validation fenced.
+
+A head waiting for rescue tokens can wake on existing budget replenishment rather
+than permanently abandon recovery after one empty-budget observation. Eligibility
+and stall age are checked again at dispatch, suppressing obsolete queued duplicates.
+Primary GET plans, token caps/refill rates, rescue concurrency, cooldown protection,
+one-rescue-per-range limits, checksums, deduplication and ACK fences remain intact.
+Legacy/standalone callers without the ordered delivery signal retain wire-progress
+recovery. No uploads are duplicated and no encrypted bytes are reordered.
+
+This is not a two-second delivery deadline: quota eligibility, available tokens,
+HTTP admission and the service still determine whether a rescue can help. Racing a
+slow but moving transfer can consume bandwidth and one extra media GET within the
+existing budget. Actual requests may differ; use matched first-block/missing-block
+waits, throughput and both peers' quota units to judge the result. Shared backend or
+network stalls can affect both copies, and per-mux-stream isolation is not provided.
+
+No wire-version or configuration change is required. The improved reader works
+with existing v48 streaming peers; for downstream browsing, upgrade the client
+reader. Updating the server also applies the server-side batching improvements.
+
 ## Optional two-range streaming-head experiment
 
 The production default remains four media ranges for a large initially headed
@@ -144,6 +181,28 @@ cap to those same plans would remove 68 primary GETs (13,600 estimated units).
 That is a planned counterfactual, not measured savings. It motivates only the
 explicit opt-in experiment above, with the default unchanged.
 
+### Browsing-oriented follow-up
+
+Small Drive inline suffixes that stop growing can flush after two coalescing
+ticks rather than waiting for all eight while other uploads are outstanding.
+At the default 10 ms interval this is typically 20–30 ms instead of 80–90 ms;
+growing bursts keep the existing batching. Cooldown/recent rate limits disable
+the early flush. The first matched v48 client session had 600 small inline writes
+with a median buffer episode age near 84 ms, which motivates this local change,
+not a claimed website speedup. An earlier suffix can split later data into another inline
+upload, increasing write units and polling/ACK overhead; this is not quota-neutral.
+
+Repeated clean empty descriptions and never-written lazy-slot 404s can now use
+the existing quiet distant backoff. Errors, invalid frames and 404s for previously
+seen slots do not accumulate clean-absence credit. Head/near schedules and
+promotion interrupts remain unchanged. This can delay far-future prefetching;
+v48 recorded no extended quiet-tail backoffs, so savings need a matched rerun.
+Ranges, upload windows, checksums, ordered delivery and ACK fences are unchanged.
+Ready small frames can still wait behind earlier bulk data: the matched v48 log
+includes a 101-byte frame blocked for 18.44 s. Head-block recovery targets retrieval
+stalls, but these changes do not isolate browser/mux streams or eliminate every
+remote HTTP stall.
+
 Drive media reads use up to four independent HTTP connection pools. The head
 frame normally uses up to four ranges (four 128 KiB ranges for a 512 KiB frame);
 prefetched non-head frames use one range per 512 KiB, capped at four. After two
@@ -153,9 +212,11 @@ prefetched range defers this recovery until its frame becomes the delivery head.
 Promotion rechecks the primary's existing stall age and active status, rather
 than imposing another two-second delay. Standalone callers without a nonnil
 promotion channel retain their previous recovery policy. Headers and body bytes
-reset this clock;
-token/permit/connection waits do not start it. Completed ranges are retained.
-Moving transfers do not trigger duplicates. Generic slot-body reads also have a
+reset the wire-progress clock, not an outstanding verified-block wait.
+Token/permit/connection waits do not start recovery clocks. Completed ranges are retained.
+Moving transfers without an actual headed verified-block gap do not trigger
+duplicates. Tracked streaming heads additionally use the ordered-block recovery
+signal described above. Generic slot-body reads also have a
 two-second hedge; Drive frame
 reads use the per-range layer rather than duplicating the entire frame. Priority
 description reads have a 900 ms no-progress hedge starting at dispatch, not while
@@ -164,13 +225,17 @@ concurrent hedge per session, one dispatch per hedge, and no hedges for one minu
 after a confirmed live rate limit. Each layer has a bounded hedge budget. Recent
 403/429 rate limits also suppress media hedges and reduce new frames to one range.
 Media duplicates likewise get one dispatch, not their own retry loop. All Drive
-read duplicates recheck primary progress at dispatch admission, so known progress
-or retry recovery can suppress a queued duplicate. Primary retries are unchanged,
+read duplicates recheck active status and applicable progress at dispatch admission,
+so a resolved head-block gap, wire progress or retry recovery can suppress a queued
+duplicate. Primary retries are unchanged,
 but later retry attempts do not acquire another hedge; recovery latency after a
-failed first attempt can therefore differ. A spent timer does not wait for new
-hedge tokens or the end of a cooldown.
-`hedge-deferrals` counts expired nonhead recovery opportunities, not saved API
-calls: promotion may admit one later, and normal quota/budget checks still apply.
+failed first attempt can therefore differ. Tracked streaming heads may wait for
+existing token replenishment; legacy spent timers do not. Recovery does not wait
+out a quota cooldown to dispatch a duplicate.
+`hedge-deferrals` counts legacy timer-based nonhead recovery opportunities, not
+saved API calls. Tracked streaming generation/budget waits are not included in
+that counter; compare actual requests/units and block waits instead. Promotion
+may admit a legacy deferred rescue later, with normal quota/budget checks.
 Primary GETs, ranges, windows, and budgets are unchanged; useful speculative
 recovery can start later. Deferral does not guarantee fewer requests in every
 workload, since preserved tokens can instead fund delivery-head recovery.
@@ -216,12 +281,13 @@ Promotion and write wakeups retain an outstanding read's launch age instead of
 starting more copies at each 25 ms tick. This trades more aggressive speculative
 visibility for fewer discarded reads; stalled heads retain bounded overlap.
 After at least three misses, a distant read that returns a valid older-lap frame
-may use a 2 s backoff ceiling if the observed description frontier has not advanced
-for `eagerWindow`. The existing exponential calculation remains (typically
-1.2 s at the 300 ms pace floor), not a forced 2 s sleep. Absent/new slots,
-invalid frames, errors, and head/near schedules are unchanged. This reduces
-repeated old-frame speculation during quiet peer periods. Promotion still wakes
-the wait, but frontier progress alone does not: far-future visibility and body
+or has three consecutive clean Drive absence observations may use a 2 s backoff
+ceiling if the observed description frontier has not advanced for `eagerWindow`.
+The existing exponential calculation remains (typically
+1.2 s at the 300 ms pace floor), not a forced 2 s sleep. Invalid frames, errors,
+previously-seen-slot 404s, and head/near schedules are unchanged. This reduces
+repeated old-frame/empty-slot speculation during quiet peer periods. Promotion
+still wakes the wait, but frontier progress alone does not: far-future visibility and body
 prefetch timing can be delayed, even though prefetch-window sizes are unchanged.
 During cooldown and for five seconds after a rate limit, the slot reader admits only
 one metadata hunt at a time per slot instead of three overlapping hunts. These
@@ -278,13 +344,22 @@ range (exclusive end), whole-frame and requested-range byte sizes, rescue status
 and head-marker/promotion state at dispatch and HTTP completion. The head state
 is sticky once promoted, not evidence of HTTP priority or the current head after
 a losing rescue outlives its primary. Head flags are diagnostic; promotion can
-wake deferred media recovery but does not reprioritize or restart primary GETs.
+wake deferred media recovery; the ordered-block signal prioritizes rescues, not
+primary GETs. Primary requests are not restarted on promotion.
 These diagnostic details add no API calls and do not themselves improve download
 speed. Unobserved phases are reported as
 unavailable (`-1ns`).
 Sum units across operation types and peers when comparing usage
 with the project's effective quota. These are estimates using the published
 per-method model, not measurements of a grandfathered project's quota charges.
+
+Exact-name Drive cache lookups use a direct map lookup instead of scanning the
+whole shared name cache. Duplicate/missing-ID filtering is unchanged; this reduces
+local work and lock contention without adding API calls.
+Disposable idle connection probes use one application-level request-loop attempt.
+After a transient failure, warming waits for later traffic or the next keeper tick;
+foreground retries, token/ID refills, quota signaling, and transport-level replays
+are unchanged.
 
 Cleanup listings and deletes share a storage-wide concurrency limit; every
 cleanup DELETE attempt, including retries, is paced. Cleanup rate limits do not

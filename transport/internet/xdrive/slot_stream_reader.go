@@ -19,6 +19,11 @@ type slotStreamBuffer struct {
 	next     int
 	received int
 	updates  chan struct{}
+
+	// Recovery observes the ordered reader, independently of the single-reader
+	// updates signal and run-owned delivery timing. Both fields are guarded by mu.
+	deliveryChanged chan struct{}
+	requiredAt      time.Time
 }
 
 // These observations belong to run, not the HTTP workers. Missing-block waits
@@ -67,10 +72,11 @@ func (d *streamDeliveryTiming) completionWait(readyAt time.Time) time.Duration {
 
 func newSlotStreamBuffer(frame slotFrame) *slotStreamBuffer {
 	return &slotStreamBuffer{
-		frame:   frame,
-		data:    make([][]byte, len(frame.blocks)),
-		seen:    make([]bool, len(frame.blocks)),
-		updates: make(chan struct{}, 1),
+		frame:           frame,
+		data:            make([][]byte, len(frame.blocks)),
+		seen:            make([]bool, len(frame.blocks)),
+		updates:         make(chan struct{}, 1),
+		deliveryChanged: make(chan struct{}),
 	}
 }
 
@@ -103,8 +109,32 @@ func (s *slotStreamBuffer) take() ([]byte, bool) {
 	if data != nil {
 		s.data[s.next] = nil
 		s.next++
+		s.requiredAt = time.Time{}
+		close(s.deliveryChanged)
+		s.deliveryChanged = make(chan struct{})
+	} else if s.requiredAt.IsZero() {
+		// Start only when the ordered reader actually needs this missing block;
+		// prefetch age and downstream enqueue waits do not start this clock.
+		s.requiredAt = time.Now()
+		close(s.deliveryChanged)
+		s.deliveryChanged = make(chan struct{})
 	}
 	return data, false
+}
+
+// deliveryState atomically snapshots the next block to take, its current reader
+// wait, and a broadcast generation. The terminal offset means every block was
+// taken; enqueue and the successful range/EOF fence still govern delivery/ACK.
+func (s *slotStreamBuffer) deliveryState() (int, <-chan struct{}, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	waitingAt := s.requiredAt
+	if s.next == len(s.data) || s.data[s.next] != nil {
+		// A verified block may arrive before the ordered reader is scheduled.
+		// Do not rescue already-buffered bytes during that scheduling gap.
+		waitingAt = time.Time{}
+	}
+	return min(s.next*slotStreamBlockBytes, s.frame.size), s.deliveryChanged, waitingAt
 }
 
 func (s *slotStreamBuffer) complete() bool {

@@ -31,6 +31,8 @@ const (
 	// inlineRampSegments segments of one size in a row double it, from
 	// slotInlineLimit up to segmentBytes
 	inlineRampSegments = 8
+	// Stable browsing suffixes retain two batching ticks before an early flush.
+	slotInlineStableTicks = 2
 
 	// Bulk uploads use a wider window once a deep ring is warm. Media reads
 	// have bounded lookahead for mixed traffic too. Small rings retain their
@@ -519,6 +521,27 @@ func (w *slotWriter) flushLoop() {
 func (w *slotWriter) readyToFlush() bool {
 	grew := len(w.buf) > w.lastSize
 	w.lastSize = len(w.buf)
+
+	// Drive keeps two coalescing ticks for small stable inline suffixes;
+	// growing buffers still use the full budget below. Flushing a suffix
+	// sooner can split a later burst into another PATCH, trading some batching
+	// for browsing latency without sending every small write immediately.
+	if _, drive := w.store.(throttleStore); drive && !grew && w.held >= slotInlineStableTicks &&
+		len(w.buf) < min(w.size/2, slotInlineLimit) {
+		healthy := true
+		if s, ok := w.store.(interface {
+			cooling() bool
+			lastRateLimitAt() time.Time
+		}); ok {
+			healthy = !s.cooling() && time.Since(s.lastRateLimitAt()) > 5*time.Second
+		}
+		// Preserve ordinary batching during quota recovery instead of splitting
+		// a small suffix into another upload while live requests are throttled.
+		if healthy {
+			w.held = 0
+			return true
+		}
+	}
 
 	// While uploads are outstanding, hold only a buffer too small for an
 	// inline segment, so the rest of a split burst leaves a piece every tick.
@@ -1357,7 +1380,8 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	defer func() { cancelDescription() }()
 	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
-	tailMisses := 0
+	tailMisses, absentMisses := 0, 0
+	_, drive := r.store.(throttleStore)
 	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
 	for {
 		observations, present := hunt.observations, hunt.present
@@ -1374,6 +1398,20 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			tailMisses = min(tailMisses+1, 3)
 		} else {
 			tailMisses = 0
+		}
+		notWritten := false
+		if err == errNotFound && r.lazy {
+			r.mu.Lock()
+			notWritten = !r.seen[int(seq%int64(len(r.table.Slots)))]
+			r.mu.Unlock()
+		}
+		// Count only consecutive clean absence. A 404 for a previously seen
+		// slot, another HTTP error, or an invalid description must not earn the
+		// longer quiet backoff. Other stores retain their existing schedule.
+		if drive && (notWritten || err == nil && description == "") {
+			absentMisses = min(absentMisses+1, 3)
+		} else {
+			absentMisses = 0
 		}
 		r.mu.Lock()
 		progressPastHead := r.head == seq && r.frontier > seq
@@ -1432,6 +1470,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					}
 					f.bodyAdmission += time.Since(admissionAt)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
 					if r.isHead(seq) {
 						bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
 					}
@@ -1500,12 +1539,6 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				return
 			}
 		case err == errNotFound:
-			notWritten := false
-			if r.lazy {
-				r.mu.Lock()
-				notWritten = !r.seen[int(seq%int64(len(r.table.Slots)))]
-				r.mu.Unlock()
-			}
 			if notWritten {
 				// A lazy slot that has never held a frame is not written yet.
 				goneSince = time.Time{}
@@ -1563,10 +1596,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			r.mu.Unlock()
 			if distant && tailMisses > 1 {
 				ceiling := r.tailMax
-				if tailMisses >= 3 && quietFrontier && err == nil && ok && frame.seq < seq {
+				if tailMisses >= 3 && quietFrontier && (err == nil && ok && frame.seq < seq || absentMisses >= 3) {
 					// Writes can keep a session eager even when the peer has no
-					// new frames. Only valid older-lap predictions slow down;
-					// absent/new slots and errors keep their existing schedule.
+					// new frames. Valid older laps and repeated clean Drive
+					// absence slow down; errors/invalid frames do not qualify.
 					// Head/near promotion still interrupts this wait.
 					ceiling = max(ceiling, slotTailQuietMax)
 				}
