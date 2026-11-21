@@ -2748,6 +2748,8 @@ func TestMediaLatencyMeasuresActualDispatchAndRejectsInvalidRange(t *testing.T) 
 				s.mediaRanges <- struct{}{}
 				r := &driveMediaRequest{end: 4, size: 4, client: s.client}
 				ctx := context.WithValue(context.Background(), driveMediaKey{}, r)
+				timing := &bodyReadTiming{}
+				ctx = context.WithValue(ctx, bodyReadTimingKey{}, timing)
 				done := make(chan error, 1)
 				go func() { _, _, err := s.do(ctx, http.MethodGet, s.filesURL+"/item?alt=media", "", nil); done <- err }()
 				synctest.Wait()
@@ -2770,6 +2772,10 @@ func TestMediaLatencyMeasuresActualDispatchAndRejectsInvalidRange(t *testing.T) 
 				}
 				if valid && s.mediaLatency[0].ring[0] != time.Second {
 					t.Fatalf("dispatch latency = %v, want 1s, excluding 5s admission", s.mediaLatency[0].ring[0])
+				}
+				wantTiming := time.Duration(want) * time.Second
+				if timing.result(6*time.Second) != wantTiming {
+					t.Fatal("body capacity trained on queue time or invalid response bytes")
 				}
 			})
 		})
@@ -3473,15 +3479,23 @@ func TestDriveFrameStreamRetriesVerifiedPrefix(t *testing.T) {
 	frame := driveStreamTestFrame(data)
 	var attempts atomic.Int32
 	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
-		body := data
+		var start, last int
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+			return nil, err
+		}
+		body := data[start : last+1]
 		if attempts.Add(1) == 1 {
 			body = data[:driveStreamBlockBytes+13]
+		} else if start != driveStreamBlockBytes {
+			return nil, fmt.Errorf("retry starts at %d instead of the first unverified block", start)
 		}
 		return driveStreamTestResponse(request, http.StatusPartialContent,
-			fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)), -1, io.NopCloser(bytes.NewReader(body))), nil
+			fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), -1, io.NopCloser(bytes.NewReader(body))), nil
 	}, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	timing := &bodyReadTiming{}
+	ctx = context.WithValue(ctx, bodyReadTimingKey{}, timing)
 	var mu sync.Mutex
 	seen := make(map[int][]byte)
 	counts := make(map[int]int)
@@ -3498,13 +3512,122 @@ func TestDriveFrameStreamRetriesVerifiedPrefix(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if attempts.Load() != 2 || counts[0] != 2 || len(seen) != len(frame.blocks) {
+	if attempts.Load() != 2 || counts[0] != 1 || len(seen) != len(frame.blocks) || timing.result(time.Second) != 0 {
 		t.Fatalf("retry did not preserve/deduplicate its verified prefix: attempts=%d, counts=%v", attempts.Load(), counts)
 	}
 	for index, block := range seen {
 		start := index * driveStreamBlockBytes
 		if !bytes.Equal(block, data[start:min(start+driveStreamBlockBytes, len(data))]) {
 			t.Fatalf("retry supplied an unverified block %d", index)
+		}
+	}
+}
+
+type driveStreamTestEOFFailure struct{ io.Reader }
+
+func (b driveStreamTestEOFFailure) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
+}
+
+func TestDriveFrameStreamRetryPreservesEOFFence(t *testing.T) {
+	for _, ignored := range []bool{false, true} {
+		t.Run(fmt.Sprint("ignored-range=", ignored), func(t *testing.T) {
+			data := driveStreamTestData(2*driveStreamBlockBytes + 19)
+			frame := driveStreamTestFrame(data)
+			buffer := newSlotStreamBuffer(frame)
+			var attempts atomic.Int32
+			s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+				var start, last int
+				if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+					return nil, err
+				}
+				if attempts.Add(1) == 1 {
+					return driveStreamTestResponse(request, http.StatusPartialContent,
+						fmt.Sprintf("bytes 0-%d/%d", last, len(data)), int64(len(data)),
+						io.NopCloser(driveStreamTestEOFFailure{bytes.NewReader(data)})), nil
+				}
+				if start != 2*driveStreamBlockBytes || last != len(data)-1 || !buffer.complete() {
+					return nil, fmt.Errorf("EOF retry did not preserve a nonempty verified suffix: %d-%d", start, last)
+				}
+				if ignored {
+					return driveStreamTestResponse(request, http.StatusOK, "", int64(len(data)), io.NopCloser(bytes.NewReader(data))), nil
+				}
+				return driveStreamTestResponse(request, http.StatusPartialContent,
+					fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), int64(last+1-start), io.NopCloser(bytes.NewReader(data[start:last+1]))), nil
+			}, 1)
+			if err := s.readFrameStream(context.Background(), "slot", frame, buffer.offer); err != nil {
+				t.Fatal(err)
+			}
+			if attempts.Load() != 2 {
+				t.Fatal("verified blocks bypassed EOF recovery")
+			}
+			var got []byte
+			for {
+				block, all := buffer.take()
+				if all {
+					break
+				}
+				if block == nil {
+					t.Fatal("EOF retry lost a verified block")
+				}
+				got = append(got, block...)
+			}
+			if !bytes.Equal(got, data) {
+				t.Fatal("EOF retry replayed or changed ordered bytes")
+			}
+		})
+	}
+}
+
+func TestDriveFrameStreamSplitRetryResumesOnlyFailedRange(t *testing.T) {
+	data := driveStreamTestData(defaultSegmentBytes)
+	frame := driveStreamTestFrame(data)
+	var mu sync.Mutex
+	requests := 0
+	failedRangeAttempts := 0
+	counts := make(map[int]int)
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		var start, last int
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+			return nil, err
+		}
+		body := data[start : last+1]
+		mu.Lock()
+		defer mu.Unlock()
+		requests++
+		if last+1 == 3*driveMediaPart {
+			failedRangeAttempts++
+			if failedRangeAttempts == 1 {
+				body = body[:driveStreamBlockBytes+7]
+			} else if start != 2*driveMediaPart+driveStreamBlockBytes {
+				return nil, fmt.Errorf("split retry crossed its verified range prefix: %d", start)
+			}
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), -1, io.NopCloser(bytes.NewReader(body))), nil
+	}, 4)
+	ctx := context.WithValue(context.Background(), mediaHeadKey{}, true)
+	if err := s.readFrameStream(ctx, "slot", frame, func(index int, block []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		counts[index]++
+		if !validStreamBlock(frame, index, block) {
+			return errors.New("unverified retry block")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 5 || failedRangeAttempts != 2 || len(counts) != len(frame.blocks) {
+		t.Fatalf("requests=%d failed range attempts=%d blocks=%d", requests, failedRangeAttempts, len(counts))
+	}
+	for index := range frame.blocks {
+		if counts[index] != 1 {
+			t.Fatalf("split retry replayed block %d", index)
 		}
 	}
 }

@@ -1113,7 +1113,7 @@ type slotReader struct {
 	// overlap admission; primary reads and the polling tick are unchanged.
 	descriptionLatency time.Duration // guarded by mu
 
-	// bodies bounds prefetched media bodies by observed latency (see bodyGate).
+	// bodies owns ordered media admission and undelivered byte credit.
 	bodies bodyGate
 }
 
@@ -1152,6 +1152,7 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 	if r.lazy {
 		r.seen = make([]bool, len(table.Slots))
 	}
+	r.bodies.configure(head, p.segmentBytes, len(table.Slots))
 	if len(first) > 0 {
 		r.ch <- first
 		select {
@@ -1203,7 +1204,6 @@ type slotFetch struct {
 	// promoted is closed when the segment becomes the head
 	promoted      chan struct{}
 	near          chan struct{}
-	media         chan struct{} // body prefetch admission, independent of description discovery
 	body          []byte
 	end           bool
 	err           error
@@ -1214,6 +1214,7 @@ type slotFetch struct {
 	bodyTime      time.Duration
 	bodyAdmission time.Duration
 	mode          byte
+	permit        *bodyPermit
 }
 
 func (f *slotFetch) enter() {
@@ -1227,13 +1228,17 @@ func (f *slotFetch) enter() {
 func (r *slotReader) run() {
 	defer close(r.ch)
 	ctx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
+	defer func() {
+		cancel()
+		r.bodies.close()
+	}()
 
 	fetches := make(map[int64]*slotFetch)
 	for {
 		r.mu.Lock()
 		head, started, frontier := r.head, r.started, r.frontier
 		r.mu.Unlock()
+		r.bodies.advance(head)
 
 		window := 1
 		if started || frontier >= head {
@@ -1242,7 +1247,7 @@ func (r *slotReader) run() {
 		for i := range window {
 			seq := head + int64(i)
 			if fetches[seq] == nil {
-				fetches[seq] = &slotFetch{ready: make(chan struct{}), streamReady: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{}), born: time.Now()}
+				fetches[seq] = &slotFetch{ready: make(chan struct{}), streamReady: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), born: time.Now()}
 				if int64(i) <= slotReadAhead {
 					fetches[seq].enter()
 				}
@@ -1251,14 +1256,6 @@ func (r *slotReader) run() {
 					defer r.wg.Done()
 					r.fetch(ctx, seq, i, f)
 				}(fetches[seq])
-			}
-			// Mixed inline/media traffic needs the same bound as a bulk stream.
-			if i < slotBodyAhead {
-				select {
-				case <-fetches[seq].media:
-				default:
-					close(fetches[seq].media)
-				}
 			}
 		}
 
@@ -1308,12 +1305,15 @@ func (r *slotReader) run() {
 			size = f.stream.frame.size
 			firstBlockWait = max(0, f.firstBlockAt.Sub(f.headAt))
 		}
+		bodyWindow, bodyActive, bodyOutstanding, bodyBuffered, bodyBudget := r.bodies.snapshot()
 		errors.LogDebug(r.ctx, "xdrive read ", slotTag(r.table.Watermark), " seq=", head, " fetch=",
 			f.readyAt.Sub(f.born), " blocked=", time.Since(f.readyAt), " bytes=", size,
 			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
 			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
-			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(), " body-window=", r.bodies.window(),
+			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(), " body-window=", bodyWindow,
+			" body-active=", bodyActive, " body-outstanding-bytes=", bodyOutstanding,
+			" body-buffered-bytes=", bodyBuffered, " body-budget-bytes=", bodyBudget,
 			" quiet-tail-backoffs=", r.quietTailBackoffs.Load(), " first-block-wait=", firstBlockWait,
 			" media-admission=", f.bodyAdmission, " stream-blocks=", f.delivery.blocks,
 			" missing-block-gaps=", f.delivery.missingCount,
@@ -1334,6 +1334,7 @@ func (r *slotReader) run() {
 		if !streamed {
 			select {
 			case r.ch <- f.body:
+				f.permit.deliver(len(f.body))
 			case <-ctx.Done():
 				return
 			}
@@ -1345,16 +1346,6 @@ func (r *slotReader) isHead(seq int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.head == seq
-}
-
-// distanceFromHead reports how many frames seq is ahead of the head, for the
-// body gate, which never holds back the head or its immediate successors.
-func (r *slotReader) distanceFromHead(seq int64) func() int64 {
-	return func() int64 {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		return seq - r.head
-	}
 }
 
 func (r *slotReader) bursting() bool {
@@ -1480,22 +1471,21 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				if store, ok := r.store.(interface {
 					readFrameStream(context.Context, string, slotFrame, func(int, []byte) error) error
 				}); ok {
-					f.stream = newSlotStreamBuffer(frame)
-					close(f.streamReady)
 					admissionAt := time.Now()
-					select {
-					case <-f.media:
-					case <-ctx.Done():
-						f.err = ctx.Err()
-						return
-					}
-					if !r.bodies.acquire(ctx, r.distanceFromHead(seq), f.promoted) {
+					permit, admitted := r.bodies.acquire(ctx, seq, frame.size)
+					if !admitted {
 						f.err = ctx.Err()
 						return
 					}
 					f.bodyAdmission += time.Since(admissionAt)
+					f.permit = permit
+					f.stream = newSlotStreamBuffer(frame)
+					f.stream.credit = permit
+					close(f.streamReady)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
+					timing := &bodyReadTiming{}
+					bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
 					if r.isHead(seq) {
 						bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
 					}
@@ -1505,7 +1495,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					if f.err == nil && !f.stream.complete() {
 						f.err = errors.New("streamed slot ended without every verified block")
 					}
-					r.bodies.release(f.bodyTime, f.err == nil)
+					permit.finish(timing.result(f.bodyTime), f.err == nil)
 					if f.err == nil {
 						r.hit()
 					} else {
@@ -1516,21 +1506,23 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				fallthrough
 			case slotMedia:
 				admissionAt := time.Now()
-				select {
-				case <-f.media:
-				case <-ctx.Done():
-					return
-				}
-				if !r.bodies.acquire(ctx, r.distanceFromHead(seq), f.promoted) {
+				permit, admitted := r.bodies.acquire(ctx, seq, frame.size)
+				if !admitted {
 					return
 				}
 				f.bodyAdmission += time.Since(admissionAt)
+				f.permit = permit
 				began := time.Now()
 				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+				timing := &bodyReadTiming{}
+				bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
 				body, bodyErr := r.readMediaBody(bodyCtx, id, seq, frame)
 				bodyTime := time.Since(began)
 				f.bodyTime += bodyTime
-				r.bodies.release(bodyTime, bodyErr == nil)
+				if bodyErr == nil {
+					permit.received(len(body))
+				}
+				permit.finish(timing.result(bodyTime), bodyErr == nil)
 				if isAuthError(bodyErr) {
 					f.err = bodyErr
 					r.setErr(bodyErr)

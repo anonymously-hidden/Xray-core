@@ -24,6 +24,7 @@ type slotStreamBuffer struct {
 	// updates signal and run-owned delivery timing. Both fields are guarded by mu.
 	deliveryChanged chan struct{}
 	requiredAt      time.Time
+	credit          *bodyPermit
 }
 
 // These observations belong to run, not the HTTP workers. Missing-block waits
@@ -90,6 +91,7 @@ func (s *slotStreamBuffer) offer(index int, data []byte) error {
 		s.seen[index] = true
 		s.data[index] = data
 		s.received++
+		s.credit.received(len(data))
 	}
 	s.mu.Unlock()
 	select {
@@ -165,6 +167,7 @@ func (r *slotReader) deliverStream(ctx context.Context, f *slotFetch) (bool, err
 					f.firstBlockAt = now
 				}
 				f.delivery.queued(start, now)
+				f.permit.deliver(len(data))
 			case <-ctx.Done():
 				return false, ctx.Err()
 			}

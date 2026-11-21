@@ -708,6 +708,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	createOnce := method == http.MethodPost && ctx.Value(createOnceKey{}) != nil
 	descriptionHedge := method == http.MethodGet && ctx.Value(descriptionHedgeKey{}) != nil
 	media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
+	mediaTiming, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
 	readHedgeAttempt := descriptionHedge || method == http.MethodGet && media != nil && media.rescue
 	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
@@ -735,6 +736,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	rejected := 0
 	for attempt := 0; attempt-refunded < maxAttempts; attempt++ {
 		if attempt > 0 {
+			mediaTiming.reject()
 			select {
 			case <-ctx.Done():
 				return 0, nil, ctx.Err()
@@ -823,8 +825,13 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			req.GetBody = nil
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
-		if media != nil {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", media.start, media.end-1))
+		requestMedia := media
+		if media != nil && media.progress != nil && attempt > 0 {
+			resumed := media.progress.resume(*media)
+			requestMedia = &resumed
+		}
+		if requestMedia != nil {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", requestMedia.start, requestMedia.end-1))
 			req.Header.Set("Accept-Encoding", "identity")
 		}
 		if contentType != "" {
@@ -863,6 +870,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				previous := dispatched.Swap(true)
 				if previous {
 					replayed.Store(true)
+				}
+				if previous || media != nil && media.rescue {
+					mediaTiming.reject()
 				}
 				if createOnce && previous {
 					cancel()
@@ -971,6 +981,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			}
 		}
 		if err != nil {
+			mediaTiming.reject()
 			if primary != nil {
 				primary.finish()
 			}
@@ -1006,12 +1017,13 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			resp.Body = &progressBody{ReadCloser: resp.Body, alive: progress}
 		}
 		var payload []byte
-		if media != nil && media.stream != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
-			payload, err = media.stream.read(*media, resp.StatusCode, resp.Header.Get("Content-Range"), resp.ContentLength, io.LimitReader(resp.Body, limit+1))
+		if requestMedia != nil && requestMedia.stream != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+			payload, err = requestMedia.stream.read(*requestMedia, resp.StatusCode, resp.Header.Get("Content-Range"), resp.ContentLength, io.LimitReader(resp.Body, limit+1))
 		} else {
 			payload, err = readResponse(resp.Body, limit, resp.ContentLength)
 		}
 		if err != nil {
+			mediaTiming.reject()
 			noteTimeout()
 			if dispatched.Load() && s.timing != nil {
 				s.timing.noteFailure(kind, ctx.Err() != nil)
@@ -1073,7 +1085,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		tr.mu.Unlock()
 		s.recordTiming(kind, sample)
-		s.logSlowRequest(ctx, kind, req.URL.Path, sample, media, headAtDispatch.Load(), headAtCompletion, resp.StatusCode, attempt+1)
+		s.logSlowRequest(ctx, kind, req.URL.Path, sample, requestMedia, headAtDispatch.Load(), headAtCompletion, resp.StatusCode, attempt+1)
 
 		if resp.StatusCode == http.StatusUnauthorized {
 			s.invalidateToken(token)
@@ -1125,8 +1137,15 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if media != nil && media.stream == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
 		}
+		if err != nil {
+			mediaTiming.reject()
+		}
 		if ctx.Err() == nil {
 			s.observeMediaLatency(media, sample, resp.StatusCode, attempt, replayed.Load(), err)
+			if media != nil && !media.rescue && err == nil && sample.hasDispatch &&
+				(resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+				mediaTiming.observe(sample.dispatch)
+			}
 		}
 		return resp.StatusCode, payload, err
 	}
@@ -1177,6 +1196,8 @@ func (s *driveStorage) waitCool(ctx context.Context) error {
 		if d <= 0 {
 			return nil
 		}
+		timing, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
+		timing.reject()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -2852,6 +2873,29 @@ type driveMediaRequest struct {
 	client           *http.Client
 	rescue           bool
 	stream           *driveRangeStream
+	progress         *driveRangeProgress
+}
+
+type driveRangeProgress struct {
+	mu   sync.Mutex
+	next int
+}
+
+func (p *driveRangeProgress) verified(start, end int) {
+	p.mu.Lock()
+	if start == p.next {
+		p.next = end
+	}
+	p.mu.Unlock()
+}
+
+func (p *driveRangeProgress) resume(r driveMediaRequest) driveMediaRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Even a fully delivered range must revalidate a nonempty suffix after EOF failure.
+	last := (r.end - 1) / driveStreamBlockBytes * driveStreamBlockBytes
+	r.start = max(r.start, min(p.next, last))
+	return r
 }
 
 func (r *driveMediaRequest) extract(status int, contentRange string, body []byte) ([]byte, error) {
@@ -2955,6 +2999,9 @@ func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r d
 func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driveMediaRequest) ([]byte, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	if r.stream != nil {
+		r.progress = &driveRangeProgress{next: r.start}
+	}
 	primary := &driveReadProgress{dispatched: make(chan struct{})}
 	delivery, tracked := ctx.Value(mediaDeliveryKey{}).(func() (int, <-chan struct{}, time.Time))
 	tracked = tracked && delivery != nil && r.stream != nil && r.stream.frame.mode == slotStream
@@ -2983,6 +3030,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		if hedge {
 			request.client = s.bulkClient
 			request.rescue = true
+			request.progress = nil
 			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, gate)
 		} else {
 			requestCtx = context.WithValue(requestCtx, readProgressKey{}, primary)
@@ -3229,6 +3277,9 @@ func (s *driveRangeStream) read(request driveMediaRequest, status int, contentRa
 		if offset >= request.start && offset < request.end {
 			if err := s.emit(index, block); err != nil {
 				return nil, err
+			}
+			if request.progress != nil {
+				request.progress.verified(offset, offset+size)
 			}
 		}
 		offset += size

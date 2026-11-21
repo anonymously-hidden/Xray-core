@@ -9,95 +9,183 @@ import (
 )
 
 func TestBodyGateZeroValueBoundsPrefetchAndNeverHoldsNearFrames(t *testing.T) {
-	var g bodyGate
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	far := func() int64 { return 10 }
-	near := func() int64 { return 0 }
-	for i := 0; i < slotBodyAhead; i++ {
-		if !g.acquire(ctx, far, nil) {
-			t.Fatalf("acquire %d failed", i)
-		}
-	}
-	// A full window never delays the head or its immediate successors.
-	done := make(chan bool, 1)
-	go func() { done <- g.acquire(ctx, near, nil) }()
-	select {
-	case ok := <-done:
+	synctest.Test(t, func(t *testing.T) {
+		var g bodyGate
+		defer g.close()
+		ctx := context.Background()
+		bulk, ok := g.acquire(ctx, 3, slotBodyAhead*defaultSegmentBytes)
 		if !ok {
-			t.Fatal("near acquire failed")
+			t.Fatal("cold prefetch failed")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("near frame was held back by a full window")
-	}
-	// A distant frame waits until a read finishes below the window.
-	go func() { done <- g.acquire(ctx, far, nil) }()
-	select {
-	case <-done:
-		t.Fatal("distant frame started beyond the window")
-	case <-time.After(100 * time.Millisecond):
-	}
-	g.release(0, false) // finish the near read, leaving a full prefetch window
-	g.release(0, false) // finish a prefetched read, making room for the waiter
-	select {
-	case ok := <-done:
+		bulk.received(bulk.size)
+		bulk.finish(time.Second, true)
+		done := make(chan *bodyPermit, 1)
+		go func() { p, _ := g.acquire(ctx, 4, defaultSegmentBytes); done <- p }()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("completed but undelivered bytes returned prefetch credit")
+		default:
+		}
+		head, ok := g.acquire(ctx, 0, defaultSegmentBytes)
 		if !ok {
-			t.Fatal("distant acquire failed after release")
+			t.Fatal("full prefetch held the head")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("distant frame did not start after a release")
-	}
+		head.received(head.size)
+		head.finish(time.Second, true)
+		head.deliver(head.size)
+		bulk.deliver(defaultSegmentBytes)
+		if p := <-done; p == nil {
+			t.Fatal("ordered handoff did not return byte credit")
+		}
+		_, active, outstanding, buffered, budget := g.snapshot()
+		if active != 1 || outstanding != budget || buffered != budget-defaultSegmentBytes {
+			t.Fatalf("active=%d outstanding=%d buffered=%d budget=%d", active, outstanding, buffered, budget)
+		}
+	})
 }
 
 func TestBodyGateStopsWaitingWhenContextEnds(t *testing.T) {
-	var g bodyGate
-	ctx, cancel := context.WithCancel(context.Background())
-	far := func() int64 { return 10 }
-	for i := 0; i < slotBodyAhead; i++ {
-		g.acquire(ctx, far, nil)
-	}
-	done := make(chan bool, 1)
-	go func() { done <- g.acquire(ctx, far, nil) }()
-	cancel()
-	select {
-	case ok := <-done:
-		if ok {
-			t.Fatal("acquire succeeded after cancellation")
+	synctest.Test(t, func(t *testing.T) {
+		var g bodyGate
+		defer g.close()
+		_, _ = g.acquire(context.Background(), 3, slotBodyAhead*defaultSegmentBytes)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan bool, 1)
+		go func() { _, ok := g.acquire(ctx, 4, defaultSegmentBytes); done <- ok }()
+		synctest.Wait()
+		cancel()
+		if <-done {
+			t.Fatal("canceled queued request was admitted")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("acquire ignored cancellation")
-	}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if len(g.queue) != 0 || len(g.live) != 1 || g.inflight != 1 {
+			t.Fatal("cancellation leaked queued credit")
+		}
+	})
 }
 
-func TestBodyGateWindowFollowsBodyLatency(t *testing.T) {
-	var g bodyGate
-	ctx := context.Background()
-	near := func() int64 { return 0 }
-	feed := func(d time.Duration, n int) {
-		for i := 0; i < n; i++ {
-			g.acquire(ctx, near, nil)
-			g.release(d, true)
+func TestBodyGateBudgetUsesDeliveredCapacityNotSlowFetchCuts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var g bodyGate
+		g.initLocked()
+		for range latencyWindowWarm {
+			g.observeLatencyLocked(time.Second)
 		}
+		if g.budget != g.maximum {
+			t.Fatal("cold delivery capacity changed the existing maximum")
+		}
+		g.observeDeliveryLocked(defaultSegmentBytes)
+		for range 30 {
+			time.Sleep(100 * time.Millisecond)
+			g.observeDeliveryLocked(defaultSegmentBytes)
+		}
+		want := 11 * defaultSegmentBytes
+		if g.budget != want {
+			t.Fatalf("budget=%d, want %d bytes for 5 MiB/s and 1s fetch latency", g.budget, want)
+		}
+		for range 5 {
+			g.observeLatencyLocked(4 * time.Second)
+		}
+		if g.budget != want {
+			t.Fatal("slow response tails cut demonstrated throughput capacity")
+		}
+		time.Sleep(20 * time.Second)
+		g.observeDeliveryLocked(defaultSegmentBytes)
+		if g.budget != want {
+			t.Fatal("delivery outage erased healthy capacity")
+		}
+		for range 100 {
+			time.Sleep(25 * time.Millisecond)
+			g.observeDeliveryLocked(defaultSegmentBytes)
+		}
+		if g.budget != g.maximum {
+			t.Fatal("faster useful delivery did not recover the maximum")
+		}
+	})
+}
+
+func TestBodyGateQueuedMediaUsesSequenceOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var g bodyGate
+		defer g.close()
+		ctx := context.Background()
+		bulk, _ := g.acquire(ctx, 3, slotBodyAhead*defaultSegmentBytes)
+		bulk.received(bulk.size)
+		bulk.finish(0, true)
+		later := make(chan *bodyPermit, 1)
+		earlier := make(chan *bodyPermit, 1)
+		go func() { p, _ := g.acquire(ctx, 6, defaultSegmentBytes); later <- p }()
+		synctest.Wait()
+		go func() { p, _ := g.acquire(ctx, 4, defaultSegmentBytes); earlier <- p }()
+		synctest.Wait()
+		bulk.deliver(defaultSegmentBytes)
+		if <-earlier == nil {
+			t.Fatal("earliest queued frame was not admitted")
+		}
+		synctest.Wait()
+		select {
+		case <-later:
+			t.Fatal("later frame won byte credit ahead of the earlier frame")
+		default:
+		}
+		bulk.deliver(defaultSegmentBytes)
+		if <-later == nil {
+			t.Fatal("later frame was starved after ordered credit returned")
+		}
+	})
+}
+
+func TestBodyGateOversizedAndFutureFramesWaitForNearAdmission(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var g bodyGate
+		g.configure(0, slotStreamBlockBytes, 4)
+		defer g.close()
+		done := make(chan *bodyPermit, 1)
+		go func() { p, _ := g.acquire(context.Background(), 3, 5*slotStreamBlockBytes); done <- p }()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("oversized speculative frame exceeded the byte ceiling")
+		default:
+		}
+		g.advance(1)
+		p := <-done
+		if p == nil {
+			t.Fatal("oversized near frame deadlocked")
+		}
+		p.received(p.size)
+		p.finish(time.Second, true)
+		p.deliver(p.size)
+		go func() { p, _ := g.acquire(context.Background(), 1+slotBodyAhead, slotStreamBlockBytes); done <- p }()
+		synctest.Wait()
+		select {
+		case <-done:
+			t.Fatal("future frame escaped the lookahead bound")
+		default:
+		}
+		g.close()
+		if <-done != nil {
+			t.Fatal("shutdown admitted a queued future frame")
+		}
+		if g.inflight != 0 || g.resident != 0 || g.buffered != 0 || len(g.live) != 0 {
+			t.Fatal("shutdown leaked byte or request credit")
+		}
+	})
+}
+
+func TestBodyReadTimingRejectsRecoverySamples(t *testing.T) {
+	var timing bodyReadTiming
+	timing.observe(time.Second)
+	timing.observe(2 * time.Second)
+	if timing.result(10*time.Second) != 2*time.Second {
+		t.Fatal("range timing included local admission instead of dispatch latency")
 	}
-	feed(time.Second, 40)
-	if got := g.window(); got != slotBodyAhead {
-		t.Fatalf("window at the floor = %d, want %d", got, slotBodyAhead)
-	}
-	// Queueing: every read now takes 3x the floor. The window shrinks, but
-	// not below the minimum, and not faster than once per base latency.
-	for i := 0; i < 5; i++ {
-		feed(3*time.Second, 1)
-	}
-	if got := g.window(); got >= slotBodyAhead || got < bodyGateMin {
-		t.Fatalf("window under queueing = %d, want in [%d,%d)", got, bodyGateMin, slotBodyAhead)
-	}
-	g.mu.Lock()
-	g.win.cutAt = time.Time{}
-	g.win.limit = bodyGateMin
-	g.mu.Unlock()
-	feed(time.Second, 3*slotBodyAhead)
-	if got := g.window(); got != slotBodyAhead {
-		t.Fatalf("window after recovery = %d, want %d", got, slotBodyAhead)
+	timing.reject()
+	timing.observe(time.Second)
+	if timing.result(10*time.Second) != 0 {
+		t.Fatal("a successful retry or rescue restored a contaminated sample")
 	}
 }
 
@@ -118,20 +206,17 @@ func TestLatencyWindowClampsToSmallMaximum(t *testing.T) {
 func TestBodyGateRejectsCanceledAdmission(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	promoted := make(chan struct{})
-	close(promoted)
 	for _, tc := range []struct {
-		name     string
-		distance int64
-		promoted <-chan struct{}
+		name string
+		seq  int64
 	}{
-		{name: "free_window", distance: 10},
-		{name: "near", distance: bodyGateNear},
-		{name: "promoted", distance: 10, promoted: promoted},
+		{name: "free_window", seq: 10},
+		{name: "head", seq: 0},
+		{name: "near", seq: bodyGateNear},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var g bodyGate
-			if g.acquire(ctx, func() int64 { return tc.distance }, tc.promoted) || g.inflight != 0 {
+			if _, ok := g.acquire(ctx, tc.seq, defaultSegmentBytes); ok || g.inflight != 0 {
 				t.Fatal("canceled read acquired a body permit")
 			}
 		})
@@ -141,15 +226,11 @@ func TestBodyGateRejectsCanceledAdmission(t *testing.T) {
 func TestBodyGatePromotionInterruptsFullWindow(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var g bodyGate
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		far := func() int64 { return 10 }
-		for range slotBodyAhead {
-			g.acquire(ctx, far, nil)
-		}
-		promoted := make(chan struct{})
+		defer g.close()
+		ctx := context.Background()
+		_, _ = g.acquire(ctx, 3, slotBodyAhead*defaultSegmentBytes)
 		done := make(chan bool, 1)
-		go func() { done <- g.acquire(ctx, far, promoted) }()
+		go func() { _, ok := g.acquire(ctx, 7, defaultSegmentBytes); done <- ok }()
 		synctest.Wait()
 		select {
 		case <-done:
@@ -157,14 +238,12 @@ func TestBodyGatePromotionInterruptsFullWindow(t *testing.T) {
 		default:
 		}
 		at := time.Now()
-		close(promoted)
+		g.advance(7)
 		if !<-done || time.Now() != at {
 			t.Fatal("head promotion did not immediately bypass the full window")
 		}
-		for range slotBodyAhead + 1 {
-			g.release(time.Second, false)
-		}
-		if g.inflight != 0 || g.win.n != 0 {
+		g.close()
+		if g.inflight != 0 || g.n != 0 || g.resident != 0 || len(g.live) != 0 {
 			t.Fatal("permits leaked or failed reads trained the window")
 		}
 	})
@@ -263,7 +342,7 @@ func TestBodyGateIncompleteStreamDoesNotTrainWindow(t *testing.T) {
 		if reader.Err() == io.EOF {
 			t.Fatal("incomplete stream was accepted")
 		}
-		if reader.bodies.inflight != 0 || reader.bodies.win.n != 0 {
+		if reader.bodies.inflight != 0 || reader.bodies.n != 0 || reader.bodies.resident != 0 {
 			t.Fatal("incomplete stream leaked a permit or trained the latency window")
 		}
 	})

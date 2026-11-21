@@ -1311,11 +1311,14 @@ func TestSlotCancelledFetchPublishesFailureNotEmptyChunk(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		for _, media := range []bool{false, true} {
 			ctx, cancel := context.WithCancel(context.Background())
-			store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
+			store := &validatedFrameSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
 				return newSlotFrame(0, slotMedia, []byte("body")).encode(), nil
+			}}, read: func(ctx context.Context, _ string, _ slotFrame) ([]byte, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
 			}}
 			r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, tailMin: time.Hour, active: make(chan struct{}), grow: make(chan struct{}, 1), frontier: -1}
-			f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+			f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
 			offset := 1
 			if media {
 				offset = 0
@@ -1553,8 +1556,7 @@ func TestSlotMediaAuthFailurePublishesImmediately(t *testing.T) {
 			return newSlotFrame(0, slotMedia, []byte("body")).encode(), nil
 		}}, read: func(context.Context, string, slotFrame) ([]byte, error) { calls++; return nil, failure }}
 		r := &slotReader{ctx: context.Background(), store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), head: 0, frontier: -1, active: make(chan struct{}), grow: make(chan struct{}, 1), huntCeiling: time.Millisecond, stallTimeout: time.Hour}
-		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
-		close(f.media)
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
 		started := time.Now()
 		r.fetch(r.ctx, 0, 0, f)
 		r.wait()
@@ -1583,9 +1585,8 @@ func TestSlotTailAuthFailureCancelsBlockedHead(t *testing.T) {
 			}}, read: func(context.Context, string, slotFrame) ([]byte, error) { return nil, failure }}
 			r := &slotReader{ctx: ctx, stop: cancel, store: store, table: slotTable{Slots: []string{"head", "tail"}}, params: paramsFromConfig(&Config{}), active: make(chan struct{}), grow: make(chan struct{}, 1), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: time.Hour}
 			makeFetch := func() *slotFetch {
-				f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+				f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
 				close(f.near)
-				close(f.media)
 				return f
 			}
 			head, tail := makeFetch(), makeFetch()
@@ -1688,7 +1689,7 @@ func TestSlotFreshPresenceResetsAbsenceBudget(t *testing.T) {
 			}
 		}}
 		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), head: 1, frontier: -1, active: make(chan struct{}), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
-		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), media: make(chan struct{}), near: make(chan struct{})}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
 		done := make(chan struct{})
 		go func() { defer close(done); r.fetch(ctx, 1, 0, f) }()
 		<-requests
@@ -1840,7 +1841,7 @@ func TestSlotMediaCancelsDescriptionSiblingsAndIsolatesRetries(t *testing.T) {
 			}
 		}}
 		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}}, params: paramsFromConfig(&Config{}), frontier: -1, activeAt: time.Now(), active: make(chan struct{}), grow: make(chan struct{}, 1), huntFloor: slotHuntFloor, huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
-		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), media: make(chan struct{})}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
 		go r.fetch(ctx, 0, 0, f)
 		lateClosed := false
 		defer func() {
@@ -1867,9 +1868,6 @@ func TestSlotMediaCancelsDescriptionSiblingsAndIsolatesRetries(t *testing.T) {
 			synctest.Wait()
 			if requests[0].ctx.Err() != context.Canceled || requests[1].ctx.Err() != context.Canceled {
 				t.Fatal("losing descriptions remained active during media admission or reading")
-			}
-			if attempt == 0 {
-				close(f.media)
 			}
 			<-bodyEntered
 			if attempt == 0 {

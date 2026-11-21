@@ -6,6 +6,7 @@ import (
 	"io"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -110,50 +111,68 @@ func receiveStreamChunk(t *testing.T, reader *slotReader) []byte {
 }
 
 func TestStreamReaderPrefixBeforeEOFAndAck(t *testing.T) {
-	data := bytes.Repeat([]byte("s"), 2*slotStreamBlockBytes+73)
-	store := newStreamReaderFixture(data)
-	ctx, cancel := context.WithCancel(context.Background())
-	reader := newSlotReader(ctx, store, slotTable{Slots: []string{"in0", "in1"}, Watermark: "wm"}, streamReaderParams(), nil)
-	defer func() { cancel(); reader.wait() }()
-	first := receiveStreamChunk(t, reader)
-	if !bytes.Equal(first, data[:slotStreamBlockBytes]) {
-		t.Fatal("first block differs")
-	}
-	select {
-	case ack := <-store.acks:
-		t.Fatalf("premature ACK before body tail: %d", ack)
-	default:
-	}
-	close(store.tail)
-	second, third := receiveStreamChunk(t, reader), receiveStreamChunk(t, reader)
-	if !bytes.Equal(second, data[slotStreamBlockBytes:2*slotStreamBlockBytes]) || !bytes.Equal(third, data[2*slotStreamBlockBytes:]) {
-		t.Fatal("remaining blocks differ")
-	}
-	select {
-	case ack := <-store.acks:
-		t.Fatalf("premature ACK before validated EOF: %d", ack)
-	case <-time.After(25 * time.Millisecond):
-	}
-	close(store.eof)
-	select {
-	case ack := <-store.acks:
-		if ack != 0 {
-			t.Fatalf("ACK=%d, want 0", ack)
+	synctest.Test(t, func(t *testing.T) {
+		data := bytes.Repeat([]byte("s"), 2*slotStreamBlockBytes+73)
+		store := newStreamReaderFixture(data)
+		ctx, cancel := context.WithCancel(context.Background())
+		reader := newSlotReader(ctx, store, slotTable{Slots: []string{"in0", "in1"}, Watermark: "wm"}, streamReaderParams(), nil)
+		defer func() { cancel(); reader.wait() }()
+		first := receiveStreamChunk(t, reader)
+		if !bytes.Equal(first, data[:slotStreamBlockBytes]) {
+			t.Fatal("first block differs")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("no completion ACK")
-	}
-	select {
-	case _, ok := <-reader.chunks():
-		if ok {
-			t.Fatal("unexpected extra chunk")
+		synctest.Wait()
+		_, active, outstanding, buffered, _ := reader.bodies.snapshot()
+		if active != 1 || outstanding != len(data)-len(first) || buffered != 0 {
+			t.Fatal("verified prefix did not return only its own ordered byte credit")
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("END not delivered")
-	}
-	if reader.Err() != io.EOF {
-		t.Fatalf("reader error: %v", reader.Err())
-	}
+		select {
+		case ack := <-store.acks:
+			t.Fatalf("premature ACK before body tail: %d", ack)
+		default:
+		}
+		close(store.tail)
+		second, third := receiveStreamChunk(t, reader), receiveStreamChunk(t, reader)
+		if !bytes.Equal(second, data[slotStreamBlockBytes:2*slotStreamBlockBytes]) || !bytes.Equal(third, data[2*slotStreamBlockBytes:]) {
+			t.Fatal("remaining blocks differ")
+		}
+		synctest.Wait()
+		_, active, outstanding, buffered, _ = reader.bodies.snapshot()
+		if active != 1 || outstanding != 0 || buffered != 0 {
+			t.Fatal("last handoff returned HTTP/EOF credit or retained byte credit")
+		}
+		select {
+		case ack := <-store.acks:
+			t.Fatalf("premature ACK before validated EOF: %d", ack)
+		case <-time.After(25 * time.Millisecond):
+		}
+		close(store.eof)
+		select {
+		case ack := <-store.acks:
+			if ack != 0 {
+				t.Fatalf("ACK=%d, want 0", ack)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("no completion ACK")
+		}
+		select {
+		case _, ok := <-reader.chunks():
+			if ok {
+				t.Fatal("unexpected extra chunk")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("END not delivered")
+		}
+		if reader.Err() != io.EOF {
+			t.Fatalf("reader error: %v", reader.Err())
+		}
+		cancel()
+		reader.wait()
+		_, active, outstanding, buffered, _ = reader.bodies.snapshot()
+		if active != 0 || outstanding != 0 || buffered != 0 {
+			t.Fatal("completed reader retained body credit")
+		}
+	})
 }
 
 func TestStreamReaderCancelWhilePartial(t *testing.T) {

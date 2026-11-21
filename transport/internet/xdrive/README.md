@@ -422,7 +422,7 @@ its main media slowdown. For matched inline frame 1017, bounded clock alignment
 places most of its 4.73 s head wait before the server PUT began, not in a four-second
 metadata HTTP request. These are different workloads, not matched speed benchmarks.
 
-### Bulk windows follow latency (latencyWindow)
+### Bulk upload window (latencyWindow)
 
 The ring is a FIFO byte stream, so a small frame completes only after every
 frame written before it. Bulk frames in flight share one link (and Drive's
@@ -432,17 +432,13 @@ In the November 21 client log body latency rose from about 1.1 s to 2.7 s (max
 3.4 s) at 465 frames/min, and 184 of the 194 reads blocked for over a second
 sat behind a media frame.
 
-`slot_latency_window.go` bounds bulk work by observed latency instead of a fixed
-count, in both directions with the same rule: the window shrinks by a quarter
+`slot_latency_window.go` bounds bulk uploads by observed latency instead of a fixed
+count: the window shrinks by a quarter
 (at most once per base latency) when an operation takes more than 1.5x the
 unloaded floor plus 100 ms, and grows by one when it is back within about 1.33x
 of it. The floor is the 5th percentile of the last 256 samples. It starts at
 its maximum, so an uncongested path behaves as before.
 
-- Reader (`slot_body_gate.go`): prefetched media bodies, maximum
-  `slotBodyAhead`, minimum 6. The head frame and the two after it are never held
-  back. `xdrive read` lines report `body-window=`, and `media-admission=`
-  includes time spent waiting for the gate.
 - Writer (`slotWriter.uplink`): the bulk upload window of `writeWindow`, steered
   by the latency of media/stream puts, never below the normal window.
 
@@ -451,6 +447,58 @@ behind a media frame it pays about one media latency (upload, description
 discovery and a body GET, roughly 2.2 s) minus its own (about 1.1 s). Removing
 that needs separate rings per flow class, which a byte-stream transport cannot
 choose without knowing the sessions inside it.
+
+### Ordered byte-credit prefetch
+
+`slot_body_gate.go` owns a sequence-ordered media admission queue. Queued earlier
+frames take priority over queued later frames, without restarting requests already
+running. The scheduler also enforces the existing 20-frame body lookahead.
+
+HTTP completion returns an active-request permit, but downloaded bytes keep their
+credit until ordered handoff to the connection reader. Streamed blocks return
+credit individually; legacy bodies return it at whole-body handoff. Shutdown and
+failed reads reclaim remaining reservations. The head and its two successors can
+borrow beyond the ordinary byte budget so prefetched tails cannot deadlock them.
+Borrowing does not bypass Drive's HTTP or quota limits. Inline frames do not enter
+the media scheduler, and storage ACK/reuse still requires validated completion.
+
+The cold byte budget is 20 configured segment sizes, capped by ring depth. After
+24 clean latency samples and an observed delivery interval, its target is recent
+peak ordered throughput times the healthy fetch-latency floor, plus one segment
+of handoff slack. The floor remains the 5th percentile of 256 samples; throughput
+uses the last eight complete delivery intervals. The ordinary budget stays between
+six and twenty configured segment sizes (or the smaller ring's limits).
+
+Only validated first-primary dispatch-to-EOF timings train the Drive latency
+floor. Retries, replays, dispatched rescues, and quota recovery invalidate a frame's
+sample. Idle/outage intervals do not erase demonstrated delivery capacity. There
+is no reader-side quarter-cut response to a single slow fetch. Generic stores use
+successful retrieval duration when dispatch telemetry is unavailable.
+
+Read logs retain `body-window` as the byte budget expressed in segment units and
+add `body-active`, `body-outstanding-bytes` (reserved undelivered media payload),
+`body-buffered-bytes` (received but not yet handed off), and `body-budget-bytes`.
+These do not include bytes already queued in the connection reader channel, and
+near-head borrowing can make outstanding bytes exceed the ordinary budget.
+
+### Verified-progress media retries
+
+Streaming primary retries resume at the first unverified block within their
+original range. An incomplete block is never skipped. If every block arrived but
+EOF validation failed, the retry re-reads a nonempty final block/suffix and must
+validate its response length and EOF. Ignored Range responses are still fully
+checksum-checked. Verified blocks remain deduplicated, and every original range
+must complete successfully before storage credit/ACK is returned.
+
+First-primary range geometry, retry-attempt limits, head-only adaptive hedge
+deadlines, ordered-delivery gating, and the one-additional-GET-per-range hedge
+budget are unchanged. Resuming reduces requested bytes where a verified prefix
+exists; it does not reduce the flat 200-unit cost of a retry GET.
+
+These changes address admission/recovery waste, not slow peer production, delayed
+Drive visibility, or cross-flow blocking inside a shared mux carrier. Twitch or
+other live-streaming improvement requires a matched live workload; none is claimed
+from unit tests alone. No timeout or polling constants are changed.
 
 ### Google Drive code layout
 

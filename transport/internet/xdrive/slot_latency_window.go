@@ -5,18 +5,7 @@ import (
 	"time"
 )
 
-// latencyWindow is a delay-based limit on how much bulk work may be in flight.
-// Every body in flight shares the same link (and Drive's per-user throughput),
-// so beyond the bandwidth-delay product more concurrency adds no throughput:
-// it only queues, and the ring is a FIFO byte stream, so that queue is paid by
-// every small frame written behind it. In the November 21 client log body
-// latency rose from about 1.1 s to 2.7 s (max 3.4 s) at 465 frames/min.
-//
-// The window shrinks by a quarter, at most once per base latency, when an
-// operation takes clearly longer than the unloaded floor (the 5th percentile
-// of the last 256), and grows by one when operations are back near the floor.
-// It starts at its maximum, so an uncongested path behaves as before.
-// The zero value is ready to use; the owner provides the locking.
+// latencyWindow retains the delay-based bulk upload limit; the owner locks it.
 const (
 	latencyWindowSamples = 256
 	latencyWindowWarm    = 24
