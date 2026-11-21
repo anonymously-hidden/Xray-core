@@ -17,6 +17,7 @@ type streamMetadataFixture struct {
 	mu     sync.Mutex
 	rows   map[string]map[string]interface{}
 	frames []slotFrame
+	bodies [][]byte
 	calls  int
 }
 
@@ -35,13 +36,24 @@ func (s *streamMetadataFixture) roundTrip(request *http.Request) (*http.Response
 			return nil, err
 		}
 		if kind == "multipart/related" {
-			part, err := multipart.NewReader(reader, params["boundary"]).NextPart()
+			parts := multipart.NewReader(reader, params["boundary"])
+			part, err := parts.NextPart()
 			if err != nil {
 				return nil, err
 			}
-			reader = part
-		}
-		if err := json.NewDecoder(reader).Decode(&row); err != nil {
+			if err := json.NewDecoder(part).Decode(&row); err != nil {
+				return nil, err
+			}
+			body, err := parts.NextPart()
+			if err != nil {
+				return nil, err
+			}
+			data, err := io.ReadAll(body)
+			if err != nil {
+				return nil, err
+			}
+			s.bodies = append(s.bodies, data)
+		} else if err := json.NewDecoder(reader).Decode(&row); err != nil {
 			return nil, err
 		}
 		if request.Method == http.MethodPost {
@@ -146,6 +158,46 @@ func TestDriveStreamWriterUsesOnlyConfirmedPeer(t *testing.T) {
 			}
 			if !found {
 				t.Fatal("published media frame missing")
+			}
+		})
+	}
+}
+
+func TestDriveWriterPublishesPrefixAndMediaInOneRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		streams, prefix bool
+	}{{"legacy", false, false}, {"older_streaming", true, false}, {"prefix_reader", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := &streamMetadataFixture{rows: make(map[string]map[string]interface{})}
+			store := driveStreamTestStorage(t, fixture.roundTrip, 0)
+			store.uploadURL = store.filesURL + "?uploadType=multipart"
+			store.configureStreaming("writer-epoch", tc.streams)
+			writer := newSlotWriter(context.Background(), store, slotTable{
+				Slots: append([]string{"out0", "out1"}, make([]string, 62)...), Watermark: "writer-wm", streamPrefix: tc.prefix,
+			}, streamReaderParams())
+			payload := streamTestData(defaultSegmentBytes)
+			if _, err := writer.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			writer.wg.Wait()
+			fixture.mu.Lock()
+			calls, frames, bodies := fixture.calls, fixture.frames, fixture.bodies
+			fixture.mu.Unlock()
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			writer.wait()
+			if calls != 1 || len(frames) != 1 || len(bodies) != 1 {
+				t.Fatalf("first frame needed more than one upload: %d calls, %d frames and %d bodies", calls, len(frames), len(bodies))
+			}
+			wantPrefix := 0
+			if tc.prefix {
+				wantPrefix = slotStreamPrefixBytes
+			}
+			if !bytes.Equal(frames[0].prefix, payload[:wantPrefix]) || !bytes.Equal(bodies[0], payload[wantPrefix:]) ||
+				!frames[0].holds(bodies[0]) {
+				t.Fatal("multipart upload lost, duplicated, or incorrectly framed data")
 			}
 		})
 	}

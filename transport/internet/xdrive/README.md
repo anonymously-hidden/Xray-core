@@ -39,7 +39,36 @@ whole-frame completion waiting, so it is not the first-byte delay for mode 5.
 The first-block field is zero/not applicable for legacy frames. Slow HTTP/body
 timings include local checksum processing; they are not pure wire measurements.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:e7c42c9740f8a4ae3229fb179fed77e2a361e65b68681edf2210f632898fddb9 -->
+
+## Verified inline start for Drive media
+
+Pure inline frames deliver small messages from their metadata, without a media
+GET. For a downstream media frame that starts when the writer has no other
+uploads in flight, a client that advertises `streamPrefix` can read the first
+11 KiB from the metadata of that same multipart upload. The rest is downloaded
+through the existing verified streaming path. The prefix and the media suffix
+each have integrity checks, share one sequence and one slot, and are delivered
+in order. Slot reuse still requires verified EOF of the suffix. The server only
+uses this format when the client advertises both streaming and prefix support;
+older peers keep their existing format.
+
+The fast start has no separate upload, slot, metadata request, or extra primary
+media request. Repeated metadata polls can download the prefix more than once.
+Even the largest encoded prefix descriptor stays below the existing 14 KiB
+inline payload descriptor size. At 900 ms of simulated media startup, the
+prefix arrives 900 ms earlier at the XDrive reader, and the last media block
+arrives at the same time. This does not shorten the Drive publication delay,
+let later stream bytes overtake earlier ones, or guarantee a complete HLS
+segment or TLS record. Use both updated peers for downstream testing. Read and
+write logs include `inline-prefix-bytes` so live samples can distinguish it
+from ordinary streaming.
+
 ## Recovery for stalled ordered blocks
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 The matched v48 session shows two different retrieval stalls: frame 730 waited
 9.22 s for its first verified block, while frames 866 and 869 had later block gaps

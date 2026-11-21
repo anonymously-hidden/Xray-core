@@ -531,6 +531,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	if ok {
 		if streams {
 			r.StreamVersion = 1
+			r.StreamPrefix, r.Down.streamPrefix = true, true
 		}
 		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
@@ -940,6 +941,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 		if r, ok := decodeRing(announce); ok {
 			if capable, ok := storage.(interface{ configureStreaming(string, bool) }); ok {
 				capable.configureStreaming(session, r.StreamVersion == 1)
+				r.Down.streamPrefix = r.StreamVersion == 1 && r.StreamPrefix
 			}
 			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
 			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)

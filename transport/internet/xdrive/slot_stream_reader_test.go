@@ -11,12 +11,13 @@ import (
 )
 
 type streamReaderFixture struct {
-	data   []byte
-	frame  slotFrame
-	tail   chan struct{}
-	eof    chan struct{}
-	acks   chan int64
-	legacy bool
+	data       []byte
+	frame      slotFrame
+	tail       chan struct{}
+	eof        chan struct{}
+	acks       chan int64
+	legacy     bool
+	firstDelay time.Duration
 }
 
 func newStreamReaderFixture(data []byte) *streamReaderFixture {
@@ -66,6 +67,9 @@ func (s *streamReaderFixture) readBody(context.Context, string) ([]byte, error) 
 }
 
 func (s *streamReaderFixture) readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error {
+	if err := batchTestWait(ctx, s.firstDelay); err != nil {
+		return err
+	}
 	if err := emit(0, bytes.Clone(s.data[:streamBlockSize(frame.size, 0)])); err != nil {
 		return err
 	}
@@ -247,5 +251,81 @@ func TestStreamReaderLegacyMediaUnchanged(t *testing.T) {
 	defer func() { cancel(); reader.wait() }()
 	if value := receiveStreamChunk(t, reader); !bytes.Equal(value, store.data) {
 		t.Fatal("legacy media delivery changed")
+	}
+}
+
+func TestStreamReaderMetadataPrefixAheadOfMedia(t *testing.T) {
+	for _, prefix := range []bool{false, true} {
+		t.Run(strconv.FormatBool(prefix), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				table := slotTable{Slots: []string{"in0", "in1"}, Watermark: "wm", streamPrefix: prefix}
+				body := streamTestData(slotStreamBlockBytes + 17)
+				store := newStreamReaderFixture(body)
+				store.firstDelay = 900 * time.Millisecond
+				if prefix {
+					store.frame.prefix = bytes.Repeat([]byte("p"), slotStreamPrefixBytes)
+				}
+				began := time.Now()
+				reader := newSlotReader(ctx, store, table, streamReaderParams(), nil)
+				defer func() { cancel(); reader.wait() }()
+				first := receiveStreamChunk(t, reader)
+				elapsed := time.Since(began)
+				t.Logf("first handoff: %v", elapsed)
+				if prefix {
+					if !bytes.Equal(first, store.frame.prefix) || elapsed >= store.firstDelay {
+						t.Fatal("the metadata bytes waited for the media request")
+					}
+					synctest.Wait()
+					_, active, outstanding, buffered, _ := reader.bodies.snapshot()
+					if active != 1 || outstanding != len(body) || buffered != 0 {
+						t.Fatalf("prefix did not return just its own credit: %d/%d/%d", active, outstanding, buffered)
+					}
+					first = receiveStreamChunk(t, reader)
+				} else if elapsed < store.firstDelay {
+					t.Fatal("legacy reader did not wait for media")
+				}
+				if !bytes.Equal(first, body[:slotStreamBlockBytes]) {
+					t.Fatal("first media block differs")
+				}
+				close(store.tail)
+				if last := receiveStreamChunk(t, reader); !bytes.Equal(last, body[slotStreamBlockBytes:]) {
+					t.Fatal("last media block differs")
+				}
+				select {
+				case ack := <-store.acks:
+					t.Fatalf("premature ACK before media EOF: %d", ack)
+				case <-time.After(25 * time.Millisecond):
+				}
+				close(store.eof)
+				select {
+				case ack := <-store.acks:
+					if ack != 0 {
+						t.Fatalf("ACK=%d, want 0", ack)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("no completion ACK")
+				}
+				if _, ok := <-reader.chunks(); ok || reader.Err() != io.EOF {
+					t.Fatal("reader failed to stop at the ordered END")
+				}
+			})
+		})
+	}
+}
+
+func TestStreamReaderRejectsUnnegotiatedMetadataPrefix(t *testing.T) {
+	store := newStreamReaderFixture(streamTestData(slotStreamBlockBytes))
+	store.frame.prefix = make([]byte, slotStreamPrefixBytes)
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := newSlotReader(ctx, store, slotTable{Slots: []string{"in0", "in1"}, Watermark: "wm"}, streamReaderParams(), nil)
+	defer func() { cancel(); reader.wait() }()
+	select {
+	case _, ok := <-reader.chunks():
+		if ok || reader.Err() == nil || reader.Err() == io.EOF {
+			t.Fatal("unnegotiated frame was accepted")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("reader did not reject unnegotiated frame")
 	}
 }

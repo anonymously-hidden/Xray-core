@@ -104,6 +104,7 @@ type slotFrame struct {
 	crc    uint32
 	data   []byte
 	blocks []uint32 // per-block CRCs; rooted against crc before streamed delivery
+	prefix []byte   // verified bytes before the streamed suffix; excluded from size and crc
 }
 
 func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
@@ -125,6 +126,11 @@ func (f slotFrame) encode() string {
 	binary.BigEndian.PutUint32(b[21:], f.crc)
 	if f.mode == slotStream {
 		b = appendStreamChecksums(b, f.blocks)
+		if len(f.prefix) != 0 {
+			b[16] = slotStreamPrefix
+			b = binary.BigEndian.AppendUint32(b, crc32.ChecksumIEEE(f.prefix))
+			b = append(b, f.prefix...)
+		}
 	} else {
 		b = append(b, f.data...)
 	}
@@ -155,9 +161,21 @@ func decodeSlot(description string) (slotFrame, bool) {
 		if f.size == 0 || len(b) != slotHeaderLen {
 			return slotFrame{}, false
 		}
-	case slotStream:
+	case slotStream, slotStreamPrefix:
+		trailer := b[slotHeaderLen:]
+		if f.mode == slotStreamPrefix {
+			end := len(trailer) - slotStreamPrefixBytes - 4
+			if end < 0 || f.size > maxSegmentBytes-slotStreamPrefixBytes {
+				return slotFrame{}, false
+			}
+			f.prefix = trailer[end+4:]
+			if crc32.ChecksumIEEE(f.prefix) != binary.BigEndian.Uint32(trailer[end:]) {
+				return slotFrame{}, false
+			}
+			trailer, f.mode = trailer[:end], slotStream
+		}
 		var ok bool
-		f.blocks, ok = decodeStreamChecksums(f.size, f.crc, b[slotHeaderLen:])
+		f.blocks, ok = decodeStreamChecksums(f.size, f.crc, trailer)
 		if !ok {
 			return slotFrame{}, false
 		}
@@ -178,12 +196,13 @@ func (f slotFrame) holds(body []byte) bool {
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
-// watermark of its reader. name and lazy are local carriers, not serialized.
+// watermark of its reader. name, lazy and streamPrefix are local, not serialized.
 type slotTable struct {
-	Slots     []string `json:"s"`
-	Watermark string   `json:"w"`
-	name      string
-	lazy      bool
+	Slots        []string `json:"s"`
+	Watermark    string   `json:"w"`
+	name         string
+	lazy         bool
+	streamPrefix bool
 }
 
 // ring is what a client announces a session with, the tables are named from
@@ -193,7 +212,8 @@ type ring struct {
 	Down          slotTable `json:"d"`
 	First         []byte    `json:"first,omitempty"`
 	Lazy          bool      `json:"lazy,omitempty"`
-	StreamVersion uint32    `json:"stream,omitempty"` // receiver capability, not a v1 watermark change
+	StreamPrefix  bool      `json:"streamPrefix,omitempty"` // downstream reader also accepts a verified metadata prefix
+	StreamVersion uint32    `json:"stream,omitempty"`       // receiver capability, not a v1 watermark change
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -302,6 +322,7 @@ type slotWriteResult struct {
 	inlinePlannedBytes     int
 	accountedBytes         int
 	accounted              bool // direct upload callers may not have enqueued/accounted this result
+	inlinePrefix           bool // start of a media burst on a capable downstream ring
 }
 
 func slotWriteElapsed(start, end time.Time) time.Duration {
@@ -736,6 +757,7 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 		inlinePlannedBytes:     inlinePlanned,
 		accountedBytes:         n,
 		accounted:              true,
+		inlinePrefix:           w.table.streamPrefix && len(w.slots) == 1 && n >= 2*slotStreamBlockBytes,
 	}
 	w.gates[idx] = result
 	w.wg.Add(1)
@@ -776,11 +798,15 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	}
 	awaited := time.Since(began)
 	putAt := time.Now()
-	if err := w.write(seq, mode, chunk); err != nil {
+	var prefix []byte
+	if mode == slotStream && result.inlinePrefix {
+		prefix = chunk[:slotStreamPrefixBytes]
+	}
+	if err := w.write(seq, mode, chunk[len(prefix):], prefix); err != nil {
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		// Completion includes the best-effort error frame, before reuse can
 		// observe the failed predecessor and leave that frame intact.
-		w.write(seq, slotErr, nil)
+		w.write(seq, slotErr, nil, nil)
 		result.err = err
 		return
 	}
@@ -803,10 +829,10 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		" upload-queue=", queueWait, " prefetch-setup=", prefetchSetup,
 		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes,
 		" inline-budget-bytes=", inlineBudget, " inline-burst-budget-bytes=", inlineBurstBudget,
-		" inline-planned-bytes=", inlinePlanned)
+		" inline-planned-bytes=", inlinePlanned, " inline-prefix-bytes=", len(prefix))
 }
 
-func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
+func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error) {
 	defer func() {
 		if err == nil && mode != slotErr {
 			w.ackMu.Lock()
@@ -818,6 +844,7 @@ func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
 		return err
 	}
 	f := newSlotFrame(seq, mode, data)
+	f.prefix = prefix
 	var body []byte
 	if mode == slotMedia || mode == slotStream {
 		body = data
@@ -1090,7 +1117,7 @@ func (w *slotWriter) closeOrdered() error {
 	if err := w.await(seq); err != nil {
 		return err
 	}
-	return w.write(seq, slotEnd, nil)
+	return w.write(seq, slotEnd, nil, nil)
 }
 
 func (w *slotWriter) Err() error {
@@ -1251,6 +1278,7 @@ type slotFetch struct {
 	visibleAt     time.Time
 	bodyTime      time.Duration
 	bodyAdmission time.Duration
+	prefixBytes   int
 	mode          byte
 	permit        *bodyPermit
 }
@@ -1340,7 +1368,7 @@ func (r *slotReader) run() {
 		size := len(f.body)
 		firstBlockWait := time.Duration(0)
 		if streamed {
-			size = f.stream.frame.size
+			size = f.stream.frame.size + f.prefixBytes
 			firstBlockWait = max(0, f.firstBlockAt.Sub(f.headAt))
 		}
 		bodyWindow, bodyActive, bodyOutstanding, bodyBuffered, bodyBudget := r.bodies.snapshot()
@@ -1357,7 +1385,7 @@ func (r *slotReader) run() {
 			" missing-block-gaps=", f.delivery.missingCount,
 			" missing-block-wait=", f.delivery.missingTotal, " missing-block-max=", f.delivery.missingMax,
 			" enqueue-wait=", f.delivery.enqueueTotal, " enqueue-max=", f.delivery.enqueueMax,
-			" completion-after-blocks=", f.delivery.completionWait(f.readyAt), " slot=", slotTag(r.slotID(head)))
+			" completion-after-blocks=", f.delivery.completionWait(f.readyAt), " slot=", slotTag(r.slotID(head)), " inline-prefix-bytes=", f.prefixBytes)
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {
@@ -1506,11 +1534,17 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.hit()
 				return
 			case slotStream:
-				if store, ok := r.store.(interface {
+				store, streams := r.store.(interface {
 					readFrameStream(context.Context, string, slotFrame, func(int, []byte) error) error
-				}); ok {
+				})
+				if len(frame.prefix) != 0 && (!r.table.streamPrefix || !streams) {
+					f.err = errors.New("unnegotiated inline stream prefix")
+					return
+				}
+				if streams {
 					admissionAt := time.Now()
-					permit, admitted := r.bodies.acquire(ctx, seq, frame.size)
+					f.prefixBytes = len(frame.prefix)
+					permit, admitted := r.bodies.acquire(ctx, seq, frame.size+f.prefixBytes)
 					if !admitted {
 						f.err = ctx.Err()
 						return
@@ -1519,6 +1553,8 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					f.permit = permit
 					f.stream = newSlotStreamBuffer(frame)
 					f.stream.credit = permit
+					permit.received(f.prefixBytes)
+					frame.prefix = nil
 					close(f.streamReady)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)

@@ -14,6 +14,7 @@ import (
 type slotStreamBuffer struct {
 	frame    slotFrame
 	mu       sync.Mutex
+	prefix   []byte
 	data     [][]byte
 	seen     []bool
 	next     int
@@ -72,8 +73,11 @@ func (d *streamDeliveryTiming) completionWait(readyAt time.Time) time.Duration {
 }
 
 func newSlotStreamBuffer(frame slotFrame) *slotStreamBuffer {
+	prefix := frame.prefix
+	frame.prefix = nil
 	return &slotStreamBuffer{
 		frame:           frame,
+		prefix:          prefix,
 		data:            make([][]byte, len(frame.blocks)),
 		seen:            make([]bool, len(frame.blocks)),
 		updates:         make(chan struct{}, 1),
@@ -104,6 +108,11 @@ func (s *slotStreamBuffer) offer(index int, data []byte) error {
 func (s *slotStreamBuffer) take() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.prefix != nil {
+		data := s.prefix
+		s.prefix = nil
+		return data, false
+	}
 	if s.next == len(s.data) {
 		return nil, true
 	}
@@ -131,7 +140,7 @@ func (s *slotStreamBuffer) deliveryState() (int, <-chan struct{}, time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	waitingAt := s.requiredAt
-	if s.next == len(s.data) || s.data[s.next] != nil {
+	if s.prefix != nil || s.next == len(s.data) || s.data[s.next] != nil {
 		// A verified block may arrive before the ordered reader is scheduled.
 		// Do not rescue already-buffered bytes during that scheduling gap.
 		waitingAt = time.Time{}

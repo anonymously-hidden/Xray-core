@@ -6,8 +6,11 @@ import (
 )
 
 const (
-	slotStream           byte = 5
-	slotStreamBlockBytes      = 32 << 10
+	slotStream       byte = 5
+	slotStreamPrefix byte = 6
+	// Leave room for checksums and headers under the existing inline description size.
+	slotStreamPrefixBytes = 11 << 10
+	slotStreamBlockBytes  = 32 << 10
 )
 
 // streamBlockChecksums covers each fixed-size block, including the final short

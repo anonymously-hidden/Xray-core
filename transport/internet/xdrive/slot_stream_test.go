@@ -2,6 +2,7 @@ package xdrive
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"hash/crc32"
 	"math/rand"
@@ -264,5 +265,37 @@ func TestCRC32CombineRandomSplits(t *testing.T) {
 				t.Fatalf("iteration=%d block=%d: valid random block was rejected", iteration, i)
 			}
 		}
+	}
+}
+
+func TestStreamMetadataPrefixBoundsAndChecksums(t *testing.T) {
+	payload := streamTestData(maxSegmentBytes)
+	frame := newSlotFrame(31, slotStream, payload[slotStreamPrefixBytes:])
+	frame.prefix = payload[:slotStreamPrefixBytes]
+	encoded := frame.encode()
+	// The largest metadata prefix fits within the size already used for inline descriptions.
+	if len(encoded) > base64.StdEncoding.EncodedLen(slotHeaderLen+slotInlineLimit) {
+		t.Fatal("description exceeded the existing inline envelope")
+	}
+	got, ok := decodeSlot(encoded)
+	if !ok || got.seq != frame.seq || got.mode != slotStream || !bytes.Equal(got.prefix, frame.prefix) || !got.holds(payload[slotStreamPrefixBytes:]) {
+		t.Fatal("prefix, media size, or checksum changed on the wire")
+	}
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[16] != slotStreamPrefix {
+		t.Fatal("the new format was marked as ordinary streaming")
+	}
+	for _, offset := range []int{slotHeaderLen, len(raw) - slotStreamPrefixBytes - 1, len(raw) - 1} {
+		corrupt := bytes.Clone(raw)
+		corrupt[offset] ^= 1
+		if _, ok := decodeSlot(base64.StdEncoding.EncodeToString(corrupt)); ok {
+			t.Fatalf("accepted broken metadata at byte %d", offset)
+		}
+	}
+	if _, ok := decodeSlot(base64.StdEncoding.EncodeToString(raw[:len(raw)-1])); ok {
+		t.Fatal("accepted a truncated prefix")
 	}
 }
