@@ -53,42 +53,16 @@ func TestSlotBatchAccountsBytesAndRequestsAcrossInputChunks(t *testing.T) {
 	}
 }
 
-func TestSlotBatchBudgetLearnsPublicationCapacityAndPreservesOutages(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		b := newSlotBatchWindow(1024, 64)
-		for range latencyWindowWarm {
-			b.observe(0, time.Second)
-		}
-		if b.budget != b.window*b.unit {
-			t.Fatal("latency without publication capacity changed the cold budget")
-		}
-		for range 20 {
-			time.Sleep(100 * time.Millisecond)
-			b.observe(b.unit, time.Second)
-		}
-		if b.budget != 11*b.unit {
-			t.Fatalf("healthy 10 KiB/s budget=%d, want %d", b.budget, 11*b.unit)
-		}
-		time.Sleep(20 * time.Second)
-		b.observe(b.unit, 4*time.Second)
-		if b.budget != 11*b.unit {
-			t.Fatal("a publication outage erased demonstrated capacity")
-		}
-		for range 40 {
-			time.Sleep(25 * time.Millisecond)
-			b.observe(b.unit, time.Second)
-		}
-		if b.budget != b.window*b.unit {
-			t.Fatal("higher useful capacity did not restore the ordinary ceiling")
-		}
-		for range 20 {
-			time.Sleep(500 * time.Millisecond)
-			b.observe(b.unit, time.Second)
-		}
-		if b.budget != bodyGateMin*b.unit {
-			t.Fatal("sustained lower capacity did not reach the bounded minimum")
-		}
-	})
+func TestSlotBatchModestBurstSharesCreditsWithSmallRequests(t *testing.T) {
+	const buffered = 167230
+	b := newSlotBatchWindow(defaultSegmentBytes, 64)
+	if got := b.frameSize(buffered, 4096, 2, defaultSegmentBytes); got != slotInlineLimit || b.planned != buffered-slotInlineLimit {
+		t.Fatal("a modest burst with available byte/request credit was forced into media")
+	}
+	b = newSlotBatchWindow(defaultSegmentBytes, 64)
+	if got := b.frameSize(buffered, b.budget, 11, defaultSegmentBytes); got != buffered {
+		t.Fatal("actual byte backlog was ignored to force a modest burst inline")
+	}
 }
 
 func TestSlotBatchSmallSegmentsAndRingsStayBounded(t *testing.T) {
@@ -108,6 +82,8 @@ type batchTestSlots struct {
 	*memSlots
 	release   chan struct{}
 	streaming bool
+	warm      int64
+	latency   time.Duration
 }
 
 func (s *batchTestSlots) throttled() int64       { return 0 }
@@ -116,13 +92,89 @@ func (s *batchTestSlots) streamingEnabled() bool { return s.streaming }
 func (s *batchTestSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
 	frame, ok := decodeSlot(description)
 	if ok && (frame.mode == slotInline || frame.mode == slotMedia || frame.mode == slotStream) {
+		var release <-chan struct{}
+		var tick <-chan time.Time
+		if frame.seq < s.warm {
+			timer := time.NewTimer(s.latency)
+			defer timer.Stop()
+			tick = timer.C
+		} else {
+			release = s.release
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-s.release:
+		case <-release:
+		case <-tick:
 		}
 	}
 	return s.memSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotWriterSparseTrafficDoesNotForceModestBurstIntoMedia(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		store := &batchTestSlots{memSlots: newMemSlots(), release: make(chan struct{}), streaming: true, warm: 32, latency: 700 * time.Millisecond}
+		p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+		ring, err := makeRing(ctx, store, "sparse", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := newSlotWriter(ctx, store, ring.Up, p)
+		defer func() { cancel(); w.wait() }()
+		control := bytes.Repeat([]byte{1}, 89)
+		for range store.warm {
+			if _, err := w.Write(control); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Second)
+			w.wg.Wait()
+		}
+		for range 2 {
+			if _, err := w.Write(control); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(3 * p.flushInterval)
+		}
+		synctest.Wait()
+		w.mu.Lock()
+		first, pending, budget := w.seq, w.pendingUploadBytes, w.batch.budget
+		w.mu.Unlock()
+		if first != store.warm+2 || pending != 2*len(control) || budget != slotWriteInflight*slotInlineLimit {
+			t.Fatalf("sparse traffic consumed capacity: seq=%d pending=%d budget=%d", first, pending, budget)
+		}
+		payload := randomPayload(167230)
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		w.mu.Lock()
+		result := w.gates[first%int64(len(w.gates))]
+		inline := result != nil && result.accountedBytes == slotInlineLimit && result.inlinePlannedBytes == len(payload)-slotInlineLimit
+		w.mu.Unlock()
+		if !inline {
+			t.Fatal("sparse publication demand converted a fitting burst into media")
+		}
+		close(store.release)
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if len(store.bodies) != 0 {
+			t.Fatal("a fitting burst still required media retrieval")
+		}
+		var got []byte
+		for seq := first; seq < w.seq; seq++ {
+			frame, ok := decodeSlot(store.descs[w.slotID(seq)])
+			if !ok || frame.seq != seq || frame.mode != slotInline {
+				t.Fatalf("invalid ordered inline frame %d", seq)
+			}
+			got = append(got, frame.data...)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatal("inline planning lost, duplicated, or reordered burst bytes")
+		}
+	})
 }
 
 func TestSlotWriterBacklogBatchingPreservesBytesAndSmallSuffix(t *testing.T) {

@@ -761,13 +761,9 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		return
 	}
 	put := time.Since(putAt)
-	if mode != slotInline || w.batch != nil {
+	if mode != slotInline {
 		w.mu.Lock()
-		if mode != slotInline {
-			w.uplink.observe(put, bodyGateMin, cap(w.slots))
-		} else {
-			w.batch.observe(len(chunk), put)
-		}
+		w.uplink.observe(put, bodyGateMin, cap(w.slots))
 		w.mu.Unlock()
 	}
 	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)

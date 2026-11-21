@@ -509,15 +509,23 @@ window while the old work is still outstanding. An accepted inline burst retains
 its byte-counted plan across later flushes, so changing pressure does not turn its
 remaining suffix into media halfway through the burst.
 
-The cold ordinary byte allowance is one normal upload window of inline payloads
-(12 times 14 KiB by default). After 24 successful inline publication samples and a
-complete throughput interval, it follows recent peak publication capacity times
-the healthy latency floor plus one inline frame. Latency uses the 5th percentile
-of 256 samples, and capacity uses the last eight complete latency-length intervals.
-The allowance stays between six and twelve inline payload sizes, capped by the
-normal window/ring size; configured smaller segment sizes are respected. An empty
+The ordinary byte allowance is one normal upload window of inline payloads
+(12 times 14 KiB by default), capped by ring depth; configured smaller segment
+sizes are respected. It is resource credit, not an estimate of application demand.
+Sparse control writes must not lower it: their publication rate measures how little
+the application sent, not how much a full inline upload window can carry. An empty
 publisher can still admit the existing window-plus-half-window fresh inline burst.
-Idle/outage gaps do not erase demonstrated publication capacity.
+The separate bulk upload latency controller continues to handle measured congestion.
+
+The November 21 10:07–10:22 client log contains streamed frames around 160 KiB
+whose media retrieval alone takes about one second. The previous demand-based
+inline estimator could reduce the allowance to 84 KiB after sparse control traffic,
+forcing an otherwise fitting burst through media. Removing that estimator preserves
+the existing byte/request backlog checks and committed burst plans, without new
+timeouts, polling changes, files, ranges, or recovery requests. Actual inline/media
+traffic and quota units can change; replacing media with inline fan-out can increase
+metadata/upload requests. Matched server logs and live playback are needed to measure
+the benefit, not just the client-wide frame timings.
 
 Unplanned backlogged bulk uses media and the full configured aggregation target,
 allowing later chunks to coalesce rather than repeatedly creating inline waves.
