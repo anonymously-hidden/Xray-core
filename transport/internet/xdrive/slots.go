@@ -69,9 +69,10 @@ var (
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
 
-	slotReadAhead      int64 = 11
-	slotReadAheadPoll        = 40 * time.Millisecond
-	slotReadAheadBurst       = 500 * time.Millisecond
+	slotFrontierProbeAhead int64 = 3
+	slotReadAhead          int64 = 11
+	slotReadAheadPoll            = 40 * time.Millisecond
+	slotReadAheadBurst           = 500 * time.Millisecond
 )
 
 var slotWriteInflight = 12
@@ -1153,15 +1154,16 @@ type slotReader struct {
 	// hitAt is when a segment last came and gap the time between them, activeAt
 	// when a segment came, was seen coming or Wake. Nothing for the eager window
 	// is idle, and active is closed when that ends
-	hitAt      time.Time
-	gap        time.Duration
-	activeAt   time.Time
-	active     chan struct{}
-	frontier   int64
-	frontierAt time.Time // last advance of the observed description frontier
-	err        error
-	stop       context.CancelFunc
-	reads      atomic.Int64
+	hitAt           time.Time
+	gap             time.Duration
+	activeAt        time.Time
+	active          chan struct{}
+	frontier        int64
+	frontierAt      time.Time // last advance of the observed description frontier
+	frontierChanged chan struct{}
+	err             error
+	stop            context.CancelFunc
+	reads           atomic.Int64
 	// headReads and tailReads split reads by the role the fetch had when the
 	// walk started; staleReads counts valid frames of another lap, the normal
 	// not-ready answer of a ring slot; emptyReads counts 404 and empty
@@ -1198,30 +1200,31 @@ func newSlotReader(ctx context.Context, store slotStore, table slotTable, p para
 	}
 	runCtx, stop := context.WithCancel(ctx)
 	r := &slotReader{
-		ctx:          runCtx,
-		stop:         stop,
-		store:        store,
-		table:        table,
-		params:       p,
-		head:         head,
-		started:      len(first) > 0,
-		ch:           make(chan []byte, max(p.concurrency, 1)),
-		wake:         make(chan struct{}, 1),
-		acks:         make(chan struct{}, 1),
-		grow:         make(chan struct{}, 1),
-		frontier:     -1,
-		frontierAt:   time.Now(),
-		hitAt:        time.Now(),
-		activeAt:     time.Now(),
-		active:       make(chan struct{}),
-		tailMin:      slotTailMin,
-		tailMax:      slotTailMax,
-		huntFloor:    slotHuntFloor,
-		huntCeiling:  slotHuntCeiling,
-		ackRetry:     slotAckRetry,
-		stallTimeout: slotStallTimeout,
-		ackDelay:     ackDelay,
-		lazy:         table.lazy,
+		ctx:             runCtx,
+		stop:            stop,
+		store:           store,
+		table:           table,
+		params:          p,
+		head:            head,
+		started:         len(first) > 0,
+		ch:              make(chan []byte, max(p.concurrency, 1)),
+		wake:            make(chan struct{}, 1),
+		acks:            make(chan struct{}, 1),
+		grow:            make(chan struct{}, 1),
+		frontier:        -1,
+		frontierAt:      time.Now(),
+		frontierChanged: make(chan struct{}),
+		hitAt:           time.Now(),
+		activeAt:        time.Now(),
+		active:          make(chan struct{}),
+		tailMin:         slotTailMin,
+		tailMax:         slotTailMax,
+		huntFloor:       slotHuntFloor,
+		huntCeiling:     slotHuntCeiling,
+		ackRetry:        slotAckRetry,
+		stallTimeout:    slotStallTimeout,
+		ackDelay:        ackDelay,
+		lazy:            table.lazy,
 	}
 	if r.lazy {
 		r.seen = make([]bool, len(table.Slots))
@@ -1435,6 +1438,10 @@ func (r *slotReader) reach(seq int64) {
 	if grown {
 		r.frontier = seq
 		r.frontierAt = time.Now()
+		if r.frontierChanged != nil {
+			close(r.frontierChanged)
+			r.frontierChanged = make(chan struct{})
+		}
 	}
 	r.mu.Unlock()
 	if grown {
@@ -1632,7 +1639,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					return
 				}
 				descriptionCtx, cancelDescription = newDescriptionContext()
-				hunt = slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), observations: hunt.observations, present: hunt.present}
+				hunt = slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), observations: hunt.observations, present: hunt.present, frontierProbe: hunt.frontierProbe}
 			}
 		case err == nil && !ok && description != "":
 			// A present but undecodable description for this slot is not idle;
@@ -1740,15 +1747,16 @@ type slotDescriptionResult struct {
 }
 
 type slotDescriptionHunt struct {
-	results      chan slotDescriptionResult
-	outstanding  int
-	lastLaunch   time.Time  // retained across observations and tail promotion
-	spread       connSpread // keeps overlapped head reads on different connections
-	last         slotDescriptionResult
-	seen         bool
-	err          error
-	observations uint64
-	present      uint64
+	results       chan slotDescriptionResult
+	outstanding   int
+	lastLaunch    time.Time  // retained across observations and tail promotion
+	spread        connSpread // keeps overlapped head reads on different connections
+	last          slotDescriptionResult
+	seen          bool
+	err           error
+	observations  uint64
+	present       uint64
+	frontierProbe bool // at most one evidence-based overlapping read per hunt
 }
 
 // Frame-aware stores validate the complete size and checksum before returning;
@@ -1881,8 +1889,29 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		}
 	}
 	admit()
+	_, drive := r.store.(throttleStore)
 	for {
+		var frontierChanged <-chan struct{}
+		if drive && !head && !pending.frontierProbe && pending.outstanding == 1 {
+			r.mu.Lock()
+			near := seq > r.head && seq <= r.head+slotFrontierProbeAhead
+			evidence := near && r.frontier > seq && r.frontierAt.After(pending.lastLaunch)
+			if near {
+				frontierChanged = r.frontierChanged
+			}
+			r.mu.Unlock()
+			// A verified later frame is specific evidence that the peer is
+			// publishing here. An older in-flight read can still return the
+			// previous lap; start one fresh read without discarding either.
+			if evidence && budget() > 1 {
+				pending.frontierProbe = true
+				launch()
+				frontierChanged = nil
+			}
+		}
 		select {
+		case <-frontierChanged:
+			continue
 		case res := <-pending.results:
 			pending.outstanding--
 			if isAuthError(res.err) {
@@ -1902,6 +1931,11 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 				r.emptyReads.Add(1)
 			}
 			if !head {
+				frame, ok := decodeSlot(res.description)
+				if pending.outstanding > 0 && (res.err != nil || !ok || frame.seq != seq) {
+					// A miss from one read says nothing about its newer sibling.
+					continue
+				}
 				return res.description, res.err
 			}
 			pending.last, pending.seen = res, true

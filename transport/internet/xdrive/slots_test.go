@@ -1887,3 +1887,92 @@ func TestSlotMediaCancelsDescriptionSiblingsAndIsolatesRetries(t *testing.T) {
 		}
 	})
 }
+
+func TestDriveSlotReaderRefreshesStaleNearReadOnLaterFrame(t *testing.T) {
+	for _, cooldown := range []bool{false, true} {
+		t.Run("cooldown="+strconv.FormatBool(cooldown), func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				var gapReads atomic.Int32
+				base := newMemSlots()
+				p := paramsFromConfig(&Config{Concurrency: 64})
+				ring, err := makeRing(ctx, base, "frontier", p)
+				if err != nil {
+					cancel()
+					t.Fatal(err)
+				}
+				put := func(seq int, data string) {
+					t.Helper()
+					if err := base.setSlot(ctx, ring.Up.Slots[seq], newSlotFrame(int64(seq), slotInline, []byte(data)).encode(), nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				store := &frontierTestSlots{&controlledSlots{memSlots: base, desc: func(ctx context.Context, id string) (string, error) {
+					if id == ring.Up.Slots[3] {
+						// Unlike the older gap read, this request reaches the
+						// snapshot point after the peer's burst is visible.
+						if err := batchTestWait(ctx, 200*time.Millisecond); err != nil {
+							return "", err
+						}
+					}
+					desc, err := base.readDescription(ctx, id)
+					if id != ring.Up.Slots[2] {
+						return desc, err
+					}
+					delay := 100 * time.Millisecond
+					if gapReads.Add(1) == 1 {
+						// Drive took an empty snapshot but its response is still
+						// in flight when both missing bytes become visible.
+						delay = 1200 * time.Millisecond
+					}
+					if waitErr := batchTestWait(ctx, delay); waitErr != nil {
+						return "", waitErr
+					}
+					return desc, err
+				}}, cooldown}
+				r := newSlotReader(ctx, store, ring.Up, p, []byte("start"))
+				defer func() { cancel(); r.wait() }()
+				if got := string(<-r.chunks()); got != "start" {
+					t.Fatal(got)
+				}
+				began := time.Now()
+				time.Sleep(slotTailMin + time.Millisecond)
+				if gapReads.Load() != 1 {
+					t.Fatal("expected one stale read in flight before publication")
+				}
+				put(2, "gap")
+				put(3, "after")
+				// Keep sequence 2 out of the ordinary head hunt. It must be
+				// prefetched while the preceding sequence is still missing.
+				time.Sleep(400 * time.Millisecond)
+				if cooldown && gapReads.Load() != 1 {
+					t.Fatal("successor started an extra read during quota recovery")
+				}
+				put(1, "head")
+				want := "headgapafter"
+				var got string
+				for len(got) < len(want) {
+					chunk, ok := <-r.chunks()
+					if !ok {
+						t.Fatal(r.Err())
+					}
+					got += string(chunk)
+				}
+				elapsed := time.Since(began)
+				t.Logf("ordered burst delivered at %v; gap reads=%d", elapsed, gapReads.Load())
+				if got != want || (!cooldown && (elapsed > 600*time.Millisecond || gapReads.Load() != 2)) {
+					t.Fatalf("unexpected burst delivery: got %q in %v with %d gap reads", got, elapsed, gapReads.Load())
+				}
+			})
+		})
+	}
+}
+
+type frontierTestSlots struct {
+	*controlledSlots
+	inCooldown bool
+}
+
+func (*frontierTestSlots) throttled() int64           { return 0 }
+func (s *frontierTestSlots) cooling() bool            { return s.inCooldown }
+func (*frontierTestSlots) lastRateLimitAt() time.Time { return time.Time{} }
