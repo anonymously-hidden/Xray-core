@@ -926,7 +926,7 @@ func TestSlotRampedBurstSplitsInline(t *testing.T) {
 	for _, c := range []struct {
 		pieces int
 		media  bool
-	}{{1 + slotWriteInflight/2, false}, {2 + slotWriteInflight/2, true}} {
+	}{{1 + slotInlineWriteInflight/2, false}, {1 + slotInlineWriteInflight, true}} {
 		t.Run(strconv.Itoa(c.pieces), func(t *testing.T) {
 			driveClock(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
@@ -941,8 +941,12 @@ func TestSlotRampedBurstSplitsInline(t *testing.T) {
 				w.mu.Lock()
 				w.size = p.segmentBytes
 				w.mu.Unlock()
-				// all permits but one stay with uploads that never finish
-				for range slotWriteInflight - 1 {
+				window := slotInlineWriteInflight
+				if c.media {
+					window = slotWriteInflight
+				}
+				// Leave one permit in the selected publication class.
+				for range window - 1 {
 					w.slots <- struct{}{}
 				}
 				payload := randomPayload(c.pieces * slotInlineLimit)

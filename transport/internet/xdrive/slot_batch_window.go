@@ -1,14 +1,34 @@
 package xdrive
 
+const slotInlineBurstWaves = 2
+
 // The writer locks this controller. Inline plans reserve a complete buffered burst.
 type slotBatchWindow struct {
 	unit, window, budget int
+	burstBudget          int
 	planned              int
 }
 
 func newSlotBatchWindow(size, depth int) *slotBatchWindow {
-	unit, window := min(size, slotInlineLimit), min(depth, slotWriteInflight)
-	return &slotBatchWindow{unit: unit, window: window, budget: unit * window}
+	unit, window := min(size, slotInlineLimit), min(depth, slotInlineWriteInflight)
+	return &slotBatchWindow{
+		unit: unit, window: window, budget: unit * window,
+		burstBudget: unit * min(depth, slotInlineBurstWaves*window),
+	}
+}
+
+func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
+	budget := b.budget
+	frames := b.window + b.window/2
+	// Spare upload capacity can cover two waves without another media GET.
+	if outstanding <= b.budget/2 && active <= b.window/2 {
+		budget, frames = b.burstBudget, b.burstBudget/b.unit
+	}
+	return buffered <= budget-outstanding && (buffered+b.unit-1)/b.unit <= frames-active
+}
+
+func (b *slotBatchWindow) inlineNext(buffered, outstanding, active int) bool {
+	return buffered > 0 && (buffered <= 4*b.unit || b.planned > 0 || b.fits(buffered, outstanding, active))
 }
 
 func (b *slotBatchWindow) frameSize(buffered, outstanding, active, maximum int) int {
@@ -16,15 +36,8 @@ func (b *slotBatchWindow) frameSize(buffered, outstanding, active, maximum int) 
 		b.planned = max(0, b.planned-buffered)
 		return buffered
 	}
-	if b.planned == 0 {
-		budget := b.budget
-		if outstanding == 0 && active == 0 {
-			budget = (b.window + b.window/2) * b.unit
-		}
-		requests := (buffered + b.unit - 1) / b.unit
-		if buffered <= budget-outstanding && requests <= b.window+b.window/2-active {
-			b.planned = buffered
-		}
+	if b.planned == 0 && b.fits(buffered, outstanding, active) {
+		b.planned = buffered
 	}
 	if b.planned > 0 {
 		n := min(buffered, b.planned, b.unit)

@@ -32,7 +32,8 @@ const (
 	// slotInlineLimit up to segmentBytes
 	inlineRampSegments = 8
 	// Stable browsing suffixes retain two batching ticks before an early flush.
-	slotInlineStableTicks = 2
+	slotInlineStableTicks   = 2
+	slotInlineWriteInflight = 16
 
 	// Bulk uploads use a wider window once a deep ring is warm. Media reads
 	// have bounded lookahead for mixed traffic too. Small rings retain their
@@ -290,16 +291,17 @@ type slotWriteResult struct {
 	// These observations are immutable once the upload worker is assigned.
 	// The buffer episode can outlive extracted prefixes, so its age bounds
 	// the selected bytes' residence time rather than measuring each byte.
-	bufferEpisodeAt       time.Time
-	selectedAt            time.Time
-	assignedAt            time.Time
-	permitWait            time.Duration // cumulative full-window waits, including mu reacquisition
-	bufferBytes           int           // input buffer before extracting this chunk
-	localOutstandingBytes int           // buffered plus assigned/not-yet-completed upload bytes
-	inlineBudgetBytes     int
-	inlinePlannedBytes    int
-	accountedBytes        int
-	accounted             bool // direct upload callers may not have enqueued/accounted this result
+	bufferEpisodeAt        time.Time
+	selectedAt             time.Time
+	assignedAt             time.Time
+	permitWait             time.Duration // cumulative full-window waits, including mu reacquisition
+	bufferBytes            int           // input buffer before extracting this chunk
+	localOutstandingBytes  int           // buffered plus assigned/not-yet-completed upload bytes
+	inlineBudgetBytes      int
+	inlineBurstBudgetBytes int
+	inlinePlannedBytes     int
+	accountedBytes         int
+	accounted              bool // direct upload callers may not have enqueued/accounted this result
 }
 
 func slotWriteElapsed(start, end time.Time) time.Duration {
@@ -567,6 +569,9 @@ func (w *slotWriter) readyToFlush() bool {
 func (w *slotWriter) writeWindow() int {
 	depth := len(w.table.Slots)
 	base := min(depth, slotWriteInflight)
+	if w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots)) {
+		return w.batch.window
+	}
 	if depth < slotBulkDepth || w.bulkSegments < 2*depth || w.bulkLimited {
 		return base
 	}
@@ -653,10 +658,10 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	}
 
 	n := min(len(w.buf), w.size)
-	inlineBudget, inlinePlanned := -1, -1
+	inlineBudget, inlineBurstBudget, inlinePlanned := -1, -1, -1
 	if w.batch != nil {
 		n = w.batch.frameSize(len(w.buf), w.pendingUploadBytes, len(w.slots)-1, w.segmentBytes)
-		inlineBudget, inlinePlanned = w.batch.budget, w.batch.planned
+		inlineBudget, inlineBurstBudget, inlinePlanned = w.batch.budget, w.batch.burstBudget, w.batch.planned
 		if n > slotInlineLimit {
 			w.size, w.full = w.segmentBytes, 0
 		}
@@ -701,17 +706,18 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	idx := int(seq % int64(len(w.table.Slots)))
 	w.pendingUploadBytes += n
 	prev, result := w.gates[idx], &slotWriteResult{
-		done:                  make(chan struct{}),
-		bufferEpisodeAt:       bufferEpisodeAt,
-		selectedAt:            selectedAt,
-		assignedAt:            time.Now(),
-		permitWait:            permitWait,
-		bufferBytes:           bufferBytes,
-		localOutstandingBytes: len(w.buf) + w.pendingUploadBytes,
-		inlineBudgetBytes:     inlineBudget,
-		inlinePlannedBytes:    inlinePlanned,
-		accountedBytes:        n,
-		accounted:             true,
+		done:                   make(chan struct{}),
+		bufferEpisodeAt:        bufferEpisodeAt,
+		selectedAt:             selectedAt,
+		assignedAt:             time.Now(),
+		permitWait:             permitWait,
+		bufferBytes:            bufferBytes,
+		localOutstandingBytes:  len(w.buf) + w.pendingUploadBytes,
+		inlineBudgetBytes:      inlineBudget,
+		inlineBurstBudgetBytes: inlineBurstBudget,
+		inlinePlannedBytes:     inlinePlanned,
+		accountedBytes:         n,
+		accounted:              true,
 	}
 	w.gates[idx] = result
 	w.wg.Add(1)
@@ -768,17 +774,18 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	}
 	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)
 	localOutstandingBytes, bufferBytes := -1, -1
-	inlineBudget, inlinePlanned := -1, -1
+	inlineBudget, inlineBurstBudget, inlinePlanned := -1, -1, -1
 	if !result.assignedAt.IsZero() {
 		localOutstandingBytes, bufferBytes = result.localOutstandingBytes, result.bufferBytes
-		inlineBudget, inlinePlanned = result.inlineBudgetBytes, result.inlinePlannedBytes
+		inlineBudget, inlineBurstBudget, inlinePlanned = result.inlineBudgetBytes, result.inlineBurstBudgetBytes, result.inlinePlannedBytes
 	}
 	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
 		" mode=", mode, " await=", awaited, " put=", put,
 		" buffer-episode-age=", bufferEpisodeAge, " upload-permit-wait=", permitWait,
 		" upload-queue=", queueWait, " prefetch-setup=", prefetchSetup,
 		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes,
-		" inline-budget-bytes=", inlineBudget, " inline-planned-bytes=", inlinePlanned)
+		" inline-budget-bytes=", inlineBudget, " inline-burst-budget-bytes=", inlineBurstBudget,
+		" inline-planned-bytes=", inlinePlanned)
 }
 
 func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {

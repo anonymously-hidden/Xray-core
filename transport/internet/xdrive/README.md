@@ -510,12 +510,28 @@ its byte-counted plan across later flushes, so changing pressure does not turn i
 remaining suffix into media halfway through the burst.
 
 The ordinary byte allowance is one normal upload window of inline payloads
-(12 times 14 KiB by default), capped by ring depth; configured smaller segment
+(16 times 14 KiB by default), capped by ring depth; configured smaller segment
 sizes are respected. It is resource credit, not an estimate of application demand.
 Sparse control writes must not lower it: their publication rate measures how little
-the application sent, not how much a full inline upload window can carry. An empty
-publisher can still admit the existing window-plus-half-window fresh inline burst.
+the application sent, not how much a full inline upload window can carry.
 The separate bulk upload latency controller continues to handle measured congestion.
+
+A lightly loaded publisher can reserve up to two normal inline upload waves,
+capped by ring depth (32 times 14 KiB, or 448 KiB, by default). This requires no
+more than half the normal request window and half its byte allowance already in
+use. The new burst and outstanding bytes must fit that ceiling, and outstanding
+requests reduce its frame credit. Inline publication has its own 16-request limit;
+normal bulk admission remains 12 and its warmed adaptive ceiling remains 24. The
+second inline wave waits for returned permits. A busy publisher retains its
+one-wave byte allowance and request-pressure rule. Accepted plans remain
+committed, but later input does not inherit unused burst credit automatically.
+
+This targets the extra media-GET stage for modest bursts, not idle peer production
+or outages. In the November 21 10:54 Twitch interval, a 192,207-byte frame waited
+1.95 s for its first block while its media read took 0.93 s, with no admission wait.
+The client alone cannot separate earlier production/upload from Drive visibility.
+The larger inline allowance can avoid media retrieval when real producer-side
+pressure permits; it does not claim to establish or remove every buffering cause.
 
 The November 21 10:07–10:22 client log contains streamed frames around 160 KiB
 whose media retrieval alone takes about one second. The previous demand-based
@@ -527,21 +543,62 @@ traffic and quota units can change; replacing media with inline fan-out can incr
 metadata/upload requests. Matched server logs and live playback are needed to measure
 the benefit, not just the client-wide frame timings.
 
+Admission previews the next publication class without committing a burst plan.
+This lets a committed inline burst use the inline limit even after the aggregation
+target has grown, but prevents a larger unplanned media upload from inheriting that
+limit. This separation is necessary when input arrives in smaller chunks: enlarging
+only the byte allowance would leave the old 12-upload bottleneck in place. Drive's
+backend permit ceilings, range geometry, and download/recovery concurrency stay
+unchanged. Other storage backends retain their original scheduling.
+
 Unplanned backlogged bulk uses media and the full configured aggregation target,
 allowing later chunks to coalesce rather than repeatedly creating inline waves.
 Small suffixes remain inline; bursts of at most four inline payloads also retain
 inline publication instead of spending a media GET on a short body. Existing
-flush ticks, stable-suffix admission, upload limits, bulk latency window, range
+flush ticks, stable-suffix admission, bulk upload limits/latency window, range
 plans, wire formats, and ACK/reuse fences are unchanged. Other slot stores retain
 their original batching rule.
 
-Write logs add `inline-budget-bytes` (ordinary allowance) and
+Write logs add `inline-budget-bytes` (ordinary allowance),
+`inline-burst-budget-bytes` (light-load two-wave ceiling), and
 `inline-planned-bytes` (committed inline bytes remaining after this assignment).
-A fresh committed burst can exceed the ordinary allowance. Non-Drive or
+A lightly loaded committed burst can exceed the ordinary allowance. Non-Drive or
 unassigned observations report `-1`. Publication completion is not proof of peer
 visibility, and these are transport measurements, not browser/player deadlines.
 Media conversion can increase GET units for individual bursts even when it reduces
 upload fragmentation; no universal quota saving or playback improvement is claimed.
+
+The published Drive limits were rechecked through the supplied local SOCKS proxy:
+325,000 units/minute/user/project and 1,000,000 units/minute/project, with metadata
+GETs costing 5, edits 50, and media GETs 200. The supplied client windows peak near
+30,000 units/minute and contain no confirmed rate limits. Converting all 19
+size-eligible media frames in the 95-second Twitch interval would add about 6,110
+combined publication/one-discovery units under those prices at the 448 KiB ceiling:
+12,100 additional server publication units minus 5,990 client retrieval units.
+This is a size-only counterfactual, not actual eligibility or full accounting:
+repeated metadata reads,
+both peers, other applications, grandfathered quotas, and backend throttling still
+matter. No per-request payload limit, backend permit ceiling, media-download
+concurrency, or hedge budget is raised; only inline publication admission is wider.
+
+There is no new quota limiter, persistent ledger, or request-admission behavior.
+Concurrency and ring sizes do not bound requests per minute: faster responses and
+additional carriers can spend more units with the same constants. A complete
+client-plus-server worst-case ceiling cannot be guaranteed from this client log.
+Both endpoints' dispatched units (including retries, hedges, and cleanup) and other
+applications must be counted against the shared 325,000-unit limit. The existing
+Drive cooldown and quota-retry handling remain unchanged.
+
+Keep a 64-slot ring for this workload. Inline admission tops out at 16 and a fresh
+two-wave plan at 32 frames; media lookahead tops out at 20 segment sizes and can
+adapt lower. A deeper ring does not widen these windows or shorten Drive response
+latency. It also requires more object creation/cleanup when fully used and delays
+the two-lap bulk warm-up (128 full bulk frames at depth 64; 192 at depth 96).
+Consider 96 only as a measured experiment if logs demonstrate sustained slot-reuse
+`await` stalls while the peer drains promptly—not as a buffering fix or quota-safety
+guarantee. The supported ring-depth cap remains 256; it is not a recommendation.
+The current client capture has only four nonzero writer `await` observations, all
+under one millisecond; there is no client-side ring-reuse bottleneck in this trace.
 
 ### Shared-owner live-ring cleanup fence
 
