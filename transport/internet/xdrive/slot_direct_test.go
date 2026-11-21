@@ -128,7 +128,7 @@ func TestDriveDirectMediaWriterRequiresClientOffer(t *testing.T) {
 	})
 }
 
-func TestDriveDirectMediaDefaultSession(t *testing.T) {
+func TestDriveProgressiveMediaDefaultSession(t *testing.T) {
 	t.Setenv("XRAY_XDRIVE_DIRECT_MEDIA", "")
 	drive := newFakeDrive(t)
 	settings := drive.settings(t)
@@ -137,8 +137,8 @@ func TestDriveDirectMediaDefaultSession(t *testing.T) {
 	defer cleanup()
 	reader := client.(*Conn).reader.(*slotReader)
 	writer := server.(*Conn).writer.(*slotWriter)
-	if !reader.table.directMedia || !writer.table.directMedia {
-		t.Fatal("default session did not negotiate direct media in both directions")
+	if !reader.table.progressiveMedia || !writer.table.progressiveMedia {
+		t.Fatal("default session did not negotiate progressive downstream media")
 	}
 
 	data := bytes.Repeat([]byte("d"), defaultSegmentBytes)
@@ -152,18 +152,18 @@ func TestDriveDirectMediaDefaultSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := <-written; err != nil || !bytes.Equal(got, data) {
-		t.Fatalf("default direct transfer failed: %v", err)
+		t.Fatalf("default progressive transfer failed: %v", err)
 	}
 	drive.mu.Lock()
 	defer drive.mu.Unlock()
 	found := false
 	for _, file := range drive.files {
-		if frame, ok := decodeSlot(file.description); ok && frame.mode == slotDirectMedia {
+		if frame, ok := decodeSlot(file.description); ok && frame.mode == slotStream && frame.size+len(frame.prefix) == len(data) {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatal("no direct frame was published in the default session")
+		t.Fatal("no streaming frame was published in the default session")
 	}
 }
 
@@ -176,7 +176,7 @@ func TestDriveDirectMediaCanBeDisabled(t *testing.T) {
 	defer cleanup()
 	reader := client.(*Conn).reader.(*slotReader)
 	writer := server.(*Conn).writer.(*slotWriter)
-	if reader.table.directMedia || writer.table.directMedia {
+	if reader.table.directMedia || writer.table.directMedia || reader.table.progressiveMedia || writer.table.progressiveMedia {
 		t.Fatal("disabled session unexpectedly negotiated direct media")
 	}
 }

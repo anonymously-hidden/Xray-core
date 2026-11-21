@@ -209,26 +209,28 @@ func (f slotFrame) holds(body []byte) bool {
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
-// watermark of its reader. name, lazy and streamPrefix are local, not serialized.
+// watermark of its reader. name, lazy and capability flags are local, not serialized.
 type slotTable struct {
-	Slots        []string `json:"s"`
-	Watermark    string   `json:"w"`
-	name         string
-	lazy         bool
-	streamPrefix bool
-	directMedia  bool
+	Slots            []string `json:"s"`
+	Watermark        string   `json:"w"`
+	name             string
+	lazy             bool
+	streamPrefix     bool
+	directMedia      bool
+	progressiveMedia bool
 }
 
 // ring is what a client announces a session with, the tables are named from
 // its side. Lazy rings create their slots on first write instead of up front.
 type ring struct {
-	Up            slotTable `json:"u"`
-	Down          slotTable `json:"d"`
-	First         []byte    `json:"first,omitempty"`
-	Lazy          bool      `json:"lazy,omitempty"`
-	DirectMedia   bool      `json:"directMedia,omitempty"`
-	StreamPrefix  bool      `json:"streamPrefix,omitempty"` // downstream reader also accepts a verified metadata prefix
-	StreamVersion uint32    `json:"stream,omitempty"`       // receiver capability, not a v1 watermark change
+	Up               slotTable `json:"u"`
+	Down             slotTable `json:"d"`
+	First            []byte    `json:"first,omitempty"`
+	Lazy             bool      `json:"lazy,omitempty"`
+	ProgressiveMedia bool      `json:"progressiveMedia,omitempty"` // prefer one progressively verified media download
+	DirectMedia      bool      `json:"directMedia,omitempty"`
+	StreamPrefix     bool      `json:"streamPrefix,omitempty"` // downstream reader also accepts a verified metadata prefix
+	StreamVersion    uint32    `json:"stream,omitempty"`       // receiver capability, not a v1 watermark change
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -823,7 +825,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	awaited := time.Since(began)
 	putAt := time.Now()
 	var prefix []byte
-	if mode == slotStream && w.table.directMedia && len(chunk) <= slotDirectMediaMax {
+	if mode == slotStream && w.table.directMedia && !w.table.progressiveMedia && len(chunk) <= slotDirectMediaMax {
 		mode = slotDirectMedia
 	}
 	if mode == slotStream && result.inlinePrefix {
@@ -1296,6 +1298,7 @@ type slotFetch struct {
 	ready        chan struct{}
 	streamReady  chan struct{}
 	stream       *slotStreamBuffer
+	progressive  bool      // published with streamReady
 	firstBlockAt time.Time // run-owned first verified delivery, before whole-frame ACK
 	delivery     streamDeliveryTiming
 	// promoted is closed when the segment becomes the head
@@ -1603,9 +1606,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					f.stream.credit = permit
 					permit.received(f.prefixBytes)
 					frame.prefix = nil
+					f.progressive = r.table.progressiveMedia && frame.size+f.prefixBytes <= slotDirectMediaMax
 					close(f.streamReady)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
+					if f.progressive {
+						bodyCtx = context.WithValue(bodyCtx, progressiveMediaKey{}, true)
+					}
 					timing := &bodyReadTiming{}
 					bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
 					if r.isHead(seq) {

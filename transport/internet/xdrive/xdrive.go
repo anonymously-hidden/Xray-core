@@ -535,6 +535,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			r.StreamPrefix, r.Down.streamPrefix = true, true
 			r.DirectMedia = os.Getenv("XRAY_XDRIVE_DIRECT_MEDIA") != "0"
 			r.Down.directMedia = r.DirectMedia
+			r.ProgressiveMedia, r.Down.progressiveMedia = r.DirectMedia, r.DirectMedia
 		}
 		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
@@ -946,6 +947,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 				capable.configureStreaming(session, r.StreamVersion == 1)
 				r.Down.streamPrefix = r.StreamVersion == 1 && r.StreamPrefix
 				r.Down.directMedia = r.StreamVersion == 1 && r.DirectMedia
+				r.Down.progressiveMedia = r.Down.directMedia && r.ProgressiveMedia
 			}
 			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
 			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)

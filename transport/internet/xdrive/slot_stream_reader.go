@@ -177,6 +177,14 @@ func (r *slotReader) deliverStream(ctx context.Context, f *slotFetch) (bool, err
 				}
 				f.delivery.queued(start, now)
 				f.permit.deliver(len(data))
+				if f.progressive {
+					// Handing off a verified block is useful forward progress
+					// even if HTTP completion is still seconds away. Keep
+					// discovery active without training whole-frame cadence.
+					r.mu.Lock()
+					r.touch()
+					r.mu.Unlock()
+				}
 			case <-ctx.Done():
 				return false, ctx.Err()
 			}

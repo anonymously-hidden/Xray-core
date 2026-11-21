@@ -253,14 +253,21 @@ queued. Speculative descriptions do not hedge. Description recovery allows one
 concurrent hedge per session, one dispatch per hedge, and no hedges for one minute
 after a confirmed live rate limit. Each layer has a bounded hedge budget. Recent
 403/429 rate limits also suppress media hedges and reduce new frames to one range.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cf8fa32b6219364979e04b13c6b35546c9fc289ca59ea1263ca1cb09a97868fa -->
+
 Media duplicates likewise get one dispatch, not their own retry loop. All Drive
 read duplicates recheck active status and applicable progress at dispatch admission,
 so a resolved head-block gap, wire progress or retry recovery can suppress a queued
-duplicate. Primary retries are unchanged,
-but later retry attempts do not acquire another hedge; recovery latency after a
-failed first attempt can therefore differ. Tracked streaming heads may wait for
+duplicate. Legacy reads only hedge the first dispatch. For progressive
+media, a dispatched application retry can use the frame's one rescue if it is
+still unused. No recovery clock runs during retry backoff or admission, and
+internal HTTP replays are still excluded. Tracked streaming heads may wait for
 existing token replenishment; legacy spent timers do not. Recovery does not wait
 out a quota cooldown to dispatch a duplicate.
+
+<!-- /coderabbit-ai-generated:v1 -->
 `hedge-deferrals` counts legacy timer-based nonhead recovery opportunities, not
 saved API calls. Tracked streaming generation/budget waits are not included in
 that counter; compare actual requests/units and block waits instead. Promotion

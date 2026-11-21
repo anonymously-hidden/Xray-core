@@ -87,7 +87,8 @@ type bodyProgressKey struct{}
 
 type attemptKey struct{}
 
-// Hedge only the first dispatch; admission waits and retries are excluded.
+// Hedge the first dispatch by default. Progressive media can retain one unused
+// rescue across dispatched application retries, excluding backoff and admission.
 
 type (
 	readProgressKey     struct{}
@@ -104,6 +105,7 @@ type readHedgeGate struct {
 type driveReadProgress struct {
 	mu         sync.Mutex
 	dispatched chan struct{}
+	retrying   chan struct{} // nonnil only for progressive media primaries
 	started    bool
 	pending    bool
 	dispatchAt time.Time
@@ -118,6 +120,13 @@ func (p *driveReadProgress) dispatch() {
 		p.started, p.pending = true, true
 		p.progressAt = p.dispatchAt
 		close(p.dispatched)
+	} else if p.retrying != nil {
+		p.pending = true
+		p.progressAt = p.dispatchAt
+		select {
+		case p.retrying <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -797,6 +806,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	firstTry := time.Now()
 	refunded := 0
 	rejected := 0
+	retriedMissingBody := false
 	for attempt := 0; attempt-refunded < maxAttempts; attempt++ {
 		if attempt > 0 {
 			mediaTiming.reject()
@@ -1183,6 +1193,15 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			} else if stop {
 				return 0, nil, lastErr
 			}
+			continue
+		}
+		// A verified stream already has valid metadata for this slot. Its
+		// body may briefly lag publication. Retry one miss on the primary;
+		// a persistently missing slot or a speculative read still fails.
+		if resp.StatusCode == http.StatusNotFound && media != nil && media.stream != nil && !singleAttempt && !retriedMissingBody {
+			retriedMissingBody = true
+			lastErr = errNotFound
+			failedConn = selected.Load()
 			continue
 		}
 		if retryableStatus(resp.StatusCode) {
@@ -2962,7 +2981,10 @@ type (
 	mediaPromotionKey struct{}
 )
 
-type mediaDeliveryKey struct{}
+type (
+	mediaDeliveryKey    struct{}
+	progressiveMediaKey struct{}
+)
 
 func mediaHead(ctx context.Context) bool {
 	if ctx.Value(mediaHeadKey{}) != nil {
@@ -2982,22 +3004,31 @@ type driveMediaRequest struct {
 	seq              int64
 	client           *http.Client
 	rescue           bool
+	progressive      bool
 	direct           *slotFrame // expected envelope for a full direct-media object
 	stream           *driveRangeStream
 	progress         *driveRangeProgress
 }
 
 type driveRangeProgress struct {
-	mu   sync.Mutex
-	next int
+	mu         sync.Mutex
+	next       int
+	verifiedAt time.Time
 }
 
 func (p *driveRangeProgress) verified(start, end int) {
 	p.mu.Lock()
 	if start == p.next {
 		p.next = end
+		p.verifiedAt = time.Now()
 	}
 	p.mu.Unlock()
+}
+
+func (p *driveRangeProgress) remainingSinceVerified(delay time.Duration) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return delay - time.Since(p.verifiedAt)
 }
 
 func (p *driveRangeProgress) resume(r driveMediaRequest) driveMediaRequest {
@@ -3094,14 +3125,16 @@ func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r d
 	if !mediaHead(ctx) {
 		return 0, false, changed
 	}
-	if next == r.size {
-		remaining, active := primary.remainingSinceDispatch(delay)
-		return remaining, active, changed
-	}
-	if next < r.start || next >= r.end || waitAt.IsZero() {
+	// After the last block, keep the EOF fence eligible for recovery too.
+	if next != r.size && (next < r.start || next >= r.end || waitAt.IsZero()) {
 		return 0, false, changed
 	}
 	remaining, active := primary.remainingSinceDispatch(delay)
+	if r.progressive {
+		// A healthy paced download may outlive its initial dispatch threshold.
+		// Rescue only after verified data, not just wire activity, stops.
+		remaining = max(remaining, r.progress.remainingSinceVerified(delay))
+	}
 	return remaining, active, changed
 }
 
@@ -3116,6 +3149,9 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	primary := &driveReadProgress{dispatched: make(chan struct{})}
 	delivery, tracked := ctx.Value(mediaDeliveryKey{}).(func() (int, <-chan struct{}, time.Time))
 	tracked = tracked && delivery != nil && r.stream != nil && r.stream.frame.mode == slotStream
+	if tracked && r.progressive {
+		primary.retrying = make(chan struct{}, 1)
+	}
 	hedgeDelay := slotBodyHedge
 	gate := readHedgeGate{primary: primary, delay: hedgeDelay}
 	if tracked {
@@ -3139,6 +3175,11 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		request := r
 		requestCtx := ctx
 		if hedge {
+			if r.progressive {
+				// Prefix blocks have already been verified and offered. The
+				// independent lane only needs to fill the remaining suffix.
+				request = r.progress.resume(r)
+			}
 			request.client = s.bulkClient
 			request.rescue = true
 			request.progress = nil
@@ -3189,7 +3230,8 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			return
 		}
 		if _, active := primary.remainingSinceDispatch(hedgeDelay); !active {
-			recoveryStopped = true
+			// Progressive reads can rearm on the next application retry.
+			recoveryStopped = primary.retrying == nil
 			return
 		}
 		if !mediaHead(ctx) {
@@ -3253,6 +3295,8 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				}
 				hedgeAt = timer.C
 			}
+		case <-primary.retrying:
+			armTracked()
 		case <-frontier:
 			armTracked()
 		case <-budgetChanged:
@@ -3424,7 +3468,8 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 	if ctx.Value(mediaHeadKey{}) != nil {
 		parts = min(parts, s.streamHeadRangeLimit())
 	}
-	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+	progressive := ctx.Value(progressiveMediaKey{}) != nil
+	if progressive || s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
 		parts = 1
 	}
 	if parts > 1 {
@@ -3439,7 +3484,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 		stream.closeAndWait()
 	}()
 	if parts == 1 {
-		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq, stream: stream}
+		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq, stream: stream, progressive: progressive}
 		if len(s.mediaClients) > 0 {
 			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
 		}
