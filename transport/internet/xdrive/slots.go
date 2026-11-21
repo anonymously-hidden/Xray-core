@@ -1659,8 +1659,11 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 							}
 							hunt.probe.result = nil
 						}
-						if direct.size == 0 {
-							direct, bodyErr = store.readDirectSlot(bodyCtx, id, seq)
+						if direct.size != frame.size || direct.crc != frame.crc {
+							if r.isHead(seq) {
+								bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
+							}
+							direct, bodyErr = store.readDirectSlot(bodyCtx, id, frame)
 						}
 						if bodyErr == nil && (direct.size != frame.size || direct.crc != frame.crc) {
 							bodyErr = errors.New("direct media frame does not match its description")

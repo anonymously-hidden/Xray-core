@@ -1199,6 +1199,13 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		if media != nil && media.stream == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
+			if want := media.direct; want != nil && err == nil {
+				// Validate each candidate before it can win and cancel its sibling.
+				got, ok := decodeDirectSlot(payload, want.seq)
+				if !ok || got.size != want.size || got.crc != want.crc {
+					err = errors.New("direct media frame does not match its description")
+				}
+			}
 		}
 		if err != nil {
 			mediaTiming.reject()
@@ -2975,6 +2982,7 @@ type driveMediaRequest struct {
 	seq              int64
 	client           *http.Client
 	rescue           bool
+	direct           *slotFrame // expected envelope for a full direct-media object
 	stream           *driveRangeStream
 	progress         *driveRangeProgress
 }

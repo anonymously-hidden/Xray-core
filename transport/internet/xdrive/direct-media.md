@@ -1,6 +1,6 @@
 <!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:0c3694501a8b2d5ab8aa73a22e008a4b297858fa3840da5a990580fac9d4fae3 -->
+<!-- coderabbit-ai-generated-section:v1:f04055a82c3647f7adc5e443c55542bc2ec05d5302327bd6340e1c7fa02c534e -->
 
 # Direct media
 
@@ -20,8 +20,13 @@ metadata comes first, the client reuses the same download. If the direct read
 misses, the normal metadata path is still available. The first frame after idle
 still needs discovery. Speculation is disabled during quota recovery.
 
-This mode buffers eligible frames until validation and does not divide them
-across media ranges. An unsuccessful speculation can cost an extra media GET.
+This mode buffers eligible frames until validation. When metadata confirms a
+download, the client requests the whole frame from one of four media lanes.
+If that frame blocks ordered delivery and its lane stalls, the existing media
+recovery budget permits one additional GET on a separate lane. The first response
+that passes the sequence, size and checksum checks wins. An unsuccessful
+speculative read can also cost one media GET.
+
 Compare tail latency and Drive quota. To restore the previous streaming mode,
 set `XRAY_XDRIVE_DIRECT_MEDIA=0` on the client and reconnect.
 

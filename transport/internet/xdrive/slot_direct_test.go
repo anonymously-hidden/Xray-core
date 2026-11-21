@@ -33,8 +33,8 @@ type directTestSlots struct {
 	drive *driveStorage
 }
 
-func (s *directTestSlots) readDirectSlot(ctx context.Context, id string, seq int64) (slotFrame, error) {
-	return s.drive.readDirectSlot(ctx, id, seq)
+func (s *directTestSlots) readDirectSlot(ctx context.Context, id string, want slotFrame) (slotFrame, error) {
+	return s.drive.readDirectSlot(ctx, id, want)
 }
 
 func TestDriveDirectMediaReusesSpeculationOrFallsBack(t *testing.T) {
@@ -178,5 +178,60 @@ func TestDriveDirectMediaCanBeDisabled(t *testing.T) {
 	writer := server.(*Conn).writer.(*slotWriter)
 	if reader.table.directMedia || writer.table.directMedia {
 		t.Fatal("disabled session unexpectedly negotiated direct media")
+	}
+}
+
+func TestDirectMediaConfirmedHeadRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		primary, rescue time.Duration
+		stale           bool
+		wantGets        int32
+		want            time.Duration
+	}{
+		{"healthy", 100 * time.Millisecond, 0, false, 1, 100 * time.Millisecond},
+		{"stalled", 21 * time.Second, 100 * time.Millisecond, false, 2, time.Second},
+		{"stale rescue cannot cancel valid primary", 1400 * time.Millisecond, 100 * time.Millisecond, true, 2, 1400 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				data := bytes.Repeat([]byte("v"), 512<<10)
+				frame := newSlotFrame(0, slotDirectMedia, data)
+				var gets atomic.Int32
+				drive := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+					gets.Add(1)
+					d := tc.primary
+					reply := frame
+					if m, _ := req.Context().Value(driveMediaKey{}).(*driveMediaRequest); m != nil && m.rescue {
+						d = tc.rescue
+						if tc.stale {
+							reply.seq++
+						}
+					}
+					if err := batchTestWait(req.Context(), d); err != nil {
+						return nil, err
+					}
+					return memoryResponse(http.StatusOK, string(encodeDirectSlot(reply, data))), nil
+				}))
+				drive.mediaClients = []*http.Client{drive.client}
+				drive.bulkClient = &http.Client{Transport: drive.client.Transport}
+				drive.mediaHedgeTokens = 1
+				for range rangeLatencyMin {
+					drive.mediaLatency[1].note(500 * time.Millisecond)
+				}
+				store := &directTestSlots{drive: drive, controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) { return frame.encode(), nil }}}
+				p := paramsFromConfig(&Config{Concurrency: 8})
+				r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"zero", "one"}, directMedia: true}, params: p, active: make(chan struct{}), activeAt: time.Now(), huntCeiling: slotHuntCeiling, stallTimeout: slotStallTimeout}
+				r.bodies.configure(0, p.segmentBytes, 2)
+				defer func() { cancel(); r.wait() }()
+				f := &slotFetch{ready: make(chan struct{}), streamReady: make(chan struct{}), promoted: make(chan struct{})}
+				start := time.Now()
+				r.fetch(ctx, 0, 0, f)
+				if f.err != nil || !bytes.Equal(f.body, data) || gets.Load() != tc.wantGets || time.Since(start) != tc.want {
+					t.Fatalf("err=%v valid=%v GETs=%d elapsed=%v", f.err, bytes.Equal(f.body, data), gets.Load(), time.Since(start))
+				}
+			})
+		})
 	}
 }

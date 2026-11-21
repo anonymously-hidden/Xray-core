@@ -18,7 +18,7 @@ const (
 type directProbeKey struct{}
 
 type directSlotStore interface {
-	readDirectSlot(context.Context, string, int64) (slotFrame, error)
+	readDirectSlot(context.Context, string, slotFrame) (slotFrame, error)
 }
 
 type directSlotProbe struct {
@@ -42,20 +42,36 @@ func decodeDirectSlot(payload []byte, seq int64) (slotFrame, bool) {
 	return frame, true
 }
 
-func (s *driveStorage) readDirectSlot(ctx context.Context, id string, seq int64) (slotFrame, error) {
+func (s *driveStorage) readDirectSlot(ctx context.Context, id string, want slotFrame) (slotFrame, error) {
 	ctx = context.WithValue(ctx, bodyKey{}, true)
 	ctx = context.WithValue(ctx, maxBodyKey{}, int64(slotHeaderLen+slotDirectMediaMax))
-	status, payload, err := s.do(ctx, http.MethodGet,
-		s.filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil)
+	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+	// Discovery has no trusted size yet. Once metadata identifies the frame,
+	// schedule a single full-object range on the existing media lanes so a
+	// stalled delivery head is eligible for the normal bounded rescue.
+	if want.size != 0 {
+		width := slotHeaderLen + want.size
+		request := driveMediaRequest{end: width, size: width, seq: want.seq, direct: &want}
+		if n := uint32(len(s.mediaClients)); n != 0 {
+			request.client = s.mediaClients[(s.mediaNext.Add(1)-1)%n]
+		}
+		wire, err := s.readMediaRange(ctx, target, request)
+		if err != nil {
+			return slotFrame{}, err
+		}
+		want.data = wire[slotHeaderLen:]
+		return want, nil
+	}
+	status, payload, err := s.do(ctx, http.MethodGet, target, "", nil)
 	if err != nil {
 		return slotFrame{}, err
 	}
 	if status == http.StatusOK {
-		if frame, ok := decodeDirectSlot(payload, seq); ok {
+		if frame, ok := decodeDirectSlot(payload, want.seq); ok {
 			return frame, nil
 		}
 	}
-	return slotFrame{}, errors.New("Drive did not return a complete direct media frame for sequence ", seq)
+	return slotFrame{}, errors.New("Drive did not return a complete direct media frame for sequence ", want.seq)
 }
 
 func (r *slotReader) startDirectProbe(ctx context.Context, seq int64, id string) *directSlotProbe {
@@ -75,7 +91,7 @@ func (r *slotReader) startDirectProbe(ctx context.Context, seq int64, id string)
 	go func() {
 		defer r.wg.Done()
 		defer cancel()
-		frame, _ := store.readDirectSlot(ctx, id, seq)
+		frame, _ := store.readDirectSlot(ctx, id, slotFrame{seq: seq})
 		done <- frame
 	}()
 	return &directSlotProbe{stop: cancel, result: done}
