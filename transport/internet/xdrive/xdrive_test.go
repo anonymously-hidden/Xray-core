@@ -1415,6 +1415,7 @@ func TestInvalidNonemptySlotAnnouncementDoesNotFallBackToWAL(t *testing.T) {
 type cleanupStateStorage struct {
 	Storage
 	fail  bool
+	err   error
 	calls int
 }
 
@@ -1424,6 +1425,9 @@ func (s *cleanupStateStorage) List(context.Context, string) ([]Entry, error) {
 
 func (s *cleanupStateStorage) Delete(context.Context, string) error {
 	s.calls++
+	if s.err != nil {
+		return s.err
+	}
 	if s.fail {
 		return io.ErrUnexpectedEOF
 	}
@@ -1445,6 +1449,25 @@ func TestFailedCleanupPreservesEstablishedAge(t *testing.T) {
 	if err := l.collect(); err != nil || store.calls != 2 || !l.idleSince["dead"].IsZero() {
 		t.Fatal("eligible cleanup did not retry and clear on success")
 	}
+}
+
+func TestLiveSessionFenceRefreshesCleanupAgeWithoutRetry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &cleanupStateStorage{err: errSessionInUse}
+		l := &Listener{ctx: context.Background(), storage: store, params: paramsFromConfig(&Config{}), idleSince: map[string]time.Time{"dead": time.Now().Add(-2 * defaultSessionTTL)}}
+		started := time.Now()
+		if err := l.collect(); err != nil || store.calls != 1 || !l.idleSince["dead"].Equal(started) {
+			t.Fatal("a shared live session was treated as failed or stale cleanup")
+		}
+		if err := l.drop(sessionPrefix("dead")); err != errSessionInUse || store.calls != 2 || time.Now() != started {
+			t.Fatal("the live fence consumed cleanup retries or retry sleeps")
+		}
+		l.idleSince["dead"] = started.Add(-2 * defaultSessionTTL)
+		l.finishDrop(sessionPrefix("dead"), errSessionInUse)
+		if !l.idleSince["dead"].Equal(started) {
+			t.Fatal("queued cleanup retained an age predating observed live ownership")
+		}
+	})
 }
 
 func TestCollectPrunesOrphanAnnouncementWarnings(t *testing.T) {

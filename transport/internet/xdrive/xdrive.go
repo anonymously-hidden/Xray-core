@@ -536,8 +536,14 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			warmSpares(streamSettings, config, p)
 		}
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
+		releaseSession, err := holdStorageSession(storage, session)
+		if err != nil {
+			storage.Close()
+			return nil, err
+		}
 		conn := newSlotConn(context.Background(), slots, r.Up, r.Down, p, nil, func() {
 			storage.Close()
+			releaseSession()
 		})
 		writer := conn.writer.(*slotWriter)
 		writer.first = make(chan []byte, 1)
@@ -855,7 +861,7 @@ func (l *Listener) finishDrop(name string, err error) {
 		if l.idleSince == nil {
 			l.idleSince = make(map[string]time.Time)
 		}
-		if err == nil || l.idleSince[session].IsZero() {
+		if err == nil || err == errSessionInUse || l.idleSince[session].IsZero() {
 			l.idleSince[session] = time.Now()
 		}
 	}
@@ -868,6 +874,8 @@ func (l *Listener) drop(name string) error {
 	for attempt := 0; attempt < cleanupMaxRetries && ctx.Err() == nil; attempt++ {
 		if err := l.storage.Delete(ctx, name); err == nil {
 			return nil
+		} else if err == errSessionInUse {
+			return err
 		} else {
 			last = err
 			errors.LogDebug(ctx, "failed to drop ", name, ": ", err)
@@ -916,8 +924,14 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 	if err != nil {
 		return nil
 	}
+	releaseSession, err := holdStorageSession(storage, session)
+	if err != nil {
+		storage.Close()
+		return nil
+	}
 	onClose := func() {
 		storage.Close()
+		releaseSession()
 		l.mu.Lock()
 		delete(l.active, session)
 		l.mu.Unlock()
@@ -934,6 +948,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 		}
 		if len(announce) > 0 {
 			storage.Close()
+			releaseSession()
 			return nil
 		}
 	}
@@ -1042,13 +1057,17 @@ func (l *Listener) collect() error {
 			case <-time.After(l.collectPause):
 			}
 		}
-		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil {
+		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil && err != errSessionInUse {
 			if first == nil {
 				first = err
 			}
-		} else {
+		} else if err == nil {
 			l.mu.Lock()
 			delete(l.idleSince, session)
+			l.mu.Unlock()
+		} else {
+			l.mu.Lock()
+			l.idleSince[session] = time.Now()
 			l.mu.Unlock()
 		}
 	}

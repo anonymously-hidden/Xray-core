@@ -500,6 +500,63 @@ Drive visibility, or cross-flow blocking inside a shared mux carrier. Twitch or
 other live-streaming improvement requires a matched live workload; none is claimed
 from unit tests alone. No timeout or polling constants are changed.
 
+### Backlog-aware inline publication
+
+Drive writers use `slot_batch_window.go` to decide whether another buffered burst
+fits inline. Admission accounts for buffered bytes, assigned/incomplete upload
+bytes, and outstanding upload requests; a new input chunk does not get a fresh
+window while the old work is still outstanding. An accepted inline burst retains
+its byte-counted plan across later flushes, so changing pressure does not turn its
+remaining suffix into media halfway through the burst.
+
+The cold ordinary byte allowance is one normal upload window of inline payloads
+(12 times 14 KiB by default). After 24 successful inline publication samples and a
+complete throughput interval, it follows recent peak publication capacity times
+the healthy latency floor plus one inline frame. Latency uses the 5th percentile
+of 256 samples, and capacity uses the last eight complete latency-length intervals.
+The allowance stays between six and twelve inline payload sizes, capped by the
+normal window/ring size; configured smaller segment sizes are respected. An empty
+publisher can still admit the existing window-plus-half-window fresh inline burst.
+Idle/outage gaps do not erase demonstrated publication capacity.
+
+Unplanned backlogged bulk uses media and the full configured aggregation target,
+allowing later chunks to coalesce rather than repeatedly creating inline waves.
+Small suffixes remain inline; bursts of at most four inline payloads also retain
+inline publication instead of spending a media GET on a short body. Existing
+flush ticks, stable-suffix admission, upload limits, bulk latency window, range
+plans, wire formats, and ACK/reuse fences are unchanged. Other slot stores retain
+their original batching rule.
+
+Write logs add `inline-budget-bytes` (ordinary allowance) and
+`inline-planned-bytes` (committed inline bytes remaining after this assignment).
+A fresh committed burst can exceed the ordinary allowance. Non-Drive or
+unassigned observations report `-1`. Publication completion is not proof of peer
+visibility, and these are transport measurements, not browser/player deadlines.
+Media conversion can increase GET units for individual bursts even when it reduces
+upload fragmentation; no universal quota saving or playback improvement is claimed.
+
+### Shared-owner live-ring cleanup fence
+
+Drive slot connections pin their session in the shared storage owner through
+connection teardown and worker joining. Whole-session cleanup must acquire an
+exclusive fence before listing or deleting ring objects. Another listener sharing
+that owner cannot collect a pinned ring, and a connection cannot bind a ring whose
+cleanup has already started. A live rejection refreshes cleanup's locally observed
+inactivity age without spending API requests or retry sleeps. Announcement cleanup
+and unrelated sessions remain independent; released state is reclaimed.
+
+The supplied November 21 server log matches both client sessions and shows
+downstream assigned/buffered payload reaching 6 MiB. Both directions of the first
+ring later report missing objects. It does not identify the deleting actor, so the
+fence is not claimed to establish or fix that incident's cause. It protects only
+listeners sharing one owner in one process—not other processes, external deletion,
+permission loss, or a restart. Missing slots still fail closed; IDs are not blindly
+recreated or changed underneath the peer.
+
+Mux/carrier isolation remains outside this implementation. The carrier still
+delivers one ordered stream, so ready small frames can remain blocked behind bulk.
+For downstream batching benefits, upgrade the server writer as well as the client.
+
 ### Google Drive code layout
 
 The Drive backend, media recovery, streaming negotiation, and telemetry live in

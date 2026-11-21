@@ -154,6 +154,13 @@ func transferSessionStorage(storage Storage) (Storage, error) {
 	return session, nil
 }
 
+func holdStorageSession(storage Storage, session string) (func(), error) {
+	if s, ok := storage.(interface{ holdSession(string) (func(), error) }); ok {
+		return s.holdSession(session)
+	}
+	return func() {}, nil
+}
+
 func closeStorageRoot(storage Storage) error {
 	switch s := storage.(type) {
 	case *templateStorage:

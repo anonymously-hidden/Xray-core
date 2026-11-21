@@ -251,6 +251,7 @@ type driveShared struct {
 	lastRateLimit time.Time
 	throttle      atomic.Int64
 	mediaLatency  [2]rangeLatency // shared, per requested-size class
+	sessionGuard  driveSessionGuard
 	timing        *timingAggregator
 	idPoolState
 
@@ -397,6 +398,67 @@ func (s *driveStorage) session() Storage {
 		}
 	}
 	return st
+}
+
+var errSessionInUse = errors.New("session is live or already being collected")
+
+type driveSessionGuard struct {
+	mu       sync.Mutex
+	sessions map[string]*driveSessionUse
+}
+
+type driveSessionUse struct {
+	active   int
+	cleaning bool
+}
+
+func (g *driveSessionGuard) acquire(prefix string, cleanup bool) (func(), error) {
+	g.mu.Lock()
+	if g.sessions == nil {
+		g.sessions = make(map[string]*driveSessionUse)
+	}
+	use := g.sessions[prefix]
+	if use == nil {
+		use = &driveSessionUse{}
+		g.sessions[prefix] = use
+	}
+	if use.cleaning || cleanup && use.active > 0 {
+		g.mu.Unlock()
+		return nil, errSessionInUse
+	}
+	if cleanup {
+		use.cleaning = true
+	} else {
+		use.active++
+	}
+	g.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if cleanup {
+				use.cleaning = false
+			} else {
+				use.active--
+			}
+			if use.active == 0 && !use.cleaning {
+				delete(g.sessions, prefix)
+			}
+		})
+	}, nil
+}
+
+func (s *driveStorage) holdSession(session string) (func(), error) {
+	return s.sessionGuard.acquire(sessionPrefix(session), false)
+}
+
+func (s *driveStorage) guardSessionCleanup(ctx context.Context, prefix string) (func(), error) {
+	if ctx.Value(cleanupKey{}) != nil && strings.HasPrefix(prefix, streamsDir+"/") &&
+		safeSessionID(strings.TrimPrefix(prefix, streamsDir+"/")) {
+		return s.sessionGuard.acquire(prefix, true)
+	}
+	return func() {}, nil
 }
 
 func flatten(name string) string {
@@ -1855,6 +1917,11 @@ func (s *driveStorage) Delete(parent context.Context, name string) error {
 		return context.Canceled
 	}
 	defer finish()
+	release, err := s.guardSessionCleanup(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer release()
 	flat := flatten(name)
 	remove := s.deleteID
 	if ctx.Value(cleanupKey{}) != nil {

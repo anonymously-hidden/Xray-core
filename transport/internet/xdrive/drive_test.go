@@ -808,6 +808,90 @@ func memoryDrive(rt http.RoundTripper) *driveStorage {
 
 type failingDriveBody struct{}
 
+func TestDriveCleanupSharesLiveSessionFenceWithoutRequests(t *testing.T) {
+	var requests atomic.Int32
+	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return memoryResponse(http.StatusOK, `{"files":[]}`), nil
+	}))
+	t.Cleanup(s.closeWork)
+	other := &driveStorage{driveShared: s.driveShared, client: s.client, inflight: make(chan struct{}, 64), reserved: make(chan struct{}, 8)}
+	first, err := holdStorageSession(s, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first()
+	second, err := holdStorageSession(other, "live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second()
+	ctx := context.WithValue(context.Background(), cleanupKey{}, true)
+	if err := other.Delete(ctx, sessionPrefix("live")); err != errSessionInUse || requests.Load() != 0 {
+		t.Fatal("another session lease could list/delete a live ring")
+	}
+	first()
+	first()
+	if err := s.Delete(ctx, sessionPrefix("live")); err != errSessionInUse || requests.Load() != 0 {
+		t.Fatal("releasing one pin cleared another live pin")
+	}
+	if err := other.Delete(ctx, announceName("live", time.Now())); err != nil || requests.Load() != 1 {
+		t.Fatal("live-ring protection blocked independent announcement cleanup")
+	}
+	if err := other.Delete(ctx, sessionPrefix("liveness")); err != nil || requests.Load() != 2 {
+		t.Fatal("live-ring protection matched an unrelated session prefix")
+	}
+	second()
+	if err := other.Delete(ctx, sessionPrefix("live")); err != nil || requests.Load() != 3 {
+		t.Fatal("the closed ring was never eligible for cleanup")
+	}
+	s.sessionGuard.mu.Lock()
+	defer s.sessionGuard.mu.Unlock()
+	if len(s.sessionGuard.sessions) != 0 {
+		t.Fatal("session cleanup or released pins leaked guard state")
+	}
+}
+
+func TestDriveSessionPinCannotRaceCleanupIO(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+		close(entered)
+		select {
+		case <-release:
+			return memoryResponse(http.StatusOK, `{"files":[]}`), nil
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		done <- s.Delete(context.WithValue(ctx, cleanupKey{}, true), sessionPrefix("collecting"))
+	}()
+	defer func() { cancel(); wg.Wait(); s.closeWork() }()
+	<-entered
+	if _, err := holdStorageSession(s, "collecting"); err != errSessionInUse {
+		t.Fatal("a live connection was exposed while its ring was being deleted")
+	}
+	other, err := holdStorageSession(s, "other")
+	if err != nil {
+		t.Fatal("cleanup of one ring serialized all session construction")
+	}
+	other()
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	pin, err := holdStorageSession(s, "collecting")
+	if err != nil {
+		t.Fatal("completed cleanup retained its session fence")
+	}
+	pin()
+}
+
 func (failingDriveBody) Read([]byte) (int, error) { return 0, io.ErrUnexpectedEOF }
 func (failingDriveBody) Close() error             { return nil }
 

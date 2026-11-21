@@ -296,6 +296,8 @@ type slotWriteResult struct {
 	permitWait            time.Duration // cumulative full-window waits, including mu reacquisition
 	bufferBytes           int           // input buffer before extracting this chunk
 	localOutstandingBytes int           // buffered plus assigned/not-yet-completed upload bytes
+	inlineBudgetBytes     int
+	inlinePlannedBytes    int
 	accountedBytes        int
 	accounted             bool // direct upload callers may not have enqueued/accounted this result
 }
@@ -358,6 +360,7 @@ type slotWriter struct {
 	created            []bool
 	gates              []*slotWriteResult // completion and result of the last assigned physical write
 	uplink             latencyWindow      // bulk upload window steered by media put latency; guarded by mu
+	batch              *slotBatchWindow
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -398,6 +401,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 	}
 	if s, ok := store.(throttleStore); ok {
 		w.throttles = s.throttled()
+		w.batch = newSlotBatchWindow(p.segmentBytes, len(table.Slots))
 	}
 	go w.flushLoop()
 	return w
@@ -649,17 +653,21 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	}
 
 	n := min(len(w.buf), w.size)
-	if len(w.buf) > 4*slotInlineLimit {
-		// a burst goes at the full size at once
-		n = min(len(w.buf), w.segmentBytes)
-	}
-	// Count the token acquired above as available to this batch. Fan out
-	// inline if the whole buffer fits in the free tokens and half a window
-	// more, even after the segment size has ramped during an earlier burst:
-	// an inline segment that waits for one upload still arrives before media.
-	free := base - len(w.slots) + 1
-	if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free+base/2 {
-		n = min(len(w.buf), slotInlineLimit, w.segmentBytes)
+	inlineBudget, inlinePlanned := -1, -1
+	if w.batch != nil {
+		n = w.batch.frameSize(len(w.buf), w.pendingUploadBytes, len(w.slots)-1, w.segmentBytes)
+		inlineBudget, inlinePlanned = w.batch.budget, w.batch.planned
+		if n > slotInlineLimit {
+			w.size, w.full = w.segmentBytes, 0
+		}
+	} else {
+		if len(w.buf) > 4*slotInlineLimit {
+			n = min(len(w.buf), w.segmentBytes)
+		}
+		free := base - len(w.slots) + 1
+		if (len(w.buf)+slotInlineLimit-1)/slotInlineLimit <= free+base/2 {
+			n = min(len(w.buf), slotInlineLimit, w.segmentBytes)
+		}
 	}
 	if n >= w.size && w.size < w.segmentBytes {
 		w.full += n / w.size
@@ -700,6 +708,8 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 		permitWait:            permitWait,
 		bufferBytes:           bufferBytes,
 		localOutstandingBytes: len(w.buf) + w.pendingUploadBytes,
+		inlineBudgetBytes:     inlineBudget,
+		inlinePlannedBytes:    inlinePlanned,
 		accountedBytes:        n,
 		accounted:             true,
 	}
@@ -751,21 +761,28 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		return
 	}
 	put := time.Since(putAt)
-	if mode != slotInline {
+	if mode != slotInline || w.batch != nil {
 		w.mu.Lock()
-		w.uplink.observe(put, bodyGateMin, cap(w.slots))
+		if mode != slotInline {
+			w.uplink.observe(put, bodyGateMin, cap(w.slots))
+		} else {
+			w.batch.observe(len(chunk), put)
+		}
 		w.mu.Unlock()
 	}
 	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)
 	localOutstandingBytes, bufferBytes := -1, -1
+	inlineBudget, inlinePlanned := -1, -1
 	if !result.assignedAt.IsZero() {
 		localOutstandingBytes, bufferBytes = result.localOutstandingBytes, result.bufferBytes
+		inlineBudget, inlinePlanned = result.inlineBudgetBytes, result.inlinePlannedBytes
 	}
 	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
 		" mode=", mode, " await=", awaited, " put=", put,
 		" buffer-episode-age=", bufferEpisodeAge, " upload-permit-wait=", permitWait,
 		" upload-queue=", queueWait, " prefetch-setup=", prefetchSetup,
-		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes)
+		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes,
+		" inline-budget-bytes=", inlineBudget, " inline-planned-bytes=", inlinePlanned)
 }
 
 func (w *slotWriter) write(seq int64, mode byte, data []byte) (err error) {
