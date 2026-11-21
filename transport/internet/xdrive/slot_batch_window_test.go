@@ -12,7 +12,7 @@ import (
 
 func TestSlotBatchCommittedBurstSurvivesChangingPressure(t *testing.T) {
 	b := newSlotBatchWindow(defaultSegmentBytes, 64)
-	buffered := slotInlineBurstWaves * slotInlineWriteInflight * slotInlineLimit
+	buffered := 448 << 10
 	for i := 0; buffered > 0; i++ {
 		if got := b.frameSize(buffered, i*slotInlineLimit, min(i, slotInlineWriteInflight-1), defaultSegmentBytes); got != slotInlineLimit {
 			t.Fatalf("committed frame %d became %d-byte media", i, got)
@@ -56,7 +56,7 @@ func TestSlotBatchAccountsBytesAndRequestsAcrossInputChunks(t *testing.T) {
 }
 
 func TestSlotBatchModestBurstSharesCreditsWithSmallRequests(t *testing.T) {
-	for _, buffered := range []int{167230, 192207, 272702, defaultSegmentBytes} {
+	for _, buffered := range []int{167230, 192207, 272702, 420 << 10} {
 		b := newSlotBatchWindow(defaultSegmentBytes, 64)
 		if got := b.frameSize(buffered, 4096, 2, defaultSegmentBytes); got != slotInlineLimit || b.planned != buffered-slotInlineLimit {
 			t.Fatalf("a fitting %d-byte burst with spare credits was forced into media", buffered)
@@ -74,11 +74,11 @@ func TestSlotBatchTwoWaveAllowanceRequiresSpareCredits(t *testing.T) {
 		depth, active         int
 		outstanding, buffered int
 	}{
-		{"request_pressure", 64, slotInlineWriteInflight/2 + 1, 1024, defaultSegmentBytes},
-		{"byte_pressure", 64, 2, slotInlineWriteInflight*slotInlineLimit/2 + 1, defaultSegmentBytes},
-		{"two_wave_ceiling", 64, 0, 0, slotInlineBurstWaves*slotInlineWriteInflight*slotInlineLimit + 1},
+		{"request_pressure", 64, slotInlineWriteInflight/2 + 1, 1024, 420 << 10},
+		{"byte_pressure", 64, 2, slotInlineWriteInflight*slotInlineLimit/2 + 1, 400 << 10},
+		{"two_wave_ceiling", 64, 0, 0, 448<<10 + 1},
 		{"ring_ceiling", 8, 0, 0, 8*slotInlineLimit + 1},
-		{"reserved_request_credit", 64, 2, 1024, (slotInlineBurstWaves*slotInlineWriteInflight - 1) * slotInlineLimit},
+		{"reserved_request_credit", 64, 2, 1024, 31 * slotInlineLimit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newSlotBatchWindow(defaultSegmentBytes, tc.depth)
@@ -129,6 +129,70 @@ func TestSlotWriterInlineAdmissionDoesNotWidenBulkWindow(t *testing.T) {
 	if w.writeWindow() != slotInlineWriteInflight {
 		t.Fatal("a committed inline prefix lost its own admission limit")
 	}
+}
+
+type burstStragglerSlots struct{ *batchTestSlots }
+
+func (s burstStragglerSlots) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if frame, ok := decodeSlot(description); ok && frame.mode == slotInline && frame.seq == 1 && len(frame.data) == slotInlineLimit {
+		if err := batchTestWait(ctx, 4*time.Second); err != nil {
+			return err
+		}
+	}
+	return s.batchTestSlots.setSlot(ctx, id, description, body)
+}
+
+func TestSlotWriterFullBurstAvoidsInlineStraggler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		store := burstStragglerSlots{&batchTestSlots{
+			memSlots: newMemSlots(), warm: 1 << 20,
+			latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
+			descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond,
+		}}
+		p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+		ring, err := makeRing(ctx, store, "inline-straggler", p)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		w := newSlotWriter(ctx, store, ring.Up, p)
+		r := newSlotReader(ctx, store, ring.Up, p, nil)
+		defer func() { cancel(); w.wait(); r.wait() }()
+		payload := randomPayload(defaultSegmentBytes)
+		want := append(payload, []byte("following control bytes")...)
+		began := time.Now()
+		written := make(chan error, 1)
+		go func() { _, err := w.Write(want); written <- err }()
+		var got []byte
+		for len(got) < len(want) {
+			select {
+			case chunk, ok := <-r.chunks():
+				if !ok {
+					t.Fatal("reader ended before control bytes")
+				}
+				got = append(got, chunk...)
+			case <-time.After(8 * time.Second):
+				t.Fatal("ordered delivery stalled")
+			}
+		}
+		if err := <-written; err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("ordered delivery changed bytes: %v", err)
+		}
+		elapsed := time.Since(began)
+		t.Logf("burst plus control delivered in %v", elapsed)
+		if elapsed > 3*time.Second {
+			t.Fatalf("oversized burst held the control suffix for %v", elapsed)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if w.seq != 2 || len(store.bodies) != 1 {
+			t.Fatalf("want one media upload and one inline suffix, got %d payload frames and %d media uploads", w.seq, len(store.bodies))
+		}
+	})
 }
 
 type batchTestSlots struct {
@@ -211,7 +275,7 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 		name   string
 		window int
 		ahead  int64
-	}{{"resume57", 16, 3}, {"upload_only", slotInlineWriteInflight, 3}, {"candidate", slotInlineWriteInflight, slotReadAhead}} {
+	}{{"resume57", 16, 3}, {"upload_only", slotInlineWriteInflight, 3}, {"resume58", slotInlineWriteInflight, slotReadAhead}} {
 		t.Run(tc.name, func(t *testing.T) {
 			previous := slotReadAhead
 			slotReadAhead = tc.ahead
@@ -263,7 +327,7 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 				if store.peak.Load() > int32(tc.window) || tc.name == "resume57" && media != 1 || tc.name != "resume57" && media != 0 {
 					t.Fatal("publication class or upload ceiling changed")
 				}
-				if tc.name == "candidate" && (first > time.Second || time.Since(began) > 1700*time.Millisecond) {
+				if tc.name == "resume58" && (first > time.Second || time.Since(began) > 1700*time.Millisecond) {
 					t.Fatal("a healthy 512 KiB burst still stalled behind media or distant metadata admission")
 				}
 				t.Logf("window=%d ahead=%d first=%v complete=%v media=%d peak=%d", tc.window, tc.ahead, first, time.Since(began), media, store.peak.Load())
@@ -286,7 +350,7 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
 					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond,
 				}
-				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10, SegmentBytes: 448 << 10})
 				ring, err := makeRing(ctx, store, "sustained", p)
 				if err != nil {
 					t.Fatal(err)
@@ -294,7 +358,7 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 				w := newSlotWriter(ctx, store, ring.Up, p)
 				r := newSlotReader(ctx, store, ring.Up, p, nil)
 				defer func() { cancel(); w.wait(); r.wait() }()
-				payload := randomPayload(4 * defaultSegmentBytes)
+				payload := randomPayload(4 * p.segmentBytes)
 				suffix := []byte("browsing control after sustained input")
 				want := append(payload, suffix...)
 				began := time.Now()
@@ -321,7 +385,7 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 				store.mu.Lock()
 				media := len(store.bodies)
 				store.mu.Unlock()
-				burstFrames := (defaultSegmentBytes + slotInlineLimit - 1) / slotInlineLimit
+				burstFrames := (p.segmentBytes + slotInlineLimit - 1) / slotInlineLimit
 				if media != 3 || w.seq != int64(burstFrames+4) {
 					t.Fatalf("backlog renewed inline plans: media=%d frames=%d", media, w.seq)
 				}
@@ -353,14 +417,14 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 				if !ok || end.seq != w.seq || end.mode != slotEnd {
 					t.Fatal("sustained batching lost the ordered terminal frame")
 				}
-				t.Logf("2 MiB plus browsing suffix: frames=%d media=%d complete=%v", w.seq, media, time.Since(began))
+				t.Logf("four segments plus browsing suffix: frames=%d media=%d complete=%v", w.seq, media, time.Since(began))
 			})
 		})
 	}
 }
 
 func TestSlotWriterSparseTrafficDoesNotForceModestBurstIntoMedia(t *testing.T) {
-	for _, size := range []int{167230, 192207, 272702, 420 << 10, defaultSegmentBytes} {
+	for _, size := range []int{167230, 192207, 272702, 420 << 10} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())

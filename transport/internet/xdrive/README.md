@@ -500,6 +500,10 @@ Drive visibility, or cross-flow blocking inside a shared mux carrier. Twitch or
 other live-streaming improvement requires a matched live workload; none is claimed
 from unit tests alone. No timeout or polling constants are changed.
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cb1130080237b200fa011794b9c50d9f224a24bff93b47e8e0076eb7916a9534 -->
+
 ### Backlog-aware inline publication
 
 Drive writers use `slot_batch_window.go` to decide whether another buffered burst
@@ -515,6 +519,34 @@ sizes are respected. It is resource credit, not an estimate of application deman
 Sparse control writes must not lower it: their publication rate measures how little
 the application sent, not how much a full inline upload window can carry.
 The separate bulk upload latency controller continues to handle measured congestion.
+
+#### Current limit for new inline plans
+
+The spare capacity allowance is capped at **32 frames** (448 KiB at the default
+14 KiB inline payload). The 24-request inline window, pressure checks, and
+committed plans still apply. A fresh 512 KiB burst uses the existing media path.
+The 48-frame allowance and 512 KiB inline timings below describe older releases.
+
+In the matched November 21 Twitch capture (client 19:21–19:24), nine inline
+plans of roughly 496–512 KiB occupied 332 slots. During one such plan, reuse
+wait reached 3.67 s; the following media frame waited 3.30 s for an upload
+permit. On another plan a 4.58 s publication held already available frames
+behind it; the largest observed wait behind earlier frames was 3.72 s.
+Both sides logged zero Drive rate-limit responses. Reducing the number of writes
+and ring slots limits this source of ordered stalls. It cannot remove Google's
+response latency, and the media fetch can delay first bytes on healthy bursts.
+
+Using the package's unit estimates, the nine bursts cost 18,260 units for
+332 writes and one metadata read each. Nine media equivalents would cost
+2,295–7,695 units with one to four primary media GETs, before polling, ACKs,
+or retries. This is a request-count comparison rather than a combined quota
+measurement. In a controlled 512 KiB burst with one delayed inline write, the
+full burst plus a small trailing message delivered in 2.10 s versus 4.97 s.
+Live playback with the new cap has not been measured.
+
+#### Earlier tuning and measurements
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 A lightly loaded publisher can reserve up to two normal inline upload waves,
 capped by ring depth (48 times 14 KiB, or 672 KiB, by default). This requires no

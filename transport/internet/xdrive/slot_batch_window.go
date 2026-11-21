@@ -1,6 +1,11 @@
 package xdrive
 
-const slotInlineBurstWaves = 2
+const (
+	slotInlineBurstWaves = 2
+	// Large plans multiply Drive writes and ring occupancy. Keep up to 32
+	// inline frames (448 KiB at the default payload size); use media above it.
+	slotInlineBurstFrames = 32
+)
 
 // The writer locks this controller. Inline plans reserve a complete buffered burst.
 type slotBatchWindow struct {
@@ -13,14 +18,14 @@ func newSlotBatchWindow(size, depth int) *slotBatchWindow {
 	unit, window := min(size, slotInlineLimit), min(depth, slotInlineWriteInflight)
 	return &slotBatchWindow{
 		unit: unit, window: window, budget: unit * window,
-		burstBudget: unit * min(depth, slotInlineBurstWaves*window),
+		burstBudget: unit * min(depth, slotInlineBurstWaves*window, slotInlineBurstFrames),
 	}
 }
 
 func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
 	budget := b.budget
 	frames := b.window + b.window/2
-	// Spare upload capacity can cover two waves without another media GET.
+	// Spare upload capacity can cover a bounded second wave without a media GET.
 	if outstanding <= b.budget/2 && active <= b.window/2 {
 		budget, frames = b.burstBudget, b.burstBudget/b.unit
 	}
