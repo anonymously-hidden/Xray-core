@@ -1976,3 +1976,39 @@ type frontierTestSlots struct {
 func (*frontierTestSlots) throttled() int64           { return 0 }
 func (s *frontierTestSlots) cooling() bool            { return s.inCooldown }
 func (*frontierTestSlots) lastRateLimitAt() time.Time { return time.Time{} }
+
+func TestDriveSlotCleanMissWakesWhenLaterFrameArrives(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var calls atomic.Int32
+		store := &frontierTestSlots{controlledSlots: &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) {
+			if calls.Add(1) == 1 {
+				return "", nil
+			}
+			return newSlotFrame(2, slotInline, []byte("payload")).encode(), nil
+		}}}
+		r := &slotReader{ctx: ctx, store: store, table: slotTable{Slots: []string{"0", "1", "2", "3"}}, params: paramsFromConfig(&Config{}), activeAt: time.Now(), frontier: -1, frontierChanged: make(chan struct{}), tailMax: time.Second}
+		f := &slotFetch{ready: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{})}
+		f.enter()
+		go r.fetch(ctx, 2, 1, f)
+		synctest.Wait()
+		time.Sleep(10 * time.Millisecond)
+		r.reach(1)
+		synctest.Wait()
+		if calls.Load() != 1 {
+			t.Fatal("unrelated progress triggered a read")
+		}
+		r.reach(3)
+		synctest.Wait()
+		select {
+		case <-f.ready:
+			if string(f.body) != "payload" || calls.Load() != 2 {
+				t.Fatal("missing payload or redundant reads")
+			}
+		default:
+			t.Fatal("known gap still sleeping after successor arrived")
+		}
+		r.wait()
+	})
+}

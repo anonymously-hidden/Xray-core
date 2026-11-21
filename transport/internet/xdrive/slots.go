@@ -1735,6 +1735,35 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.quietTailBackoffs.Add(1)
 			}
 		}
+		// If the miss has already returned, the same evidence can advance
+		// the scheduled retry. Keep the original deadline on unrelated wakes.
+		if drive && !head && !idle && b == nil && !hunt.frontierProbe &&
+			(notWritten || err == nil && (description == "" || ok && frame.seq < seq)) {
+			changed, gap := r.gapProgress(seq, hunt.lastLaunch)
+			if changed != nil {
+				timer := time.NewTimer(wait)
+			waitForGap:
+				for {
+					if gap && r.descriptionBudget() > 1 {
+						hunt.frontierProbe = true
+						break
+					}
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-a:
+						break waitForGap
+					case <-timer.C:
+						break waitForGap
+					case <-changed:
+						changed, gap = r.gapProgress(seq, hunt.lastLaunch)
+					}
+				}
+				timer.Stop()
+				continue
+			}
+		}
 		if !r.hold(ctx, wait, a, b) {
 			return
 		}
@@ -1799,6 +1828,31 @@ func (r *slotReader) headOverlapDelay() time.Duration {
 	return min(max(delay, max(4*r.huntCeiling, 100*time.Millisecond)), time.Second)
 }
 
+// Drive already hedges individual slow metadata requests. During quota
+// recovery, overlapping three hunts multiplies attempts without helping
+// visibility; leave existing requests alone but admit only one new read.
+func (r *slotReader) descriptionBudget() int {
+	if s, ok := r.store.(interface {
+		cooling() bool
+		lastRateLimitAt() time.Time
+	}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
+		return 1
+	}
+	return 3
+}
+
+// A later valid description is evidence for retrying a nearby gap, never
+// permission to deliver its bytes. Observe the frontier and its notification
+// under the same lock so publication cannot race registration.
+func (r *slotReader) gapProgress(seq int64, launched time.Time) (<-chan struct{}, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if seq <= r.head || seq-r.head > slotFrontierProbeAhead {
+		return nil, false
+	}
+	return r.frontierChanged, r.frontier > seq && r.frontierAt.After(launched)
+}
+
 func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}, pending *slotDescriptionHunt) (string, error) {
 	r.mu.Lock()
 	head := r.head == seq
@@ -1826,18 +1880,6 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	}
 	if head {
 		hunt()
-	}
-	// Drive already hedges individual slow metadata requests. During quota
-	// recovery, overlapping three hunts multiplies attempts without helping
-	// visibility; leave existing requests alone but admit only one new read.
-	budget := func() int {
-		if s, ok := r.store.(interface {
-			cooling() bool
-			lastRateLimitAt() time.Time
-		}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
-			return 1
-		}
-		return 3
 	}
 
 	// Yield observations for fetch's stall checks without canceling or
@@ -1884,7 +1926,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		// Never hold back a primary. Every additional head read waits from
 		// the latest launch, including a pending tail read on promotion, so
 		// observation yields and Wake cannot refill the overlap at 25ms.
-		if pending.outstanding < budget() && (pending.outstanding == 0 || head && time.Since(pending.lastLaunch) >= r.headOverlapDelay()) {
+		if pending.outstanding < r.descriptionBudget() && (pending.outstanding == 0 || head && time.Since(pending.lastLaunch) >= r.headOverlapDelay()) {
 			launch()
 		}
 	}
@@ -1893,17 +1935,12 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	for {
 		var frontierChanged <-chan struct{}
 		if drive && !head && !pending.frontierProbe && pending.outstanding == 1 {
-			r.mu.Lock()
-			near := seq > r.head && seq <= r.head+slotFrontierProbeAhead
-			evidence := near && r.frontier > seq && r.frontierAt.After(pending.lastLaunch)
-			if near {
-				frontierChanged = r.frontierChanged
-			}
-			r.mu.Unlock()
+			var evidence bool
+			frontierChanged, evidence = r.gapProgress(seq, pending.lastLaunch)
 			// A verified later frame is specific evidence that the peer is
 			// publishing here. An older in-flight read can still return the
 			// previous lap; start one fresh read without discarding either.
-			if evidence && budget() > 1 {
+			if evidence && r.descriptionBudget() > 1 {
 				pending.frontierProbe = true
 				launch()
 				frontierChanged = nil
