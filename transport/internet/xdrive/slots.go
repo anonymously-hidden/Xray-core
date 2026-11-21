@@ -339,7 +339,7 @@ type slotWriteResult struct {
 	inlinePlannedBytes     int
 	accountedBytes         int
 	accounted              bool // direct upload callers may not have enqueued/accounted this result
-	inlinePrefix           bool // start of a media burst on a capable downstream ring
+	inlinePrefix           bool // publish the first bytes in the media frame description
 }
 
 func slotWriteElapsed(start, end time.Time) time.Duration {
@@ -769,6 +769,7 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	w.held = 0
 
 	idx := int(seq % int64(len(w.table.Slots)))
+	inlinePrefix := w.useInlinePrefix(n)
 	w.pendingUploadBytes += n
 	prev, result := w.gates[idx], &slotWriteResult{
 		done:                   make(chan struct{}),
@@ -783,12 +784,34 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 		inlinePlannedBytes:     inlinePlanned,
 		accountedBytes:         n,
 		accounted:              true,
-		inlinePrefix:           w.table.streamPrefix && len(w.slots) == 1 && n >= 2*slotStreamBlockBytes,
+		inlinePrefix:           inlinePrefix,
 	}
 	w.gates[idx] = result
 	w.wg.Add(1)
 	go w.upload(seq, chunk, prev, result)
 	return nil
+}
+
+// Called with mu held, after reserving this frame's upload permit. Prefixes
+// carry useful bytes at metadata time. Limit the expansion to the front of
+// the upload queue, where an earlier handoff is most likely to be useful.
+func (w *slotWriter) useInlinePrefix(n int) bool {
+	if !w.table.streamPrefix || n < 2*slotStreamBlockBytes {
+		return false
+	}
+	if len(w.slots) == 1 {
+		return true
+	}
+	if !w.table.progressiveMedia || n > slotDirectMediaMax || w.pendingUploadBytes > slotDirectMediaMax {
+		return false
+	}
+	if s, ok := w.store.(interface{ cooling() bool }); ok && s.cooling() {
+		return false
+	}
+	if s, ok := w.store.(interface{ lastRateLimitAt() time.Time }); ok && time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+		return false
+	}
+	return true
 }
 
 func (w *slotWriter) slotID(seq int64) string {
@@ -1444,6 +1467,38 @@ func (r *slotReader) run() {
 			}
 		}
 	}
+}
+
+type directSlotStore interface {
+	readDirectSlot(context.Context, string, slotFrame) (slotFrame, error)
+}
+
+type directSlotProbe struct {
+	stop   context.CancelFunc
+	result <-chan slotFrame
+}
+
+func (r *slotReader) startDirectProbe(ctx context.Context, seq int64, id string) *directSlotProbe {
+	store, ok := r.store.(directSlotStore)
+	if !ok || !r.table.directMedia || r.descriptionBudget() == 1 {
+		return nil
+	}
+	r.mu.Lock()
+	followsMedia := seq > 0 && r.head == seq && r.directNext == seq && time.Since(r.hitAt) <= slotReadAheadBurst
+	r.mu.Unlock()
+	if !followsMedia {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithValue(ctx, directProbeKey{}, true), slotDirectProbeTimeout)
+	done := make(chan slotFrame, 1)
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer cancel()
+		frame, _ := store.readDirectSlot(ctx, id, slotFrame{seq: seq})
+		done <- frame
+	}()
+	return &directSlotProbe{stop: cancel, result: done}
 }
 
 func (r *slotReader) isHead(seq int64) bool {

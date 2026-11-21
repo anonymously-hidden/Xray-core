@@ -3052,6 +3052,9 @@ func TestAdaptiveQueuedRescueRechecksDeliveryFrontier(t *testing.T) {
 		if f.rescueGets.Load() != 0 {
 			t.Fatal("queued rescue dispatched after the blocking block became available")
 		}
+		if f.s.mediaHedgeTokens != 1 {
+			t.Fatal("undispatched rescue consumed a token")
+		}
 		f.cancel()
 		if result := <-f.done; !errors.Is(result.err, context.Canceled) {
 			t.Fatalf("cancellation = %v", result.err)

@@ -3,6 +3,8 @@ package xdrive
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math/bits"
+	"time"
 )
 
 const (
@@ -12,6 +14,28 @@ const (
 	slotStreamPrefixBytes = 11 << 10
 	slotStreamBlockBytes  = 32 << 10
 )
+
+const (
+	slotDirectMedia        byte = 7
+	slotDirectMediaMax          = defaultSegmentBytes
+	slotDirectProbeTimeout      = 1250 * time.Millisecond
+)
+
+func encodeDirectSlot(frame slotFrame, data []byte) []byte {
+	return append(frame.header(), data...)
+}
+
+func decodeDirectSlot(payload []byte, seq int64) (slotFrame, bool) {
+	if len(payload) <= slotHeaderLen || len(payload) > slotHeaderLen+slotDirectMediaMax {
+		return slotFrame{}, false
+	}
+	frame, ok := decodeSlotBytes(payload[:slotHeaderLen])
+	if !ok || frame.mode != slotDirectMedia || frame.seq != seq || !frame.holds(payload[slotHeaderLen:]) {
+		return slotFrame{}, false
+	}
+	frame.data = payload[slotHeaderLen:]
+	return frame, true
+}
 
 // streamBlockChecksums covers each fixed-size block, including the final short
 // block. An empty payload has no checksums and is not a valid stream frame.
@@ -91,35 +115,29 @@ func crc32Combine(first, second uint32, secondLen int) uint32 {
 	if secondLen <= 0 {
 		return first
 	}
-	var odd, even [32]uint32
-	odd[0] = crc32.IEEE
-	row := uint32(1)
-	for i := 1; i < len(odd); i++ {
-		odd[i] = row
-		row <<= 1
-	}
-	crc32MatrixSquare(&even, &odd) // Two zero bits.
-	crc32MatrixSquare(&odd, &even) // Four zero bits.
-	for {
-		crc32MatrixSquare(&even, &odd) // Eight zero bits, then powers of bytes.
-		if secondLen&1 != 0 {
-			first = crc32MatrixTimes(&even, first)
-		}
-		secondLen >>= 1
-		if secondLen == 0 {
-			break
-		}
-		crc32MatrixSquare(&odd, &even)
-		if secondLen&1 != 0 {
-			first = crc32MatrixTimes(&odd, first)
-		}
-		secondLen >>= 1
-		if secondLen == 0 {
-			break
-		}
+	for n := uint(secondLen); n != 0; n &= n - 1 {
+		first = crc32MatrixTimes(&crc32BytePowers[bits.TrailingZeros(n)], first)
 	}
 	return first ^ second
 }
+
+// Each matrix advances a CRC by 2^i zero bytes. Preparing the matrices once
+// keeps repeated description polls from rebuilding them for every block.
+var crc32BytePowers = func() [bits.UintSize - 1][32]uint32 {
+	var powers [bits.UintSize - 1][32]uint32
+	var bit, two, four [32]uint32
+	bit[0] = crc32.IEEE
+	for i := 1; i < len(bit); i++ {
+		bit[i] = 1 << (i - 1)
+	}
+	crc32MatrixSquare(&two, &bit)
+	crc32MatrixSquare(&four, &two)
+	crc32MatrixSquare(&powers[0], &four)
+	for i := 1; i < len(powers); i++ {
+		crc32MatrixSquare(&powers[i], &powers[i-1])
+	}
+	return powers
+}()
 
 func crc32MatrixTimes(matrix *[32]uint32, vector uint32) uint32 {
 	var sum uint32

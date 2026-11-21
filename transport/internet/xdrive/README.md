@@ -45,15 +45,24 @@ timings include local checksum processing; they are not pure wire measurements.
 
 ## Verified inline start for Drive media
 
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:cf12cf40ac2afb9ea6fdec6d8e9f416e8dcaeea4550283534e08b962b26a514f -->
+
 Pure inline frames deliver small messages from their metadata, without a media
-GET. For a downstream media frame that starts when the writer has no other
-uploads in flight, a client that advertises `streamPrefix` can read the first
-11 KiB from the metadata of that same multipart upload. The rest is downloaded
-through the existing verified streaming path. The prefix and the media suffix
-each have integrity checks, share one sequence and one slot, and are delivered
-in order. Slot reuse still requires verified EOF of the suffix. The server only
-uses this format when the client advertises both streaming and prefix support;
-older peers keep their existing format.
+GET. A downstream media frame may also carry its first 11 KiB in the metadata of
+its existing multipart upload. The prefix and the media suffix each have
+integrity checks and share one sequence and one slot. The reader can hand off
+the prefix before the media response arrives, but reuse still requires verified
+EOF of the suffix.
+
+With progressive media and prefix support, this also applies to overlapping
+media uploads from 64 to 512 KiB when at most 512 KiB of earlier payload is still
+uploading. The expanded path is disabled during cooldown or for five seconds
+after a rate limit. Peers that offer prefix support without progressive media
+still use it only when no other uploads are outstanding.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 The fast start has no separate upload, slot, metadata request, or extra primary
 media request. Repeated metadata polls can download the prefix more than once.

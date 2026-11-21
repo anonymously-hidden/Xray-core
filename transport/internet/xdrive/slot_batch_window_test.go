@@ -642,3 +642,84 @@ func TestSlotWriterCommittedBurstPublishesInOneWave(t *testing.T) {
 		}
 	})
 }
+
+type overlappingPrefixSlots struct {
+	*batchTestSlots
+	cool bool
+}
+
+func (s overlappingPrefixSlots) cooling() bool { return s.cool }
+
+func (s overlappingPrefixSlots) readFrameStream(ctx context.Context, id string, frame slotFrame, offer func(int, []byte) error) error {
+	body, err := s.readBody(ctx, id)
+	if err != nil {
+		return err
+	}
+	for i := range frame.blocks {
+		start := i * slotStreamBlockBytes
+		if err := offer(i, body[start:start+streamBlockSize(frame.size, i)]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestSlotProgressivePrefixDuringOverlap(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		progressive, cooldown, wantPrefix bool
+	}{
+		{"legacy", false, false, false},
+		{"progressive", true, false, true},
+		{"cooldown", true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store := overlappingPrefixSlots{&batchTestSlots{
+					memSlots: newMemSlots(), streaming: true, warm: 1 << 20,
+					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
+					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond,
+				}, tc.cooldown}
+				p := paramsFromConfig(&Config{Concurrency: 64})
+				ring, err := makeRing(ctx, store, "progressive-overlap", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ring.Down.streamPrefix, ring.Down.progressiveMedia = true, tc.progressive
+				r := newSlotReader(ctx, store, ring.Down, p, nil)
+				w := newSlotWriter(ctx, store, ring.Down, p)
+				defer func() { cancel(); w.wait(); r.wait() }()
+				control := bytes.Repeat([]byte("c"), slotInlineLimit)
+				payload := randomPayload(defaultSegmentBytes)
+				start := time.Now()
+				if _, err := w.Write(control); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := w.Write(payload); err != nil {
+					t.Fatal(err)
+				}
+				if got := receiveStreamChunk(t, r); !bytes.Equal(got, control) {
+					t.Fatal("media overtook earlier control bytes")
+				}
+				got := receiveStreamChunk(t, r)
+				first := time.Since(start)
+				if (len(got) == slotStreamPrefixBytes) != tc.wantPrefix {
+					t.Fatalf("first media chunk was %d bytes at %v", len(got), first)
+				}
+				for len(got) < len(payload) {
+					got = append(got, receiveStreamChunk(t, r)...)
+				}
+				last := time.Since(start)
+				t.Logf("first media=%v complete=%v frames=%d", first, last, w.seq)
+				store.mu.Lock()
+				media := len(store.bodies)
+				store.mu.Unlock()
+				if !bytes.Equal(got, payload) || w.seq != 2 || media != 1 || last-first < 900*time.Millisecond && tc.wantPrefix {
+					t.Fatal("unexpected burst bytes, timing or request count")
+				}
+			})
+		})
+	}
+}

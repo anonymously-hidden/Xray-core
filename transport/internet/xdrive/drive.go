@@ -260,6 +260,7 @@ type driveShared struct {
 	lastRateLimit time.Time
 	throttle      atomic.Int64
 	mediaLatency  [2]rangeLatency // shared, per requested-size class
+	mediaStartup  [2]rangeLatency // dispatch to first verified block for progressive media
 	sessionGuard  driveSessionGuard
 	timing        *timingAggregator
 	idPoolState
@@ -924,6 +925,10 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		admit := func(dispatchCtx context.Context) error {
 			start := time.Now()
 			err := s.waitDispatch(dispatchCtx, cleanupPool != nil && method == http.MethodDelete)
+			if err == nil && media != nil && media.rescueSettled != nil && media.rescueSettled.Swap(true) {
+				// This reservation has already been used or refunded.
+				err = errReadHedgeSkipped
+			}
 			tr.mu.Lock()
 			tr.dispatchWait += time.Since(start)
 			if err == nil {
@@ -1155,6 +1160,9 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		if sample.hasDispatch {
 			sample.dispatch = bodyEnd.Sub(tr.admitted)
+			if media != nil && media.progressive && media.progress != nil {
+				sample.firstVerified = media.progress.firstBlockLatency(tr.admitted)
+			}
 		}
 		tr.mu.Unlock()
 		s.recordTiming(kind, sample)
@@ -1196,13 +1204,21 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			continue
 		}
 		// A verified stream already has valid metadata for this slot. Its
-		// body may briefly lag publication. Retry one miss on the primary;
-		// a persistently missing slot or a speculative read still fails.
-		if resp.StatusCode == http.StatusNotFound && media != nil && media.stream != nil && !singleAttempt && !retriedMissingBody {
-			retriedMissingBody = true
-			lastErr = errNotFound
-			failedConn = selected.Load()
-			continue
+		// The body may lag its verified metadata. An older snapshot may
+		// also be too short for a resumed suffix. Both use the same one
+		// extra retry allowance; speculative requests still never retry.
+		if media != nil && media.stream != nil && !singleAttempt && !retriedMissingBody {
+			missing := resp.StatusCode == http.StatusNotFound
+			staleSuffix := resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && requestMedia.start > media.start
+			if missing || staleSuffix {
+				lastErr = errNotFound
+				if staleSuffix {
+					lastErr = errors.New("Drive could not serve the resumed media suffix")
+				}
+				retriedMissingBody = true
+				failedConn = selected.Load()
+				continue
+			}
 		}
 		if retryableStatus(resp.StatusCode) {
 			lastErr = errors.New("Drive answered ", resp.StatusCode, ": ", string(payload))
@@ -2142,9 +2158,24 @@ func (s *driveStorage) noteMediaRange() {
 	defer s.readHedgeMu.Unlock()
 	before := s.mediaHedgeTokens
 	accrueHedgeToken(&s.mediaHedgeCount, &s.mediaHedgeTokens)
-	if s.mediaHedgeTokens > before && s.mediaHedgeChanged != nil {
+	if s.mediaHedgeTokens > before {
+		s.signalMediaHedgeCreditLocked()
+	}
+}
+
+func (s *driveStorage) signalMediaHedgeCreditLocked() {
+	if s.mediaHedgeChanged != nil {
 		close(s.mediaHedgeChanged)
 		s.mediaHedgeChanged = nil
+	}
+}
+
+func (s *driveStorage) returnMediaHedgeToken() {
+	s.readHedgeMu.Lock()
+	defer s.readHedgeMu.Unlock()
+	if s.mediaHedgeTokens < maxReadHedgeTokens {
+		s.mediaHedgeTokens++
+		s.signalMediaHedgeCreditLocked()
 	}
 }
 
@@ -2166,11 +2197,13 @@ func (s *driveStorage) takeMediaHedgeTokenOrWait() (bool, <-chan struct{}) {
 	return false, s.mediaHedgeChanged
 }
 
+const maxReadHedgeTokens = 6
+
 func accrueHedgeToken(count, tokens *int) {
 	*count++
 	if *count >= 20 {
 		*count = 0
-		if *tokens < 6 {
+		if *tokens < maxReadHedgeTokens {
 			*tokens++
 		}
 	}
@@ -3004,6 +3037,7 @@ type driveMediaRequest struct {
 	seq              int64
 	client           *http.Client
 	rescue           bool
+	rescueSettled    *atomic.Bool // one reservation, settled by dispatch or refund
 	progressive      bool
 	direct           *slotFrame // expected envelope for a full direct-media object
 	stream           *driveRangeStream
@@ -3014,21 +3048,47 @@ type driveRangeProgress struct {
 	mu         sync.Mutex
 	next       int
 	verifiedAt time.Time
+	previousAt time.Time
+	firstAt    time.Time
 }
 
 func (p *driveRangeProgress) verified(start, end int) {
 	p.mu.Lock()
 	if start == p.next {
 		p.next = end
-		p.verifiedAt = time.Now()
+		p.previousAt, p.verifiedAt = p.verifiedAt, time.Now()
+		if p.firstAt.IsZero() {
+			p.firstAt = p.verifiedAt
+		}
 	}
 	p.mu.Unlock()
 }
 
-func (p *driveRangeProgress) remainingSinceVerified(delay time.Duration) time.Duration {
+func (p *driveRangeProgress) firstBlockLatency(dispatchAt time.Time) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return delay - time.Since(p.verifiedAt)
+	if p.firstAt.IsZero() {
+		return 0
+	}
+	return p.firstAt.Sub(dispatchAt)
+}
+
+// Startup, first inter-block wait, and steady delivery have separate clocks.
+func (p *driveRangeProgress) remaining(primary *driveReadProgress, startup, delay time.Duration) (time.Duration, bool) {
+	primary.mu.Lock()
+	defer primary.mu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !primary.pending {
+		return 0, false
+	}
+	if p.verifiedAt.IsZero() || p.verifiedAt.Before(primary.dispatchAt) {
+		return startup - time.Since(primary.dispatchAt), true
+	}
+	if !p.previousAt.IsZero() && !p.previousAt.Before(primary.dispatchAt) {
+		delay = min(delay, max(mediaHedgeFloor, 2*min(p.verifiedAt.Sub(p.previousAt), delay)))
+	}
+	return delay - time.Since(p.verifiedAt), true
 }
 
 func (p *driveRangeProgress) resume(r driveMediaRequest) driveMediaRequest {
@@ -3120,7 +3180,7 @@ func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotF
 	return body, nil
 }
 
-func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r driveMediaRequest, delay time.Duration, delivery func() (int, <-chan struct{}, time.Time)) (time.Duration, bool, <-chan struct{}) {
+func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r driveMediaRequest, startup, delay time.Duration, delivery func() (int, <-chan struct{}, time.Time)) (time.Duration, bool, <-chan struct{}) {
 	next, changed, waitAt := delivery()
 	if !mediaHead(ctx) {
 		return 0, false, changed
@@ -3129,12 +3189,13 @@ func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r d
 	if next != r.size && (next < r.start || next >= r.end || waitAt.IsZero()) {
 		return 0, false, changed
 	}
-	remaining, active := primary.remainingSinceDispatch(delay)
 	if r.progressive {
 		// A healthy paced download may outlive its initial dispatch threshold.
 		// Rescue only after verified data, not just wire activity, stops.
-		remaining = max(remaining, r.progress.remainingSinceVerified(delay))
+		remaining, active := r.progress.remaining(primary, startup, delay)
+		return remaining, active, changed
 	}
+	remaining, active := primary.remainingSinceDispatch(delay)
 	return remaining, active, changed
 }
 
@@ -3152,11 +3213,17 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	if tracked && r.progressive {
 		primary.retrying = make(chan struct{}, 1)
 	}
-	hedgeDelay := slotBodyHedge
+	hedgeDelay := s.mediaHedgeDelay(r)
+	startupDelay := hedgeDelay
+	if r.progressive {
+		if median, ok := s.mediaStartup[rangeClass(r)].median(); ok {
+			startupDelay = min(hedgeDelay, mediaDelayFromMedian(median))
+		}
+	}
 	gate := readHedgeGate{primary: primary, delay: hedgeDelay}
 	if tracked {
 		gate.remaining = func() (time.Duration, bool) {
-			remaining, eligible, _ := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+			remaining, eligible, _ := mediaDeliveryRemaining(ctx, primary, r, startupDelay, hedgeDelay, delivery)
 			return remaining, eligible
 		}
 	} else {
@@ -3182,6 +3249,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			}
 			request.client = s.bulkClient
 			request.rescue = true
+			request.rescueSettled = new(atomic.Bool)
 			request.progress = nil
 			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, gate)
 		} else {
@@ -3190,6 +3258,9 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		}
 		go func() {
 			status, body, err := s.do(context.WithValue(requestCtx, driveMediaKey{}, &request), http.MethodGet, target, "", nil)
+			if hedge && !request.rescueSettled.Swap(true) {
+				s.returnMediaHedgeToken()
+			}
 			if err == nil {
 				switch status {
 				case http.StatusOK, http.StatusPartialContent:
@@ -3238,7 +3309,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			promoted = promotion
 			return
 		}
-		remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+		remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, startupDelay, hedgeDelay, delivery)
 		frontier = changed
 		if !eligible {
 			return
@@ -3266,8 +3337,6 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			}
 		case <-dispatched:
 			dispatched = nil
-			hedgeDelay = s.mediaHedgeDelay(r)
-			gate.delay = hedgeDelay
 			if tracked {
 				armTracked()
 				continue
@@ -3314,7 +3383,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 				continue
 			}
 			if tracked {
-				remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+				remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, startupDelay, hedgeDelay, delivery)
 				if !eligible || remaining > 0 {
 					armTracked()
 					continue
@@ -3448,6 +3517,40 @@ func (s *driveRangeStream) read(request driveMediaRequest, status int, contentRa
 		return nil, errors.New("failed to verify Drive media stream EOF").Base(err)
 	}
 	return nil, nil
+}
+
+type directProbeKey struct{}
+
+func (s *driveStorage) readDirectSlot(ctx context.Context, id string, want slotFrame) (slotFrame, error) {
+	ctx = context.WithValue(ctx, bodyKey{}, true)
+	ctx = context.WithValue(ctx, maxBodyKey{}, int64(slotHeaderLen+slotDirectMediaMax))
+	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+	// Discovery has no trusted size yet. Once metadata identifies the frame,
+	// schedule a single full-object range on the existing media lanes so a
+	// stalled delivery head is eligible for the normal bounded rescue.
+	if want.size != 0 {
+		width := slotHeaderLen + want.size
+		request := driveMediaRequest{end: width, size: width, seq: want.seq, direct: &want}
+		if n := uint32(len(s.mediaClients)); n != 0 {
+			request.client = s.mediaClients[(s.mediaNext.Add(1)-1)%n]
+		}
+		wire, err := s.readMediaRange(ctx, target, request)
+		if err != nil {
+			return slotFrame{}, err
+		}
+		want.data = wire[slotHeaderLen:]
+		return want, nil
+	}
+	status, payload, err := s.do(ctx, http.MethodGet, target, "", nil)
+	if err != nil {
+		return slotFrame{}, err
+	}
+	if status == http.StatusOK {
+		if frame, ok := decodeDirectSlot(payload, want.seq); ok {
+			return frame, nil
+		}
+	}
+	return slotFrame{}, errors.New("Drive did not return a complete direct media frame for sequence ", want.seq)
 }
 
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error {
@@ -3646,25 +3749,26 @@ var kindNames = [kindCount]string{
 type watermarkWriteKey struct{}
 
 type timingSample struct {
-	total       time.Duration
-	waitCool    time.Duration
-	waitPool    time.Duration
-	waitToken   time.Duration
-	waitConn    time.Duration
-	dialTLS     time.Duration
-	send        time.Duration
-	server      time.Duration
-	body        time.Duration
-	reused      bool
-	newConn     bool
-	hedge       bool
-	won         bool
-	hasConn     bool
-	hasDial     bool
-	hasSend     bool
-	hasServer   bool
-	dispatch    time.Duration
-	hasDispatch bool
+	total         time.Duration
+	waitCool      time.Duration
+	waitPool      time.Duration
+	waitToken     time.Duration
+	waitConn      time.Duration
+	dialTLS       time.Duration
+	send          time.Duration
+	server        time.Duration
+	body          time.Duration
+	reused        bool
+	newConn       bool
+	hedge         bool
+	won           bool
+	hasConn       bool
+	hasDial       bool
+	hasSend       bool
+	hasServer     bool
+	dispatch      time.Duration
+	firstVerified time.Duration
+	hasDispatch   bool
 }
 
 const (
@@ -3722,6 +3826,10 @@ func (s *driveStorage) mediaHedgeDelay(r driveMediaRequest) time.Duration {
 	if !ok {
 		return slotBodyHedge
 	}
+	return mediaDelayFromMedian(median)
+}
+
+func mediaDelayFromMedian(median time.Duration) time.Duration {
 	if median >= slotBodyHedge {
 		return slotBodyHedge
 	}
@@ -3733,7 +3841,11 @@ func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSa
 		(status != http.StatusOK && status != http.StatusPartialContent) {
 		return
 	}
-	s.mediaLatency[rangeClass(*r)].note(sample.dispatch)
+	class := rangeClass(*r)
+	s.mediaLatency[class].note(sample.dispatch)
+	if r.progressive {
+		s.mediaStartup[class].note(sample.firstVerified)
+	}
 }
 
 type timingAggregator struct {
