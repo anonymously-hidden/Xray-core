@@ -944,6 +944,7 @@ func TestSlotRampedBurstSplitsInline(t *testing.T) {
 				window := slotInlineWriteInflight
 				if c.media {
 					window = slotWriteInflight
+					w.pendingUploadBytes = w.batch.budget
 				}
 				// Leave one permit in the selected publication class.
 				for range window - 1 {

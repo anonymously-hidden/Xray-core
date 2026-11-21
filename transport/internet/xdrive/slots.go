@@ -33,7 +33,7 @@ const (
 	inlineRampSegments = 8
 	// Stable browsing suffixes retain two batching ticks before an early flush.
 	slotInlineStableTicks   = 2
-	slotInlineWriteInflight = 16
+	slotInlineWriteInflight = 24
 
 	// Bulk uploads use a wider window once a deep ring is warm. Media reads
 	// have bounded lookahead for mixed traffic too. Small rings retain their
@@ -69,7 +69,7 @@ var (
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
 
-	slotReadAhead      int64 = 3
+	slotReadAhead      int64 = 11
 	slotReadAheadPoll        = 40 * time.Millisecond
 	slotReadAheadBurst       = 500 * time.Millisecond
 )

@@ -510,17 +510,17 @@ its byte-counted plan across later flushes, so changing pressure does not turn i
 remaining suffix into media halfway through the burst.
 
 The ordinary byte allowance is one normal upload window of inline payloads
-(16 times 14 KiB by default), capped by ring depth; configured smaller segment
+(24 times 14 KiB by default), capped by ring depth; configured smaller segment
 sizes are respected. It is resource credit, not an estimate of application demand.
 Sparse control writes must not lower it: their publication rate measures how little
 the application sent, not how much a full inline upload window can carry.
 The separate bulk upload latency controller continues to handle measured congestion.
 
 A lightly loaded publisher can reserve up to two normal inline upload waves,
-capped by ring depth (32 times 14 KiB, or 448 KiB, by default). This requires no
+capped by ring depth (48 times 14 KiB, or 672 KiB, by default). This requires no
 more than half the normal request window and half its byte allowance already in
 use. The new burst and outstanding bytes must fit that ceiling, and outstanding
-requests reduce its frame credit. Inline publication has its own 16-request limit;
+requests reduce its frame credit. Inline publication has its own 24-request limit;
 normal bulk admission remains 12 and its warmed adaptive ceiling remains 24. The
 second inline wave waits for returned permits. A busy publisher retains its
 one-wave byte allowance and request-pressure rule. Accepted plans remain
@@ -579,9 +579,10 @@ This is a size-only counterfactual, not actual eligibility or full accounting:
 repeated metadata reads,
 both peers, other applications, grandfathered quotas, and backend throttling still
 matter. No per-request payload limit, backend permit ceiling, media-download
-concurrency, or hedge budget is raised; only inline publication admission is wider.
+concurrency, or hedge budget is raised; only inline publication admission and
+near-head metadata priming are wider.
 
-There is no new quota limiter, persistent ledger, or request-admission behavior.
+There is no new quota limiter, persistent ledger, or quota-related admission code.
 Concurrency and ring sizes do not bound requests per minute: faster responses and
 additional carriers can spend more units with the same constants. A complete
 client-plus-server worst-case ceiling cannot be guaranteed from this client log.
@@ -589,16 +590,43 @@ Both endpoints' dispatched units (including retries, hedges, and cleanup) and ot
 applications must be counted against the shared 325,000-unit limit. The existing
 Drive cooldown and quota-retry handling remain unchanged.
 
-Keep a 64-slot ring for this workload. Inline admission tops out at 16 and a fresh
-two-wave plan at 32 frames; media lookahead tops out at 20 segment sizes and can
+Keep a 64-slot ring for this workload. Inline admission tops out at 24 and a fresh
+two-wave plan at 48 frames; media lookahead tops out at 20 segment sizes and can
 adapt lower. A deeper ring does not widen these windows or shorten Drive response
 latency. It also requires more object creation/cleanup when fully used and delays
 the two-lap bulk warm-up (128 full bulk frames at depth 64; 192 at depth 96).
 Consider 96 only as a measured experiment if logs demonstrate sustained slot-reuse
 `await` stalls while the peer drains promptly—not as a buffering fix or quota-safety
 guarantee. The supported ring-depth cap remains 256; it is not a recommendation.
-The current client capture has only four nonzero writer `await` observations, all
+The earlier client capture has only four nonzero writer `await` observations, all
 under one millisecond; there is no client-side ring-reuse bottleneck in this trace.
+
+The matched resume.57 client/server capture contains 64 media frames, including
+27 full 512 KiB frames: they exceed the previous 448 KiB inline-plan ceiling. Media
+GET start to first verified block is about 0.88 s at p50, independently of peer
+clock alignment; media admission is negligible. Inline admission is now 24, with
+the same two-wave rule, so a lightly loaded 512 KiB frame can fit without changing
+the 14 KiB per-request inline payload limit or media range/recovery budgets.
+
+Near-head metadata priming now covers the head's 11 successors, matching the
+existing 12-slot initial fetch window. The old three-successor setting made
+already-published inline bursts drain in repeated deferred metadata waves. The
+fetch horizon, polling/backoff intervals, idle behavior, and error handling remain
+unchanged. A controlled 512 KiB test using 600 ms inline publication, 1.1 s media
+publication, 300 ms metadata reads, and 900 ms body reads delivers first/full bytes
+in 2.10/2.10 s with resume.57, 0.65/2.00 s with wider uploads alone, and
+0.65/1.55 s with both changes. This is a model, not a live playback benchmark.
+
+The endpoint timing-window peaks in that capture sum to 74,875 estimated units;
+this is not a combined rolling-minute guarantee. A reconstructed producer-side
+admission counterfactual converts 32 media frames (about 14 MiB), adding 50,300
+server publication units and removing a net 18,370 client retrieval units over
+the whole capture before changed repeated polls/retries. Actual eligibility can
+change as the new pipeline runs. Importantly, server frame 2476 really receives
+`userRateLimitExceeded` and takes 13.64 s to publish, blocking ordered delivery.
+Increasing constants cannot eliminate a Drive rejection or promise buffer-free
+playback. Verify the project's applied quotas: Google's published guide preserves
+previously assigned quotas for eligible projects, and other applications share them.
 
 ### Shared-owner live-ring cleanup fence
 

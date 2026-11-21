@@ -22,7 +22,7 @@ func TestSlotBatchCommittedBurstSurvivesChangingPressure(t *testing.T) {
 	if b.planned != 0 {
 		t.Fatal("completed inline plan retained bytes")
 	}
-	if got := b.frameSize(5*slotInlineLimit, 16*slotInlineLimit, 15, defaultSegmentBytes); got != 5*slotInlineLimit {
+	if got := b.frameSize(5*slotInlineLimit, b.budget, b.window-1, defaultSegmentBytes); got != 5*slotInlineLimit {
 		t.Fatal("new input was admitted as another fresh inline wave")
 	}
 	if got := b.frameSize(4*slotInlineLimit, 0, 0, defaultSegmentBytes); got != slotInlineLimit {
@@ -36,9 +36,9 @@ func TestSlotBatchAccountsBytesAndRequestsAcrossInputChunks(t *testing.T) {
 		buffered, outstanding int
 		active                int
 	}{
-		{"full_inline_backlog", 64 << 10, 14 * slotInlineLimit, 14},
+		{"full_inline_backlog", 64 << 10, (slotInlineWriteInflight - 2) * slotInlineLimit, slotInlineWriteInflight - 2},
 		{"bulk_backlog", 64 << 10, 2 * defaultSegmentBytes, 3},
-		{"small_request_backlog", 10 * slotInlineLimit, 1024, 15},
+		{"small_request_backlog", (slotInlineWriteInflight/2 + 2) * slotInlineLimit, 1024, slotInlineWriteInflight - 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newSlotBatchWindow(defaultSegmentBytes, 64)
@@ -56,7 +56,7 @@ func TestSlotBatchAccountsBytesAndRequestsAcrossInputChunks(t *testing.T) {
 }
 
 func TestSlotBatchModestBurstSharesCreditsWithSmallRequests(t *testing.T) {
-	for _, buffered := range []int{167230, 192207, 272702} {
+	for _, buffered := range []int{167230, 192207, 272702, defaultSegmentBytes} {
 		b := newSlotBatchWindow(defaultSegmentBytes, 64)
 		if got := b.frameSize(buffered, 4096, 2, defaultSegmentBytes); got != slotInlineLimit || b.planned != buffered-slotInlineLimit {
 			t.Fatalf("a fitting %d-byte burst with spare credits was forced into media", buffered)
@@ -74,15 +74,15 @@ func TestSlotBatchTwoWaveAllowanceRequiresSpareCredits(t *testing.T) {
 		depth, active         int
 		outstanding, buffered int
 	}{
-		{"request_pressure", 64, slotInlineWriteInflight/2 + 1, 1024, 272702},
-		{"byte_pressure", 64, 2, slotInlineWriteInflight*slotInlineLimit/2 + 1, 272702},
+		{"request_pressure", 64, slotInlineWriteInflight/2 + 1, 1024, defaultSegmentBytes},
+		{"byte_pressure", 64, 2, slotInlineWriteInflight*slotInlineLimit/2 + 1, defaultSegmentBytes},
 		{"two_wave_ceiling", 64, 0, 0, slotInlineBurstWaves*slotInlineWriteInflight*slotInlineLimit + 1},
 		{"ring_ceiling", 8, 0, 0, 8*slotInlineLimit + 1},
 		{"reserved_request_credit", 64, 2, 1024, (slotInlineBurstWaves*slotInlineWriteInflight - 1) * slotInlineLimit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := newSlotBatchWindow(defaultSegmentBytes, tc.depth)
-			if got := b.frameSize(tc.buffered, tc.outstanding, tc.active, defaultSegmentBytes); got != tc.buffered || b.planned != 0 {
+			if got := b.frameSize(tc.buffered, tc.outstanding, tc.active, defaultSegmentBytes); got != min(tc.buffered, defaultSegmentBytes) || b.planned != 0 {
 				t.Fatal("a two-wave plan escaped its pressure or resource ceiling")
 			}
 		})
@@ -117,7 +117,7 @@ func TestSlotWriterInlineAdmissionDoesNotWidenBulkWindow(t *testing.T) {
 		t.Fatal("backlogged media inherited the wider inline window")
 	}
 	w.pendingUploadBytes = 0
-	w.buf = make([]byte, defaultSegmentBytes)
+	w.buf = make([]byte, 2*defaultSegmentBytes)
 	if w.writeWindow() != slotWriteInflight {
 		t.Fatal("large unplanned media inherited inline admission")
 	}
@@ -133,12 +133,13 @@ func TestSlotWriterInlineAdmissionDoesNotWidenBulkWindow(t *testing.T) {
 
 type batchTestSlots struct {
 	*memSlots
-	release   chan struct{}
-	streaming bool
-	warm      int64
-	latency   time.Duration
-	active    atomic.Int32
-	peak      atomic.Int32
+	release                                       chan struct{}
+	streaming                                     bool
+	warm                                          int64
+	latency                                       time.Duration
+	mediaLatency, descriptionLatency, bodyLatency time.Duration
+	active                                        atomic.Int32
+	peak                                          atomic.Int32
 }
 
 func (s *batchTestSlots) throttled() int64       { return 0 }
@@ -157,7 +158,11 @@ func (s *batchTestSlots) setSlot(ctx context.Context, id, description string, bo
 		var release <-chan struct{}
 		var tick <-chan time.Time
 		if frame.seq < s.warm {
-			timer := time.NewTimer(s.latency)
+			latency := s.latency
+			if frame.mode != slotInline && s.mediaLatency > 0 {
+				latency = s.mediaLatency
+			}
+			timer := time.NewTimer(latency)
 			defer timer.Stop()
 			tick = timer.C
 		} else {
@@ -173,8 +178,100 @@ func (s *batchTestSlots) setSlot(ctx context.Context, id, description string, bo
 	return s.memSlots.setSlot(ctx, id, description, body)
 }
 
+func batchTestWait(ctx context.Context, d time.Duration) error {
+	if d == 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (s *batchTestSlots) readDescription(ctx context.Context, id string) (string, error) {
+	if err := batchTestWait(ctx, s.descriptionLatency); err != nil {
+		return "", err
+	}
+	return s.memSlots.readDescription(ctx, id)
+}
+
+func (s *batchTestSlots) readBody(ctx context.Context, id string) ([]byte, error) {
+	if err := batchTestWait(ctx, s.bodyLatency); err != nil {
+		return nil, err
+	}
+	return s.memSlots.readBody(ctx, id)
+}
+
+func TestSlotLiveSizedBurstDelivery(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		window int
+		ahead  int64
+	}{{"resume57", 16, 3}, {"upload_only", slotInlineWriteInflight, 3}, {"candidate", slotInlineWriteInflight, slotReadAhead}} {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := slotReadAhead
+			slotReadAhead = tc.ahead
+			defer func() { slotReadAhead = previous }()
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				store := &batchTestSlots{memSlots: newMemSlots(), warm: 1 << 20,
+					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
+					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond}
+				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+				ring, err := makeRing(ctx, store, "live-sized", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := newSlotWriter(ctx, store, ring.Up, p)
+				w.batch.window = tc.window
+				w.batch.budget = tc.window * w.batch.unit
+				w.batch.burstBudget = slotInlineBurstWaves * w.batch.budget
+				r := newSlotReader(ctx, store, ring.Up, p, nil)
+				defer func() { cancel(); w.wait(); r.wait() }()
+				payload := randomPayload(defaultSegmentBytes)
+				began := time.Now()
+				written := make(chan error, 1)
+				go func() { _, err := w.Write(payload); written <- err }()
+				var got []byte
+				var first time.Duration
+				for len(got) < len(payload) {
+					select {
+					case chunk, ok := <-r.chunks():
+						if !ok {
+							t.Fatal("reader ended before the burst")
+						}
+						if len(got) == 0 {
+							first = time.Since(began)
+						}
+						got = append(got, chunk...)
+					case <-time.After(10 * time.Second):
+						t.Fatal("live-sized burst did not drain")
+					}
+				}
+				if err := <-written; err != nil || !bytes.Equal(got, payload) {
+					t.Fatal("live-sized burst changed bytes", err)
+				}
+				store.mu.Lock()
+				media := len(store.bodies)
+				store.mu.Unlock()
+				if store.peak.Load() > int32(tc.window) || tc.name == "resume57" && media != 1 || tc.name != "resume57" && media != 0 {
+					t.Fatal("publication class or upload ceiling changed")
+				}
+				if tc.name == "candidate" && (first > time.Second || time.Since(began) > 1700*time.Millisecond) {
+					t.Fatal("a healthy 512 KiB burst still stalled behind media or distant metadata admission")
+				}
+				t.Logf("window=%d ahead=%d first=%v complete=%v media=%d peak=%d", tc.window, tc.ahead, first, time.Since(began), media, store.peak.Load())
+			})
+		})
+	}
+}
+
 func TestSlotWriterSparseTrafficDoesNotForceModestBurstIntoMedia(t *testing.T) {
-	for _, size := range []int{167230, 192207, 272702, 420 << 10} {
+	for _, size := range []int{167230, 192207, 272702, 420 << 10, defaultSegmentBytes} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
@@ -259,14 +356,15 @@ func TestSlotWriterBacklogBatchingPreservesBytesAndSmallSuffix(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				store := &batchTestSlots{memSlots: newMemSlots(), release: make(chan struct{}), streaming: streaming}
-				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+				// A small ring keeps the withheld uploads outside two-wave inline credit.
+				p := paramsFromConfig(&Config{Concurrency: 16, FlushIntervalMs: 10})
 				ring, err := makeRing(ctx, store, "batch", p)
 				if err != nil {
 					t.Fatal(err)
 				}
 				w := newSlotWriter(ctx, store, ring.Up, p)
 				defer func() { cancel(); w.wait() }()
-				payload := randomPayload(11 * (64 << 10))
+				payload := randomPayload(2*(64<<10) + 2*defaultSegmentBytes)
 				for off := 0; off < 2*(64<<10); off += 64 << 10 {
 					if _, err := w.Write(payload[off : off+(64<<10)]); err != nil {
 						t.Fatal(err)
