@@ -589,3 +589,56 @@ func TestSlotWriterBacklogBatchingPreservesBytesAndSmallSuffix(t *testing.T) {
 		})
 	}
 }
+
+func TestSlotWriterCommittedBurstPublishesInOneWave(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		store := &batchTestSlots{memSlots: newMemSlots(), warm: 1 << 20, latency: 700 * time.Millisecond}
+		p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+		ring, err := makeRing(ctx, store, "wave", p)
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		w := newSlotWriter(ctx, store, ring.Up, p)
+		defer func() { cancel(); w.wait() }()
+		// An established writer has ramped to the bulk aggregation size.
+		w.mu.Lock()
+		w.size = p.segmentBytes
+		w.mu.Unlock()
+		payload := randomPayload(178036)
+		if _, err := w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		began := time.Now()
+		last := w.slotID(int64((len(payload) - 1) / slotInlineLimit))
+		for time.Since(began) < 2*time.Second {
+			time.Sleep(p.flushInterval)
+			synctest.Wait()
+			store.mu.Lock()
+			f, ok := decodeSlot(store.descs[last])
+			store.mu.Unlock()
+			if ok && f.mode == slotInline {
+				break
+			}
+		}
+		elapsed := time.Since(began)
+		t.Logf("last frame published at %v", elapsed)
+		if elapsed > store.latency+3*p.flushInterval {
+			t.Fatalf("committed burst exceeded one upload wave: %v", elapsed)
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		var got []byte
+		for seq := int64(0); len(got) < len(payload); seq++ {
+			f, ok := decodeSlot(store.descs[w.slotID(seq)])
+			if !ok || f.seq != seq || f.mode != slotInline {
+				t.Fatalf("only %d/%d bytes published within one upload wave", len(got), len(payload))
+			}
+			got = append(got, f.data...)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatal("burst corrupted")
+		}
+	})
+}

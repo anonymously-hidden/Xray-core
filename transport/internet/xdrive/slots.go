@@ -535,7 +535,16 @@ func (w *slotWriter) flushLoop() {
 				w.applyGrowLocked()
 			}
 			if !w.closed && w.err == nil && !w.flushing && len(w.buf) > 0 && w.readyToFlush() {
-				w.flushLocked(nil, nil)
+				// The timer coalesces new bytes. Once an inline burst has
+				// been selected its frame boundaries are fixed: spacing them
+				// one tick apart only delays the last byte. Dispatch the
+				// committed remainder while permits are immediately free.
+				for {
+					if err := w.flushLocked(nil, nil); err != nil || w.batch == nil ||
+						w.batch.planned == 0 || len(w.slots) >= w.batch.window {
+						break
+					}
+				}
 			}
 			done := w.closed || w.err != nil
 			w.mu.Unlock()
