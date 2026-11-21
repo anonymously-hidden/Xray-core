@@ -567,9 +567,13 @@ func (w *slotWriter) readyToFlush() bool {
 // writeWindow is called with mu held. Two full laps distinguish a sustained
 // transfer from a burst and finish lazy creation before widening the window.
 func (w *slotWriter) writeWindow() int {
+	return w.writeWindowFor(w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots)))
+}
+
+func (w *slotWriter) writeWindowFor(inline bool) int {
 	depth := len(w.table.Slots)
 	base := min(depth, slotWriteInflight)
-	if w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots)) {
+	if inline {
 		return w.batch.window
 	}
 	if depth < slotBulkDepth || w.bulkSegments < 2*depth || w.bulkLimited {
@@ -610,7 +614,16 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 		stop = w.flushStop
 	}
 	var permitWait time.Duration
-	for len(w.slots) >= w.writeWindow() {
+	bulk := false
+	for {
+		inline := w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots))
+		// Returning upload permits does not make an already-backlogged burst
+		// fresh. Keep its bulk decision through this admission wait instead of
+		// renewing a two-wave inline plan as the old requests finish.
+		bulk = bulk || w.batch != nil && !inline
+		if len(w.slots) < w.writeWindowFor(inline && !bulk) {
+			break
+		}
 		available := w.available
 		w.flushing = true
 		waitAt := time.Now()
@@ -660,7 +673,12 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	n := min(len(w.buf), w.size)
 	inlineBudget, inlineBurstBudget, inlinePlanned := -1, -1, -1
 	if w.batch != nil {
-		n = w.batch.frameSize(len(w.buf), w.pendingUploadBytes, len(w.slots)-1, w.segmentBytes)
+		n = min(len(w.buf), w.segmentBytes)
+		// Concurrent flushers may leave a committed prefix or short suffix;
+		// preserve those, but do not re-plan the rejected large burst.
+		if !bulk || w.batch.planned > 0 || len(w.buf) <= 4*w.batch.unit {
+			n = w.batch.frameSize(len(w.buf), w.pendingUploadBytes, len(w.slots)-1, w.segmentBytes)
+		}
 		inlineBudget, inlineBurstBudget, inlinePlanned = w.batch.budget, w.batch.burstBudget, w.batch.planned
 		if n > slotInlineLimit {
 			w.size, w.full = w.segmentBytes, 0

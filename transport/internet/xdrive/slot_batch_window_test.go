@@ -270,6 +270,91 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 	}
 }
 
+func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		name := "legacy"
+		if streaming {
+			name = "streaming"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				store := &batchTestSlots{memSlots: newMemSlots(), streaming: streaming, warm: 1 << 20,
+					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
+					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond}
+				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
+				ring, err := makeRing(ctx, store, "sustained", p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				w := newSlotWriter(ctx, store, ring.Up, p)
+				r := newSlotReader(ctx, store, ring.Up, p, nil)
+				defer func() { cancel(); w.wait(); r.wait() }()
+				payload := randomPayload(4 * defaultSegmentBytes)
+				suffix := []byte("browsing control after sustained input")
+				want := append(payload, suffix...)
+				began := time.Now()
+				written := make(chan error, 1)
+				go func() {
+					_, err := w.Write(want)
+					written <- err
+				}()
+				var got []byte
+				for len(got) < len(want) {
+					select {
+					case chunk, ok := <-r.chunks():
+						if !ok {
+							t.Fatal("reader ended before sustained input and suffix")
+						}
+						got = append(got, chunk...)
+					case <-time.After(20 * time.Second):
+						t.Fatal("sustained input held back the browsing suffix")
+					}
+				}
+				if err := <-written; err != nil || !bytes.Equal(got, want) {
+					t.Fatal("sustained batching changed ordered bytes", err)
+				}
+				store.mu.Lock()
+				media := len(store.bodies)
+				store.mu.Unlock()
+				burstFrames := (defaultSegmentBytes + slotInlineLimit - 1) / slotInlineLimit
+				if media != 3 || w.seq != int64(burstFrames+4) {
+					t.Fatalf("backlog renewed inline plans: media=%d frames=%d", media, w.seq)
+				}
+				if store.peak.Load() > int32(slotInlineWriteInflight) {
+					t.Fatal("sustained batching exceeded upload admission")
+				}
+				if elapsed := time.Since(began); elapsed > 4*time.Second {
+					t.Fatalf("browsing suffix waited %v behind sustained input", elapsed)
+				}
+				if err := w.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store.mu.Lock()
+				defer store.mu.Unlock()
+				for seq := int64(0); seq < w.seq; seq++ {
+					frame, ok := decodeSlot(store.descs[w.slotID(seq)])
+					mode := byte(slotInline)
+					if seq >= int64(burstFrames) && seq < int64(burstFrames+3) {
+						mode = slotMedia
+						if streaming {
+							mode = slotStream
+						}
+					}
+					if !ok || frame.seq != seq || frame.mode != mode {
+						t.Fatalf("publication class changed at sequence %d", seq)
+					}
+				}
+				end, ok := decodeSlot(store.descs[w.slotID(w.seq)])
+				if !ok || end.seq != w.seq || end.mode != slotEnd {
+					t.Fatal("sustained batching lost the ordered terminal frame")
+				}
+				t.Logf("2 MiB plus browsing suffix: frames=%d media=%d complete=%v", w.seq, media, time.Since(began))
+			})
+		})
+	}
+}
+
 func TestSlotWriterSparseTrafficDoesNotForceModestBurstIntoMedia(t *testing.T) {
 	for _, size := range []int{167230, 192207, 272702, 420 << 10, defaultSegmentBytes} {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {

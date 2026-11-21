@@ -628,6 +628,39 @@ Increasing constants cannot eliminate a Drive rejection or promise buffer-free
 playback. Verify the project's applied quotas: Google's published guide preserves
 previously assigned quotas for eligible projects, and other applications share them.
 
+### Browsing alongside fluent 360p (resume.59)
+
+The matched November 21 client 13:02–13:10 and server 09:33–09:41 capture uses
+session `fef6ba5732a9492b4176a7262f0962d8`, with all observed payload frames inline
+and no recorded Drive rate-limit rejection. Server slot-reuse `await` reaches
+5.40 s. Its continuously nonempty buffer episode reaches 142.67 s; this is an
+episode-age upper bound, not proof that each selected byte waited that long.
+The client excerpt also omits sequences 49–135, so its timestamp gap must not be
+treated as a measured 36-second head stall.
+
+A large backlogged flush could reject inline admission, wait for the bulk upload
+window, then gain a fresh two-wave inline plan when outstanding requests fell below
+half a window. Repeating this defeats aggregation and spends ring slots on small
+frames. The bulk decision now survives that admission wait. Previously committed
+inline prefixes and short suffixes remain inline; fresh lightly loaded bursts retain
+the 24-upload, 48-frame two-wave allowance and 11-successor metadata priming.
+No timeout, polling interval, Drive retry, range, or hedge limit changes.
+
+A controlled 2 MiB transfer plus a browsing suffix formerly produced 148 inline
+frames; the regression now requires 41 frames, including three aggregated full
+segments, and verifies ordered bytes, publication modes, and the terminal frame.
+The isolated 512 KiB delivery model remains 0.65/1.55 s for first/full bytes.
+These are controlled transport results, not a measured website-load improvement.
+Cross-flow ordering inside one mux carrier and Drive response delays still apply.
+Routing remains controlled by the client configuration; this change adds no
+domain exceptions or routing overrides.
+
+Completed endpoint timing-window peaks sum to 92,435 estimated units, below the
+published 325,000 units/minute reference but not a combined rolling-minute bound.
+Aggregation reduces publication fan-out in the regression; actual combined usage
+still includes both peers, metadata polling, media GETs, retries, and other apps.
+Keep the deployed ring at 64 slots and validate browsing while 360p plays.
+
 ### Shared-owner live-ring cleanup fence
 
 Drive slot connections pin their session in the shared storage owner through
