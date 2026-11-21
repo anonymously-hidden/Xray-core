@@ -421,3 +421,39 @@ The short server excerpt overlaps only the last part of the client log and misse
 its main media slowdown. For matched inline frame 1017, bounded clock alignment
 places most of its 4.73 s head wait before the server PUT began, not in a four-second
 metadata HTTP request. These are different workloads, not matched speed benchmarks.
+
+### Bulk windows follow latency (latencyWindow)
+
+The ring is a FIFO byte stream, so a small frame completes only after every
+frame written before it. Bulk frames in flight share one link (and Drive's
+per-user throughput); beyond its bandwidth-delay product extra concurrency adds
+no throughput and only queues, and every small frame behind pays that queue.
+In the November 21 client log body latency rose from about 1.1 s to 2.7 s (max
+3.4 s) at 465 frames/min, and 184 of the 194 reads blocked for over a second
+sat behind a media frame.
+
+`slot_latency_window.go` bounds bulk work by observed latency instead of a fixed
+count, in both directions with the same rule: the window shrinks by a quarter
+(at most once per base latency) when an operation takes more than 1.5x the
+unloaded floor plus 100 ms, and grows by one when it is back within about 1.33x
+of it. The floor is the 5th percentile of the last 256 samples. It starts at
+its maximum, so an uncongested path behaves as before.
+
+- Reader (`slot_body_gate.go`): prefetched media bodies, maximum
+  `slotBodyAhead`, minimum 6. The head frame and the two after it are never held
+  back. `xdrive read` lines report `body-window=`, and `media-admission=`
+  includes time spent waiting for the gate.
+- Writer (`slotWriter.uplink`): the bulk upload window of `writeWindow`, steered
+  by the latency of media/stream puts, never below the normal window.
+
+What this cannot remove: a small frame still waits for the frame before it, so
+behind a media frame it pays about one media latency (upload, description
+discovery and a body GET, roughly 2.2 s) minus its own (about 1.1 s). Removing
+that needs separate rings per flow class, which a byte-stream transport cannot
+choose without knowing the sessions inside it.
+
+### Google Drive code layout
+
+The Drive backend, media recovery, streaming negotiation, and telemetry live in
+`drive.go`; their regression tests live in `drive_test.go`. Shared slot and
+transport code remains separate because other storage backends also use it.

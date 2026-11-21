@@ -357,6 +357,7 @@ type slotWriter struct {
 	lazy               bool
 	created            []bool
 	gates              []*slotWriteResult // completion and result of the last assigned physical write
+	uplink             latencyWindow      // bulk upload window steered by media put latency; guarded by mu
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -571,7 +572,9 @@ func (w *slotWriter) writeWindow() int {
 	if s, ok := w.store.(interface{ cooling() bool }); ok && s.cooling() {
 		return base
 	}
-	return cap(w.slots)
+	// Beyond the bandwidth-delay product more bulk uploads only queue, and a
+	// small frame written behind them waits for the whole queue.
+	return max(base, w.uplink.current(cap(w.slots)))
 }
 
 // releaseSlotLocked wakes every flusher so a reduced window or a cancelled
@@ -748,6 +751,11 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		return
 	}
 	put := time.Since(putAt)
+	if mode != slotInline {
+		w.mu.Lock()
+		w.uplink.observe(put, bodyGateMin, cap(w.slots))
+		w.mu.Unlock()
+	}
 	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)
 	localOutstandingBytes, bufferBytes := -1, -1
 	if !result.assignedAt.IsZero() {
@@ -1104,6 +1112,9 @@ type slotReader struct {
 	// Completed description latency, including store waits, guards only head
 	// overlap admission; primary reads and the polling tick are unchanged.
 	descriptionLatency time.Duration // guarded by mu
+
+	// bodies bounds prefetched media bodies by observed latency (see bodyGate).
+	bodies bodyGate
 }
 
 func newSlotReader(ctx context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
@@ -1302,7 +1313,7 @@ func (r *slotReader) run() {
 			" reads=", r.reads.Load(), " heads=", r.headReads.Load(), " tails=", r.tailReads.Load(),
 			" stale=", r.staleReads.Load(), " empty=", r.emptyReads.Load(),
 			" mode=", f.mode, " discover=", f.visibleAt.Sub(f.born), " body=", f.bodyTime,
-			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(),
+			" head-wait=", max(0, f.readyAt.Sub(f.headAt)), " overlap-delay=", r.headOverlapDelay(), " body-window=", r.bodies.window(),
 			" quiet-tail-backoffs=", r.quietTailBackoffs.Load(), " first-block-wait=", firstBlockWait,
 			" media-admission=", f.bodyAdmission, " stream-blocks=", f.delivery.blocks,
 			" missing-block-gaps=", f.delivery.missingCount,
@@ -1334,6 +1345,16 @@ func (r *slotReader) isHead(seq int64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.head == seq
+}
+
+// distanceFromHead reports how many frames seq is ahead of the head, for the
+// body gate, which never holds back the head or its immediate successors.
+func (r *slotReader) distanceFromHead(seq int64) func() int64 {
+	return func() int64 {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		return seq - r.head
+	}
 }
 
 func (r *slotReader) bursting() bool {
@@ -1468,6 +1489,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 						f.err = ctx.Err()
 						return
 					}
+					if !r.bodies.acquire(ctx, r.distanceFromHead(seq), f.promoted) {
+						f.err = ctx.Err()
+						return
+					}
 					f.bodyAdmission += time.Since(admissionAt)
 					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
@@ -1480,6 +1505,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					if f.err == nil && !f.stream.complete() {
 						f.err = errors.New("streamed slot ended without every verified block")
 					}
+					r.bodies.release(f.bodyTime, f.err == nil)
 					if f.err == nil {
 						r.hit()
 					} else {
@@ -1495,11 +1521,16 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				case <-ctx.Done():
 					return
 				}
+				if !r.bodies.acquire(ctx, r.distanceFromHead(seq), f.promoted) {
+					return
+				}
 				f.bodyAdmission += time.Since(admissionAt)
 				began := time.Now()
 				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 				body, bodyErr := r.readMediaBody(bodyCtx, id, seq, frame)
-				f.bodyTime += time.Since(began)
+				bodyTime := time.Since(began)
+				f.bodyTime += bodyTime
+				r.bodies.release(bodyTime, bodyErr == nil)
 				if isAuthError(bodyErr) {
 					f.err = bodyErr
 					r.setErr(bodyErr)

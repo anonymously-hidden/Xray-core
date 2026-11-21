@@ -8,13 +8,17 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
 	"os"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,7 +29,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 )
 
-// testDriveIO is a nil-by-default test hook observing every Drive request
+// Google Drive storage.
+
 var testDriveIO func(method, target string, body []byte)
 
 const (
@@ -36,10 +41,9 @@ const (
 	driveMaxInflight      = 64
 	driveReservedInflight = 8
 	driveInlineLimit      = 12000
-	// A quota window must be quiet before spending requests on description
-	// recovery. The ordinary request retry/cooldown policy remains unchanged.
+
 	driveDescriptionHedgeQuiet = time.Minute
-	// driveTimeout ends a request that makes no progress for that long
+
 	driveTimeout = 60 * time.Second
 )
 
@@ -50,9 +54,7 @@ var (
 	driveUploadURL      = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name"
 	driveInitialBackoff = 200 * time.Millisecond
 	driveCooldown       = 2 * time.Second
-	// rate-limit answers do not use up attempts while a request is younger than
-	// this: the limit is per minute and a cooldown is only 1-2 s, so eight
-	// attempts could end inside a single window and fail a slot write.
+
 	driveRateLimitBudget = 45 * time.Second
 	driveSlotRead        = 18 * time.Second
 	driveSlotWrite       = 20 * time.Second
@@ -68,11 +70,8 @@ const (
 	driveAuthBudget      = 2 * time.Minute
 )
 
-// maxBodyKey lets a caller tighten the response-body cap (announcements).
 type maxBodyKey struct{}
 
-// tokenFlight is one shared foreground token fetch; waiters read its result
-// after done closes instead of starting their own fetch.
 type tokenFlight struct {
 	done     chan struct{}
 	token    string
@@ -82,17 +81,14 @@ type tokenFlight struct {
 
 type laneKey struct{}
 
-// bodyKey marks media-body requests so they ride the bulk connection, keeping
-// small reads/acks off the connection saturated by large transfers.
 type bodyKey struct{}
 
-// bodyProgressKey carries the callback for a read's hedge timer.
 type bodyProgressKey struct{}
 
 type attemptKey struct{}
 
-// Read hedges recover only a stalled first dispatch. Token,
-// connection and permit waits, and the primary's retries, are not hedgeable.
+// Hedge only the first dispatch; admission waits and retries are excluded.
+
 type (
 	readProgressKey     struct{}
 	descriptionHedgeKey struct{}
@@ -102,7 +98,7 @@ type (
 type readHedgeGate struct {
 	primary   *driveReadProgress
 	delay     time.Duration
-	remaining func() (time.Duration, bool) // optional tracked-stream eligibility/clock
+	remaining func() (time.Duration, bool)
 }
 
 type driveReadProgress struct {
@@ -128,7 +124,7 @@ func (p *driveReadProgress) dispatch() {
 func (p *driveReadProgress) replay() {
 	p.mu.Lock()
 	p.dispatchAt = time.Now()
-	p.pending = false // transport recovery is already running; do not also hedge it
+	p.pending = false
 	p.mu.Unlock()
 }
 
@@ -152,9 +148,8 @@ func (p *driveReadProgress) remaining(delay time.Duration) (time.Duration, bool)
 	return delay - time.Since(p.progressAt), p.pending
 }
 
-// Adaptive media recovery uses the latency of an entire dispatched range.
-// Unverified wire progress cannot postpone it; eligibility still belongs to
-// the ordered delivery frontier and retries/replays still disable recovery.
+// Media deadlines use dispatch age, not wire progress.
+
 func (p *driveReadProgress) remainingSinceDispatch(delay time.Duration) (time.Duration, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -164,33 +159,12 @@ func (p *driveReadProgress) remainingSinceDispatch(delay time.Duration) (time.Du
 	return delay - time.Since(p.dispatchAt), p.pending
 }
 
-// A verified-block wait may recover a trickling body, but never count time spent
-// locally queued before this dispatch. Headers/body bytes do not reset dispatchAt.
-func (p *driveReadProgress) remainingForBlock(delay time.Duration, waitAt time.Time) (time.Duration, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	remaining := delay - now.Sub(p.progressAt)
-	if !waitAt.IsZero() && !p.dispatchAt.IsZero() {
-		remaining = min(remaining, delay-now.Sub(maxTime(waitAt, p.dispatchAt)))
-	}
-	return remaining, p.pending
-}
-
 var errReadHedgeSkipped = errors.New("Drive read hedge is no longer admitted")
 
-// cleanupKey marks session-cleanup requests (the child deletions of Delete and
-// the Listener's drop/collect) so a rate limit they hit does not cool live
-// traffic.
 type cleanupKey struct{}
 
-// namesOnlyKey asks query() for ids and names without descriptions, for the
-// listings that never read Entry.Inline (resolveID, Delete children, collect).
 type namesOnlyKey struct{}
 
-// Cleanup is deliberately gentler than live traffic: few parallel deletes, a
-// low sustained rate, and retries that never cool the live path. The values are
-// copied into the storage at construction so tests tune their own instance.
 const (
 	cleanupParallel     = 2
 	cleanupRatePerSec   = 5.0
@@ -199,8 +173,6 @@ const (
 	cleanupSessionPause = 1 * time.Second
 )
 
-// cleanupRateLimited is returned by do() when a cleanup request is rate limited.
-// The cleanup caller retries it later; live traffic is not cooled.
 type cleanupRateLimited struct{ detail string }
 
 func (e cleanupRateLimited) Error() string {
@@ -215,8 +187,8 @@ func isCleanupRateLimited(err error) bool {
 type driveStorage struct {
 	*driveShared
 	streamCaps       atomic.Pointer[driveStreamCaps]
-	streamHeadRanges int // immutable owner snapshot; zero means the unchanged default
-	// a session has a client and inflight of its own, see session
+	streamHeadRanges int
+	// Clients and permits are session-local.
 	client         *http.Client
 	priorityClient *http.Client
 	bulkClient     *http.Client
@@ -227,28 +199,23 @@ type driveStorage struct {
 	mediaRescue    chan struct{}
 	mediaRanges    chan struct{}
 	release        func()
-	// readHedge/budget are copied per instance so tests never mutate globals
-	// that other goroutines read.
+
 	readHedge       time.Duration
 	readHedgeMu     sync.Mutex
 	readHedgeTokens int
 	readHedgeCount  int
 	readHedgeActive atomic.Bool
-	// Media range hedges have a budget of their own: description hedges win
-	// far less often and must not leave the head frame's ranges without one.
+
 	mediaHedgeTokens  int
 	mediaHedgeCount   int
-	mediaHedgeChanged chan struct{} // replenishment broadcast, guarded by readHedgeMu
-	// mediaNext rotates frames over mediaClients so a stalled connection does
-	// not carry every single-range frame.
+	mediaHedgeChanged chan struct{} // guarded by readHedgeMu
+
 	mediaNext atomic.Uint32
 }
 
-// driveShared is what the sessions of a storage have in common
 type driveShared struct {
 	conns *connPool
-	// Heads and watermarks have a connection as well as reserved permits of
-	// their own, so speculative descriptions and uploads cannot queue them.
+
 	priorityConns *connPool
 	bulkConns     *connPool
 	mediaConns    [driveMediaLanes]*connPool
@@ -283,12 +250,10 @@ type driveShared struct {
 	lastThrottle  time.Time
 	lastRateLimit time.Time
 	throttle      atomic.Int64
-	mediaLatency  [2]rangeLatency // shared by sessions; small and large primary ranges
+	mediaLatency  [2]rangeLatency // shared, per requested-size class
 	timing        *timingAggregator
 	idPoolState
 
-	// cleanup token bucket and retry tuning, shared by the sessions of a
-	// storage; instance fields so tests never mutate package-level values.
 	cleanupMu         sync.Mutex
 	cleanupTokens     float64
 	cleanupAt         time.Time
@@ -298,8 +263,6 @@ type driveShared struct {
 	cleanupMaxRetries int
 	cleanupInflight   chan struct{}
 
-	// keep-warm keeper; intervals are instance fields so tests never mutate
-	// package-level values other goroutines read.
 	owner          *driveStorage
 	keepWarmEvery  time.Duration
 	keepWarmWindow time.Duration
@@ -396,8 +359,6 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	return st, nil
 }
 
-// session returns a storage for one session, over the connections of XMUX
-// until Close, with the token and ids of s
 func (s *driveStorage) session() Storage {
 	s.startKeeper()
 	transport := &sessionTransport{pool: s.conns}
@@ -499,8 +460,7 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 				go func() { defer finish(); s.refreshTokenBackground(refreshCtx, f) }()
 			}
 		}
-		// A rejected refresh grant must not discard a token that Drive still
-		// accepts: serve it until it expires, then report the grant error.
+
 		token := s.token
 		s.tokenMu.Unlock()
 		return token, nil
@@ -525,9 +485,7 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 	if time.Now().Before(s.tokenRetryAt) && s.lastTokenErr != nil {
 		err := s.lastTokenErr
 		wait := time.Until(s.tokenRetryAt)
-		// A reserved lane never waits, and a wait that cannot finish inside
-		// this request's own budget would only burn that budget and then hide
-		// the token error: report the error now.
+
 		if ctx.Value(laneKey{}) != nil {
 			s.tokenMu.Unlock()
 			return "", err
@@ -586,8 +544,6 @@ func (s *driveStorage) accessTokenOnce(ctx context.Context) (string, error) {
 	}
 }
 
-// noteTokenFailure backs off further token fetches so a failing endpoint is
-// not hit once per API call; called with tokenMu held.
 func (s *driveStorage) noteTokenFailure() {
 	if s.tokenBackoff == 0 {
 		s.tokenBackoff = tokenRefreshBackoff
@@ -728,11 +684,6 @@ func retryableStatus(status int) bool {
 	return false
 }
 
-// driveQuotaRetry tells the request loop whether a rate-limited attempt may be
-// refunded (the budget is not spent yet) or whether the budget is spent and
-// the request must stop. The budget is the limit: a request that is answered
-// with a rate limit only after the budget is gone must not spend another
-// attempt on an account that is already refusing it.
 func driveQuotaRetry(elapsed time.Duration) (refund, stop bool) {
 	return elapsed < driveRateLimitBudget, elapsed >= driveRateLimitBudget
 }
@@ -768,17 +719,14 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	}
 	maxAttempts := driveMaxAttempts
 	if singleAttempt {
-		// Recovery must not start another retry/refund loop beside the primary;
-		// an idle socket probe also has no payload worth retrying for.
 		maxAttempts = 1
 	}
 	backoff := s.backoff
 	var lastErr error
-	// the connection of the last failed attempt: the retry goes over another one
+
 	var failedConn *poolConn
 	kind := -1
 	if s.timing != nil {
-		// the same for every attempt, and it may decode the body
 		kind = classifyDriveRequest(ctx, method, target, contentType, body)
 	}
 
@@ -815,17 +763,12 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			pool = s.reserved
 		}
 		if descriptionHedge && s.readRescue != nil {
-			// A stalled priority window must not queue its own recovery.
 			pool = s.readRescue
 		}
 		if media != nil && !media.rescue && s.mediaRanges != nil {
-			// Ranges of a long download must not queue slot writes or tail
-			// reads behind them in inflight.
 			pool = s.mediaRanges
 		}
 		if media != nil && media.rescue && s.mediaRescue != nil {
-			// A stalled bulk window must not queue its own recovery, nor take
-			// the permits reserved for head descriptions and acknowledgements.
 			pool = s.mediaRescue
 		}
 		poolStart := time.Now()
@@ -931,8 +874,6 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				}
 				if primary != nil {
 					if previous {
-						// A transport replay is recovery already, not a stalled
-						// first dispatch that should also acquire a hedge.
 						primary.replay()
 					} else {
 						primary.dispatch()
@@ -1016,9 +957,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		respAt := time.Now()
 		noteTimeout := func() {
 			if ctx.Err() == nil && dispatched.Load() && !admissionFailed.Load() && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
-				// A connection that served nothing since the request began is
-				// dead, not Drive throttling: replace it without shrinking the
-				// write window or cooling the readers.
+
 				dead := false
 				if t, ok := httpc.Transport.(*sessionTransport); ok {
 					dead = t.stalled(began, selected.Load())
@@ -1080,7 +1019,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		resp.Body.Close()
 		cancel()
-		// Keep the permits until EOF/Close, including media response bodies.
+
 		releasePermit()
 		bodyEnd := time.Now()
 		headAtCompletion := media != nil && mediaHead(ctx)
@@ -1142,9 +1081,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if singleAttempt {
 				return 0, nil, lastErr
 			}
-			// One retry with a freshly fetched token can ride out a token that
-			// expired early. A second rejection means the answer will not
-			// change: stop instead of fetching a token for every attempt.
+
 			if rejected++; rejected > 1 {
 				return 0, nil, authError{code: "401"}
 			}
@@ -1169,7 +1106,6 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			if refund, stop := driveQuotaRetry(time.Since(firstTry)); refund {
 				refunded++
 			} else if stop {
-				// the budget is spent: give up now, not after eight more attempts
 				return 0, nil, lastErr
 			}
 			continue
@@ -1198,10 +1134,6 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	return 0, nil, lastErr
 }
 
-// readResponse reads at most limit+1 bytes. When the server announced a length
-// that fits the cap, the buffer is allocated once; io.ReadAll would regrow and
-// copy a 512 KiB media range about twenty times. The extra bytes.MinRead keeps
-// bytes.Buffer.ReadFrom from growing the buffer again just to see EOF.
 func readResponse(r io.Reader, limit, announced int64) ([]byte, error) {
 	if announced <= 0 || announced > limit || announced > maxSegmentBytes {
 		return io.ReadAll(io.LimitReader(r, limit+1))
@@ -1233,8 +1165,6 @@ func (s *driveStorage) waitDispatch(ctx context.Context, cleanupDelete bool) err
 	}
 }
 
-// waitCool re-reads the deadline after every sleep: a cooldown extended while a
-// request was waiting must not release it into the limit again.
 func (s *driveStorage) waitCool(ctx context.Context) error {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1260,7 +1190,7 @@ func (s *driveStorage) cool() {
 	now := time.Now()
 	until := now.Add(jitter(driveCooldown))
 	s.coolMu.Lock()
-	// a later, shorter draw must not end a cooldown that is still running
+
 	if until.After(s.coolUntil) {
 		s.coolUntil = until
 	}
@@ -1281,8 +1211,6 @@ func (s *driveStorage) lastThrottleAt() time.Time {
 	return s.lastThrottle
 }
 
-// lastRateLimitAt is set only by cool() (403 rate limit / 429), not by attempt
-// timeouts, so a stall does not disable the read hedge.
 func (s *driveStorage) lastRateLimitAt() time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
@@ -1303,8 +1231,6 @@ func (s *driveStorage) invalidateToken(used string) {
 
 const idCacheMax = 4096
 
-// rememberID merges confirmed identities; a partial or lagging listing must
-// not erase an object that a create or an earlier page already confirmed.
 func (s *driveStorage) rememberID(name, id string, extra []string) {
 	if id == "" {
 		return
@@ -1321,8 +1247,7 @@ func (s *driveStorage) rememberListedIDs(name string, listed []string) {
 	}
 	s.idMu.Lock()
 	defer s.idMu.Unlock()
-	// Re-listing a name whose single id is already the cached primary changes
-	// nothing; skip the per-name map and slice rebuilds on every poll.
+
 	if len(listed) == 1 && s.ids[name] == listed[0] && len(s.missingIDs[name]) == 0 {
 		return
 	}
@@ -1477,7 +1402,6 @@ func (s *driveStorage) cachedFiles(flat string, descendants bool) map[string]dri
 	return found
 }
 
-// cachedFileLocked snapshots one name with idMu held, excluding missing ids.
 func (s *driveStorage) cachedFileLocked(name string) driveFile {
 	id := s.ids[name]
 	if id == "" {
@@ -1542,7 +1466,7 @@ func (s *driveStorage) cachedID(name string) (string, bool) {
 type driveFile struct {
 	id          string
 	description string
-	extra       []string // ids of other objects under the same name
+	extra       []string
 }
 
 func (s *driveStorage) query(ctx context.Context, condition string) (map[string]driveFile, error) {
@@ -1620,7 +1544,6 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 	}
 }
 
-// resolveIDs is every id under the exact name
 func (s *driveStorage) resolveIDs(ctx context.Context, flat string) ([]string, error) {
 	found, err := s.query(context.WithValue(ctx, namesOnlyKey{}, true), "name = '"+quoteDriveValue(flat)+"'")
 	file := mergeDriveFile(s.cachedFiles(flat, false)[flat], found[flat])
@@ -1659,7 +1582,6 @@ func (s *driveStorage) putInline(ctx context.Context, name string, data []byte) 
 	return err
 }
 
-// create makes an object with description and no body and returns its id
 func (s *driveStorage) create(ctx context.Context, name, description string) (string, error) {
 	flat := flatten(name)
 
@@ -1696,8 +1618,6 @@ func (s *driveStorage) create(ctx context.Context, name, description string) (st
 	return parsed.ID, nil
 }
 
-// multipartBody chooses a fresh boundary absent from both parts, including
-// arbitrary binary payloads, and returns its matching Content-Type.
 func multipartBody(metadata, data []byte) ([]byte, string) {
 	var boundary string
 	for {
@@ -1845,9 +1765,6 @@ func (s *driveShared) cleanupPool() chan struct{} {
 	return s.cleanupInflight
 }
 
-// waitCleanupSlot is a token bucket capping cleanup deletes at cleanupRate per
-// second per storage. It holds at most one token, so deletes are spaced rather
-// than bursty, and it honours ctx cancellation while waiting.
 func (s *driveStorage) waitCleanupSlot(ctx context.Context) error {
 	rate := s.cleanupRate
 	if rate <= 0 {
@@ -1880,9 +1797,6 @@ func (s *driveStorage) waitCleanupSlot(ctx context.Context) error {
 	}
 }
 
-// deleteChild removes one child of a deleted prefix. A rate-limited attempt is
-// retried after a jittered delay, up to cleanupMaxRetries tries in total, then
-// reported as an ordinary error. Non-rate-limit errors are returned at once.
 func (s *driveStorage) deleteChild(ctx context.Context, name, id string) error {
 	ctx = context.WithValue(ctx, cleanupKey{}, true)
 	delay := s.cleanupRetryDelay
@@ -2049,7 +1963,6 @@ func (s *driveStorage) Close() error {
 	return nil
 }
 
-// makeSlot implements slotStore
 func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error) {
 	id, err := s.create(ctx, name, "")
 	if err == nil && id == "" {
@@ -2058,7 +1971,6 @@ func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error
 	return id, err
 }
 
-// setSlot implements slotStore, a description and a body go in one request
 func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
 	if body == nil {
 		ctx = context.WithValue(ctx, attemptKey{}, driveSlotWrite)
@@ -2093,24 +2005,18 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	return nil
 }
 
-// noteDescriptionRead accrues one hedge token per twenty completed priority
-// description reads, capped at six. Speculative tails cannot fund or spend the
-// head's recovery budget, and cancelled/failed reads do not refill it.
 func (s *driveStorage) noteDescriptionRead() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
 	accrueHedgeToken(&s.readHedgeCount, &s.readHedgeTokens)
 }
 
-// takeHedgeToken spends one token when the hedge timer fires.
 func (s *driveStorage) takeHedgeToken() bool {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
 	return spendHedgeToken(&s.readHedgeTokens)
 }
 
-// noteMediaRange and takeMediaHedgeToken keep the same budget rule for media
-// ranges: one token per twenty completed ranges, capped at six.
 func (s *driveStorage) noteMediaRange() {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
@@ -2128,8 +2034,6 @@ func (s *driveStorage) takeMediaHedgeToken() bool {
 	return spendHedgeToken(&s.mediaHedgeTokens)
 }
 
-// Only a tracked, currently required head range waits for replenishment. Taking
-// or subscribing under the same lock avoids missing a completion's broadcast.
 func (s *driveStorage) takeMediaHedgeTokenOrWait() (bool, <-chan struct{}) {
 	s.readHedgeMu.Lock()
 	defer s.readHedgeMu.Unlock()
@@ -2167,8 +2071,6 @@ func (s *driveStorage) descriptionHedgeAllowed() bool {
 	return !now.Before(s.coolUntil) && (s.lastRateLimit.IsZero() || now.Sub(s.lastRateLimit) > driveDescriptionHedgeQuiet)
 }
 
-// Recheck recovery admission at the dispatch boundary as well as when its
-// timer fires. Ordinary reads keep their existing cooldown/retry behavior.
 func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 	if gate, ok := ctx.Value(readHedgeGateKey{}).(readHedgeGate); ok {
 		var remaining time.Duration
@@ -2179,9 +2081,6 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 			remaining, pending = gate.primary.remaining(gate.delay)
 		}
 		if !pending || remaining > 0 {
-			// Recheck queued duplicates against their actual recovery target.
-			// Tracked streams can remain blocked despite unverified wire bytes;
-			// every gate still excludes primary retry/transport recovery.
 			return false
 		}
 	}
@@ -2200,12 +2099,6 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 	return true
 }
 
-// readDescHedged recovers only head/watermark reads, with at most one concurrent
-// hedge per session and one dispatch per hedge. Its timer starts at dispatch and
-// follows response progress, never token/permit waits or retry backoff. A spent
-// timer does not wait for future budget tokens or the end of a quota window.
-// The first 200/404 still wins; the slot reader validates sequence/checksum, so
-// mutable descriptions are neither cached nor coalesced here.
 func (s *driveStorage) readDescHedged(ctx context.Context, target string) (status int, payload []byte, err error) {
 	if ctx.Value(laneKey{}) == nil {
 		return s.do(ctx, http.MethodGet, target, "", nil)
@@ -2262,7 +2155,7 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 			}
 			s.readHedgeActive.Store(false)
 		}
-		// No repeated timer/budget chasing beside a queued or retrying primary.
+
 		select {
 		case r := <-ch:
 			return r.status, r.payload, r.err
@@ -2273,7 +2166,6 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 	hedgeCtx := context.WithValue(ctx, descriptionHedgeKey{}, true)
 	hedgeCtx = context.WithValue(hedgeCtx, readHedgeGateKey{}, readHedgeGate{primary: primary, delay: s.readHedge})
 	if s.priorityClient == nil {
-		// Fallback for storages without a separate priority connection.
 		hedgeCtx = context.WithValue(hedgeCtx, bodyKey{}, true)
 	}
 	ctx2, cancel2 := context.WithCancel(hedgeCtx)
@@ -2303,7 +2195,6 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 	return last.status, last.payload, last.err
 }
 
-// readDescription implements slotStore
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
 	ctx = context.WithValue(ctx, attemptKey{}, driveSlotRead)
 	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields="+s.streamingFields()+"&supportsAllDrives=true")
@@ -2327,7 +2218,6 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	return parsed.Description, nil
 }
 
-// readBody implements slotStore
 func (s *driveStorage) readBody(ctx context.Context, id string) ([]byte, error) {
 	ctx = context.WithValue(ctx, bodyKey{}, true)
 	status, payload, err := s.do(ctx, http.MethodGet,
@@ -2341,4 +2231,1639 @@ func (s *driveStorage) readBody(ctx context.Context, id string) ([]byte, error) 
 		return nil, errors.New("Drive answered ", status, " for the body of ", id, ": ", string(payload))
 	}
 	return payload, nil
+}
+
+// Owner lifecycle.
+
+// Register before launch; owner shutdown cancels and joins shared work.
+
+func (s *driveShared) beginWork(timeout time.Duration) (context.Context, func(), bool) {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.workClosed {
+		return nil, nil, false
+	}
+	if s.workCtx == nil {
+		s.workCtx, s.workCancel = context.WithCancel(context.Background())
+	}
+	ctx := context.WithValue(s.workCtx, keeperKey{}, true)
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	s.workWG.Add(1)
+	return ctx, func() { cancel(); s.workWG.Done() }, true
+}
+
+func (s *driveShared) beginRequest(parent context.Context) (context.Context, func(), bool) {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	if s.workClosed {
+		return nil, nil, false
+	}
+	if s.workCtx == nil {
+		s.workCtx, s.workCancel = context.WithCancel(context.Background())
+	}
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(s.workCtx, cancel)
+	s.workWG.Add(1)
+	return ctx, func() { stop(); cancel(); s.workWG.Done() }, true
+}
+
+func (s *driveShared) cancelWork() {
+	s.workMu.Lock()
+	s.workClosed = true
+	if s.workCancel != nil {
+		s.workCancel()
+	}
+	s.workMu.Unlock()
+}
+
+func (s *driveShared) closeWork() {
+	s.cancelWork()
+	s.workWG.Wait()
+}
+
+func (s *driveShared) isWorkClosed() bool {
+	s.workMu.Lock()
+	defer s.workMu.Unlock()
+	return s.workClosed
+}
+
+// Generated IDs and slot creation.
+
+type idPoolEntry struct {
+	id string
+	at time.Time
+}
+
+const idPoolTTL = 10 * time.Minute
+
+func (s *driveShared) idPoolCap() int {
+	return max(3*s.poolRing, 1000)
+}
+
+func (s *driveStorage) generateIDs(ctx context.Context, n int) ([]string, error) {
+	if n > 1000 {
+		n = 1000
+	}
+	status, payload, err := s.do(ctx, http.MethodGet,
+		s.filesURL+"/generateIds?count="+strconv.Itoa(n)+"&space=drive", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, errors.New("Drive generateIds answered ", status, ": ", string(payload))
+	}
+	var parsed struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.Unmarshal(payload, &parsed); err != nil {
+		return nil, errors.New("failed to parse Drive generateIds").Base(err)
+	}
+	if len(parsed.IDs) != n {
+		return nil, errors.New("Drive returned ", len(parsed.IDs), " ids, want ", n)
+	}
+	seen := make(map[string]bool, len(parsed.IDs))
+	for _, id := range parsed.IDs {
+		if len(id) == 0 || len(id) > maxSlotIDLen || seen[id] {
+			return nil, errors.New("Drive returned invalid or repeated generated ids")
+		}
+		seen[id] = true
+	}
+	return parsed.IDs, nil
+}
+
+func (s *driveStorage) takeIDs(parent context.Context, n, ringWorth int) ([]string, error) {
+	ctx, finish, ok := s.beginRequest(parent)
+	if !ok {
+		return nil, context.Canceled
+	}
+	defer finish()
+	if n <= 0 {
+		return nil, nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if s.isWorkClosed() {
+			return nil, context.Canceled
+		}
+		s.poolMu.Lock()
+		s.poolRing = max(s.poolRing, 2*ringWorth)
+		s.prunePoolLocked()
+		if len(s.idPool) < n {
+			if f := s.poolFlight; f != nil {
+				s.poolMu.Unlock()
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-f.done:
+
+					s.poolMu.Lock()
+					filled := len(s.idPool) >= n
+					s.poolMu.Unlock()
+					if filled {
+						continue
+					}
+					if err := flightFailure(f.err); err != nil {
+						return nil, err
+					}
+				}
+				continue
+			}
+			if time.Now().Before(s.poolRetryAt) && s.poolErr != nil {
+				err := s.poolErr
+				s.poolMu.Unlock()
+				return nil, err
+			}
+		}
+		take := min(n, len(s.idPool))
+		taken := append([]idPoolEntry(nil), s.idPool[:take]...)
+		s.idPool = s.idPool[take:]
+		out := make([]string, 0, n)
+		for _, e := range taken {
+			out = append(out, e.id)
+		}
+		if take == n {
+			s.refillPoolLocked()
+			s.poolMu.Unlock()
+			return out, nil
+		}
+		shortfall := n - take
+		batch := max(shortfall, min(s.idPoolCap(), 1000))
+		f := &idPoolFlight{done: make(chan struct{})}
+		s.poolFlight = f
+		s.poolMu.Unlock()
+
+		var ids []string
+		var err error
+		if shortfall > 1000 {
+			err = errors.New("Drive id shortfall exceeds 1000")
+		} else {
+			ids, err = s.generateIDs(ctx, batch)
+			if err == nil && len(ids) != batch {
+				err = errors.New("Drive returned ", len(ids), " ids, want ", batch)
+			}
+		}
+		s.poolMu.Lock()
+		if err != nil {
+			s.idPool = append(s.idPool, taken...)
+		} else {
+			now := time.Now()
+			for _, id := range ids[shortfall:] {
+				s.idPool = append(s.idPool, idPoolEntry{id: id, at: now})
+			}
+		}
+		s.prunePoolLocked()
+		s.finishPoolFlightLocked(f, err)
+		if err == nil {
+			s.refillPoolLocked()
+		}
+		s.poolMu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return append(out, ids[:shortfall]...), nil
+	}
+}
+
+func (s *driveShared) refillPoolLocked() {
+	if s.owner == nil || len(s.idPool) >= 2*s.poolRing {
+		return
+	}
+	f, want := s.beginRefillLocked(false)
+	if f == nil {
+		return
+	}
+	ctx, finish, ok := s.beginWork(30 * time.Second)
+	if !ok {
+		s.finishPoolFlightLocked(f, context.Canceled)
+		return
+	}
+	go func() { defer finish(); s.owner.refillIDs(ctx, f, want) }()
+}
+
+func (s *driveShared) prunePoolLocked() {
+	if s.poolRing <= 0 {
+		s.poolRing = 2 * (64 + 1)
+	}
+	now := time.Now()
+	kept := s.idPool[:0]
+	for _, e := range s.idPool {
+		if now.Sub(e.at) < idPoolTTL {
+			kept = append(kept, e)
+		}
+	}
+	s.idPool = kept[max(0, len(kept)-s.idPoolCap()):]
+}
+
+func (s *driveShared) beginRefillLocked(refreshOld bool) (*idPoolFlight, int) {
+	if s.poolFlight != nil || time.Now().Before(s.poolRetryAt) {
+		return nil, 0
+	}
+	want := s.idPoolCap() - len(s.idPool)
+	if refreshOld {
+		for _, e := range s.idPool {
+			if time.Since(e.at) > 5*time.Minute {
+				want++
+			}
+		}
+	}
+	if want <= 0 {
+		return nil, 0
+	}
+	f := &idPoolFlight{done: make(chan struct{})}
+	s.poolFlight = f
+	return f, want
+}
+
+func (s *driveShared) finishPoolFlightLocked(f *idPoolFlight, err error) {
+	f.err = err
+	s.poolErr = err
+	if stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) || stderrors.Is(err, errSessionClosed) {
+		s.poolErr = nil
+		s.poolRetryAt = time.Time{}
+	} else if err != nil {
+		s.coolMu.Lock()
+		s.poolRetryAt = s.coolUntil
+		s.coolMu.Unlock()
+	} else {
+		s.poolRetryAt = time.Time{}
+	}
+	s.poolFlight = nil
+	close(f.done)
+}
+
+func flightFailure(err error) error {
+	if err == nil || stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded) || stderrors.Is(err, errSessionClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *driveStorage) refillIDs(ctx context.Context, f *idPoolFlight, want int) {
+	var err error
+	for want > 0 {
+		batch := min(want, 1000)
+		var ids []string
+		ids, err = s.generateIDs(ctx, batch)
+		if err == nil && len(ids) != batch {
+			err = errors.New("Drive returned ", len(ids), " ids, want ", batch)
+		}
+		if err != nil {
+			break
+		}
+		s.poolMu.Lock()
+		now := time.Now()
+		for _, id := range ids {
+			s.idPool = append(s.idPool, idPoolEntry{id: id, at: now})
+		}
+		s.prunePoolLocked()
+		s.poolMu.Unlock()
+		want -= batch
+	}
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+	s.prunePoolLocked()
+	s.finishPoolFlightLocked(f, err)
+}
+
+type createError struct {
+	status  int
+	payload []byte
+}
+
+func (e createError) Error() string {
+	return "Drive create answered " + strconv.Itoa(e.status) + ": " + string(e.payload)
+}
+
+func (s *driveStorage) createWithID(ctx context.Context, metadata map[string]interface{}, body []byte) error {
+	md, err := json.Marshal(metadata)
+	if err != nil {
+		return errors.New("failed to build the create metadata").Base(err)
+	}
+	target := s.filesURL + "?fields=id&supportsAllDrives=true"
+	contentType := "application/json; charset=UTF-8"
+	payload := md
+	if body != nil {
+		ctx = context.WithValue(ctx, bodyKey{}, true)
+		target = withAllDrives(s.uploadURL)
+		payload, contentType = multipartBody(md, body)
+	}
+	status, reply, err := s.do(ctx, http.MethodPost, target, contentType, payload)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return createError{status: status, payload: reply}
+	}
+	name, _ := metadata["name"].(string)
+	id, _ := metadata["id"].(string)
+	s.rememberID(name, id, nil)
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(reply, &parsed) == nil {
+		s.rememberID(name, parsed.ID, nil)
+	}
+	return nil
+}
+
+func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	flat := flatten(name)
+	metadata := map[string]interface{}{
+		"id":          id,
+		"name":        flat,
+		"parents":     []string{s.folder},
+		"description": description,
+	}
+	if properties := s.streamingProperties(); properties != nil {
+		metadata["properties"] = properties
+	}
+	err := s.createWithID(ctx, metadata, body)
+	if err == nil {
+		return nil
+	}
+	ce, ok := err.(createError)
+	if ok && ce.status >= 400 && ce.status < 500 && ce.status != http.StatusUnauthorized &&
+		ce.status != http.StatusTooManyRequests && !(ce.status == http.StatusForbidden && rateLimited(ce.payload)) {
+		if existing, derr := s.readDescription(ctx, id); derr == nil {
+
+			if body != nil || existing != description {
+				s.fallbackLogOnce.Do(func() {
+					errors.LogInfo(ctx, "xdrive: create with pre-generated id fell back to update")
+				})
+				if err := s.setSlot(ctx, id, description, body); err != nil {
+					return err
+				}
+			}
+			s.rememberID(flat, id, nil)
+			return nil
+		} else if isAuthError(derr) || stderrors.Is(derr, context.Canceled) || stderrors.Is(derr, context.DeadlineExceeded) {
+			return derr
+		}
+	}
+	return err
+}
+
+type idPoolFlight struct {
+	done chan struct{}
+	err  error
+}
+
+type idPoolState struct {
+	poolMu          sync.Mutex
+	idPool          []idPoolEntry
+	poolRing        int
+	poolFlight      *idPoolFlight
+	poolRetryAt     time.Time
+	poolErr         error
+	fallbackLogOnce sync.Once
+}
+
+// Connection maintenance.
+
+type keeperKey struct{}
+
+// Maintenance probes do not retry.
+
+type keeperProbeKey struct{}
+
+func (s *driveShared) noteTraffic() {
+	s.trafficMu.Lock()
+	s.lastTraffic = time.Now()
+	s.trafficMu.Unlock()
+	s.startKeeper()
+}
+
+func (s *driveShared) noteRequest(ctx context.Context) {
+	s.trafficMu.Lock()
+	s.lastRequest = time.Now()
+	traffic := ctx.Value(keeperKey{}) == nil
+	if traffic {
+		s.lastTraffic = s.lastRequest
+	}
+	s.trafficMu.Unlock()
+	if traffic {
+		s.startKeeper()
+	}
+}
+
+func (s *driveShared) startKeeper() {
+	s.keeperMu.Lock()
+	defer s.keeperMu.Unlock()
+	if s.keeperClosed || s.keeperRunning || s.owner == nil {
+		return
+	}
+	if s.keepWarmEvery <= 0 {
+		s.keepWarmEvery = 4 * time.Minute
+	}
+	if s.keepWarmWindow <= 0 {
+		s.keepWarmWindow = 3 * time.Hour
+	}
+	workCtx, finish, ok := s.beginWork(0)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(workCtx)
+	s.keeperCancel = cancel
+	s.keeperDone = make(chan struct{})
+	s.keeperRunning = true
+	done := s.keeperDone
+	go func() { defer finish(); defer cancel(); s.keepWarm(ctx, done) }()
+}
+
+func (s *driveShared) stopKeeper() {
+	s.keeperMu.Lock()
+	s.keeperClosed = true
+	done := s.keeperDone
+	cancel := s.keeperCancel
+	s.keeperMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (s *driveShared) keeperStorage() *driveStorage {
+	warm := &driveStorage{
+		driveShared: s,
+		client:      s.owner.client,
+		inflight:    s.owner.inflight,
+		reserved:    s.owner.reserved,
+	}
+	var transports []*sessionTransport
+	if s.conns != nil {
+		t := &sessionTransport{pool: s.conns}
+		warm.client = &http.Client{Transport: t}
+		transports = append(transports, t)
+	}
+	if s.bulkConns != nil {
+		t := &sessionTransport{pool: s.bulkConns}
+		warm.bulkClient = &http.Client{Transport: t}
+		transports = append(transports, t)
+	}
+	warm.release = func() {
+		for _, t := range transports {
+			t.Close()
+		}
+	}
+	return warm
+}
+
+func (s *driveStorage) keepWarmConnection(ctx context.Context, target string) error {
+	ctx = context.WithValue(ctx, keeperProbeKey{}, true)
+	status, _, err := s.do(ctx, http.MethodGet, target, "", nil)
+	if err == nil && status != http.StatusOK {
+		err = errors.New("Drive keep-warm answered ", status)
+	}
+	return err
+}
+
+func (s *driveShared) keepWarm(runCtx context.Context, done chan struct{}) {
+	t := time.NewTicker(s.keepWarmEvery)
+	defer t.Stop()
+	var warm *driveStorage
+	defer func() {
+		if warm != nil {
+			warm.Close()
+		}
+	}()
+	for {
+		select {
+		case <-runCtx.Done():
+		case <-t.C:
+		}
+		s.keeperMu.Lock()
+		s.trafficMu.Lock()
+		lastTraffic, lastRequest := s.lastTraffic, s.lastRequest
+		s.trafficMu.Unlock()
+		if runCtx.Err() != nil || time.Since(lastTraffic) > s.keepWarmWindow {
+			s.keeperRunning = false
+			close(done)
+			s.keeperMu.Unlock()
+			return
+		}
+		s.keeperMu.Unlock()
+		o := s.owner
+		if o.cooling() || time.Since(o.lastRateLimitAt()) <= 5*time.Second {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(runCtx, 30*time.Second)
+		o.tokenMu.Lock()
+		tokenBefore := o.token
+		needsToken := tokenBefore == "" || !time.Now().Before(o.tokenExpiry)
+		o.tokenMu.Unlock()
+		tok, err := o.accessToken(ctx)
+		if err != nil {
+			errors.LogDebug(ctx, "xdrive keep-warm token: ", err)
+		}
+		tokenFetched := needsToken || tok != tokenBefore
+		if tokenFetched {
+			s.noteRequest(ctx)
+		}
+		s.poolMu.Lock()
+		s.prunePoolLocked()
+		var flight *idPoolFlight
+		var want int
+		if err == nil && !tokenFetched && time.Since(lastRequest) > 2*time.Minute {
+			low, old := len(s.idPool) < 2*s.poolRing, false
+			for _, e := range s.idPool {
+				old = old || time.Since(e.at) > 5*time.Minute
+			}
+			if low || old {
+				flight, want = s.beginRefillLocked(old)
+			}
+		}
+		s.poolMu.Unlock()
+		idle := err == nil && time.Since(lastRequest) > 2*time.Minute
+		if (idle || flight != nil) && warm == nil {
+			warm = s.keeperStorage()
+		}
+		if flight != nil {
+			warm.refillIDs(ctx, flight, want)
+			if flight.err != nil {
+				errors.LogDebug(ctx, "xdrive keep-warm ids: ", flight.err)
+			}
+		}
+		if idle && ctx.Err() == nil && (flight == nil || flight.err == nil) {
+			target := s.filesURL + "/" + url.PathEscape(s.folder) + "?fields=id&supportsAllDrives=true"
+			if s.conns != nil && flight == nil {
+				if err := warm.keepWarmConnection(ctx, target); err != nil {
+					errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
+				}
+			}
+			if s.bulkConns != nil && ctx.Err() == nil {
+				if err := warm.keepWarmConnection(context.WithValue(ctx, bodyKey{}, true), target); err != nil {
+					errors.LogDebug(ctx, "xdrive keep-warm connection: ", err)
+				}
+			}
+		}
+		cancel()
+		if warm != nil {
+			warm.Close()
+			warm = nil
+		}
+	}
+}
+
+// Media ranges and adaptive recovery.
+
+const (
+	// Media GETs cost 200 quota units; recovery does not expand the range budget.
+
+	driveMediaLanes = 4
+	driveMediaPart  = 128 << 10
+
+	driveMediaInflight = driveMaxInflight - 2*driveReservedInflight
+)
+
+type driveMediaKey struct{}
+
+type (
+	mediaHeadKey      struct{}
+	mediaPromotionKey struct{}
+)
+
+type mediaDeliveryKey struct{}
+
+func mediaHead(ctx context.Context) bool {
+	if ctx.Value(mediaHeadKey{}) != nil {
+		return true
+	}
+	promoted, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
+	select {
+	case <-promoted:
+		return true
+	default:
+		return false
+	}
+}
+
+type driveMediaRequest struct {
+	start, end, size int
+	seq              int64
+	client           *http.Client
+	rescue           bool
+	stream           *driveRangeStream
+}
+
+func (r *driveMediaRequest) extract(status int, contentRange string, body []byte) ([]byte, error) {
+	if status == http.StatusOK {
+		if len(body) == r.size {
+			return body[r.start:r.end], nil
+		}
+	} else if contentRange == fmt.Sprintf("bytes %d-%d/%d", r.start, r.end-1, r.size) && len(body) == r.end-r.start {
+		return body, nil
+	}
+	return nil, errors.New("Drive media range has an unexpected offset or length")
+}
+
+func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotFrame) ([]byte, error) {
+	if frame.size <= 0 || frame.size > maxSegmentBytes {
+		return nil, errors.New("invalid Drive media frame size")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ctx = context.WithValue(ctx, bodyKey{}, true)
+	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
+	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+	lanes := max(1, len(s.mediaClients))
+
+	partSize := int(defaultSegmentBytes)
+	if ctx.Value(mediaHeadKey{}) != nil {
+		partSize = driveMediaPart
+	}
+	parts := max(1, min((frame.size+partSize-1)/partSize, lanes))
+	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+		parts = 1
+	}
+	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
+	if parts == 1 {
+		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq}
+		if len(s.mediaClients) > 0 {
+			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
+		}
+		body, err := s.readMediaRange(ctx, target, r)
+		if err != nil {
+			return nil, err
+		}
+		if !frame.holds(body) {
+			return nil, errors.New("Drive media ranges do not match the segment checksum")
+		}
+		return body, nil
+	}
+	width := (frame.size + parts - 1) / parts
+	type result struct {
+		start int
+		body  []byte
+		err   error
+	}
+	results := make(chan result, parts)
+	for i := range parts {
+		r := driveMediaRequest{start: i * width, end: min((i+1)*width, frame.size), size: frame.size, seq: frame.seq}
+		if len(s.mediaClients) > 0 {
+			r.client = s.mediaClients[int((first+uint32(i))%uint32(len(s.mediaClients)))]
+		}
+		go func() {
+			body, err := s.readMediaRange(ctx, target, r)
+			results <- result{r.start, body, err}
+		}()
+	}
+	body := make([]byte, frame.size)
+	for range parts {
+		select {
+		case res := <-results:
+			if res.err != nil {
+				return nil, res.err
+			}
+			copy(body[res.start:], res.body)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if !frame.holds(body) {
+		return nil, errors.New("Drive media ranges do not match the segment checksum")
+	}
+	return body, nil
+}
+
+func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r driveMediaRequest, delay time.Duration, delivery func() (int, <-chan struct{}, time.Time)) (time.Duration, bool, <-chan struct{}) {
+	next, changed, waitAt := delivery()
+	if !mediaHead(ctx) {
+		return 0, false, changed
+	}
+	if next == r.size {
+		remaining, active := primary.remainingSinceDispatch(delay)
+		return remaining, active, changed
+	}
+	if next < r.start || next >= r.end || waitAt.IsZero() {
+		return 0, false, changed
+	}
+	remaining, active := primary.remainingSinceDispatch(delay)
+	return remaining, active, changed
+}
+
+// One rescue per required head range, under the existing media budget.
+
+func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driveMediaRequest) ([]byte, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	primary := &driveReadProgress{dispatched: make(chan struct{})}
+	delivery, tracked := ctx.Value(mediaDeliveryKey{}).(func() (int, <-chan struct{}, time.Time))
+	tracked = tracked && delivery != nil && r.stream != nil && r.stream.frame.mode == slotStream
+	hedgeDelay := slotBodyHedge
+	gate := readHedgeGate{primary: primary, delay: hedgeDelay}
+	if tracked {
+		gate.remaining = func() (time.Duration, bool) {
+			remaining, eligible, _ := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+			return remaining, eligible
+		}
+	} else {
+		gate.remaining = func() (time.Duration, bool) {
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
+			return remaining, active && mediaHead(ctx)
+		}
+	}
+	type result struct {
+		body  []byte
+		err   error
+		hedge bool
+	}
+	results := make(chan result, 2)
+	launch := func(hedge bool) {
+		request := r
+		requestCtx := ctx
+		if hedge {
+			request.client = s.bulkClient
+			request.rescue = true
+			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, gate)
+		} else {
+			requestCtx = context.WithValue(requestCtx, readProgressKey{}, primary)
+			requestCtx = context.WithValue(requestCtx, bodyProgressKey{}, primary.progress)
+		}
+		go func() {
+			status, body, err := s.do(context.WithValue(requestCtx, driveMediaKey{}, &request), http.MethodGet, target, "", nil)
+			if err == nil {
+				switch status {
+				case http.StatusOK, http.StatusPartialContent:
+				case http.StatusNotFound:
+					err = errNotFound
+				default:
+					err = errors.New("Drive media range answered ", status)
+				}
+			}
+			results <- result{body, err, hedge}
+		}()
+	}
+	launch(false)
+	pending := 1
+
+	var timer *time.Timer
+	var hedgeAt <-chan time.Time
+	var dispatched <-chan struct{}
+	var promoted <-chan struct{}
+	var frontier, budgetChanged <-chan struct{}
+	var recoveryStopped, hedged bool
+	promotion, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
+	if hedgeDelay > 0 {
+		dispatched = primary.dispatched
+	}
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	armTracked := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		hedgeAt, frontier, budgetChanged, promoted = nil, nil, nil, nil
+		if recoveryStopped || hedged {
+			return
+		}
+		if _, active := primary.remainingSinceDispatch(hedgeDelay); !active {
+			recoveryStopped = true
+			return
+		}
+		if !mediaHead(ctx) {
+			promoted = promotion
+			return
+		}
+		remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+		frontier = changed
+		if !eligible {
+			return
+		}
+		if timer == nil {
+			timer = time.NewTimer(max(0, remaining))
+		} else {
+			timer.Reset(max(0, remaining))
+		}
+		hedgeAt = timer.C
+	}
+	for {
+		select {
+		case res := <-results:
+			pending--
+			if res.err == nil {
+				s.noteMediaRange()
+				if res.hedge && s.timing != nil {
+					s.timing.noteHedgeWin(kindBodyRead)
+				}
+				return res.body, nil
+			}
+			if pending == 0 || isAuthError(res.err) {
+				return nil, res.err
+			}
+		case <-dispatched:
+			dispatched = nil
+			hedgeDelay = s.mediaHedgeDelay(r)
+			gate.delay = hedgeDelay
+			if tracked {
+				armTracked()
+				continue
+			}
+			if !mediaHead(ctx) {
+				promoted = promotion
+				continue
+			}
+			remaining, _ := primary.remainingSinceDispatch(hedgeDelay)
+			timer = time.NewTimer(max(0, remaining))
+			hedgeAt = timer.C
+		case <-promoted:
+			promoted = nil
+			if tracked {
+				armTracked()
+				continue
+			}
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
+			if active {
+
+				if timer == nil {
+					timer = time.NewTimer(max(0, remaining))
+				} else {
+					timer.Reset(max(0, remaining))
+				}
+				hedgeAt = timer.C
+			}
+		case <-frontier:
+			armTracked()
+		case <-budgetChanged:
+			armTracked()
+		case <-hedgeAt:
+			helper := r
+			helper.rescue = true
+
+			hedgeAt = nil
+			if s.bulkClient == nil || r.client == nil || r.client == s.bulkClient {
+				if tracked {
+					recoveryStopped = true
+					armTracked()
+				}
+				continue
+			}
+			if tracked {
+				remaining, eligible, changed := mediaDeliveryRemaining(ctx, primary, r, hedgeDelay, delivery)
+				if !eligible || remaining > 0 {
+					armTracked()
+					continue
+				}
+				if !s.readHedgeAllowed(context.WithValue(ctx, driveMediaKey{}, &helper)) {
+
+					recoveryStopped = true
+					armTracked()
+					continue
+				}
+				taken, changedBudget := s.takeMediaHedgeTokenOrWait()
+				if !taken {
+					frontier, budgetChanged = changed, changedBudget
+					continue
+				}
+				hedged = true
+				armTracked()
+				pending++
+				launch(true)
+				continue
+			}
+			remaining, active := primary.remainingSinceDispatch(hedgeDelay)
+			if !active {
+				continue
+			}
+			if remaining > 0 {
+				timer.Reset(remaining)
+				hedgeAt = timer.C
+				continue
+			}
+			if !mediaHead(ctx) {
+
+				promoted = promotion
+				if s.timing != nil {
+					s.timing.noteDeferredHedge(kindBodyRead)
+				}
+				continue
+			}
+			if !s.readHedgeAllowed(context.WithValue(ctx, driveMediaKey{}, &helper)) || !s.takeMediaHedgeToken() {
+				continue
+			}
+			hedged = true
+			pending++
+			launch(true)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+// Verified streaming.
+
+const driveStreamBlockBytes = slotStreamBlockBytes
+
+type driveRangeStream struct {
+	frame slotFrame
+	emit  func(int, []byte) error
+	mu    sync.Mutex
+	wg    sync.WaitGroup
+	done  bool
+}
+
+func (s *driveRangeStream) closeAndWait() {
+	s.mu.Lock()
+	s.done = true
+	s.mu.Unlock()
+	s.wg.Wait()
+}
+
+func (s *driveRangeStream) read(request driveMediaRequest, status int, contentRange string, contentLength int64, body io.Reader) ([]byte, error) {
+	s.mu.Lock()
+	if s.done {
+		s.mu.Unlock()
+		return nil, context.Canceled
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+	frame := s.frame
+	if frame.size <= 0 || frame.size > maxSegmentBytes || request.size != frame.size ||
+		request.start < 0 || request.start >= request.end || request.end > frame.size ||
+		request.start%driveStreamBlockBytes != 0 ||
+		(request.end != frame.size && request.end%driveStreamBlockBytes != 0) || s.emit == nil {
+		return nil, errors.New("invalid Drive media stream range")
+	}
+	start, end := request.start, request.end
+	switch status {
+	case http.StatusPartialContent:
+		if contentRange != fmt.Sprintf("bytes %d-%d/%d", start, end-1, frame.size) {
+			return nil, errors.New("Drive media stream has an unexpected Content-Range")
+		}
+	case http.StatusOK:
+
+		start, end = 0, frame.size
+	default:
+		return nil, errors.New("Drive media stream answered ", status)
+	}
+
+	if contentLength >= 0 && contentLength != int64(end-start) {
+		return nil, errors.New("Drive media stream has an unexpected Content-Length")
+	}
+	for offset := start; offset < end; {
+		index := offset / driveStreamBlockBytes
+		size := streamBlockSize(frame.size, index)
+		if size <= 0 || size > end-offset {
+			return nil, errors.New("invalid Drive media stream block boundary")
+		}
+		block := make([]byte, size)
+		if _, err := io.ReadFull(body, block); err != nil {
+			return nil, errors.New("failed to read a complete Drive media stream block").Base(err)
+		}
+		if !validStreamBlock(frame, index, block) {
+			return nil, errors.New("Drive media stream block does not match its checksum")
+		}
+		if offset >= request.start && offset < request.end {
+			if err := s.emit(index, block); err != nil {
+				return nil, err
+			}
+		}
+		offset += size
+	}
+	var extra [1]byte
+	n, err := io.ReadFull(body, extra[:])
+	if n != 0 {
+		return nil, errors.New("Drive media stream exceeds the expected response length")
+	}
+	if err != io.EOF {
+		return nil, errors.New("failed to verify Drive media stream EOF").Base(err)
+	}
+	return nil, nil
+}
+
+func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error {
+	if frame.size <= 0 || frame.size > maxSegmentBytes || frame.mode != slotStream ||
+		len(frame.blocks) != (frame.size+driveStreamBlockBytes-1)/driveStreamBlockBytes || emit == nil {
+		return errors.New("invalid Drive media stream frame")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	ctx = context.WithValue(ctx, bodyKey{}, true)
+	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
+	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+	lanes := min(driveMediaLanes, max(1, len(s.mediaClients)))
+	partSize := int(defaultSegmentBytes)
+	if ctx.Value(mediaHeadKey{}) != nil {
+		partSize = driveMediaPart
+	}
+	parts := max(1, min((frame.size+partSize-1)/partSize, lanes))
+	if ctx.Value(mediaHeadKey{}) != nil {
+		parts = min(parts, s.streamHeadRangeLimit())
+	}
+	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
+		parts = 1
+	}
+	if parts > 1 {
+		errors.LogDebug(ctx, "xdrive stream plan slot=", slotTag(id), " seq=", frame.seq,
+			" bytes=", frame.size, " parts=", parts, " head=", ctx.Value(mediaHeadKey{}) != nil,
+			" head-limit=", s.streamHeadRangeLimit())
+	}
+	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
+	stream := &driveRangeStream{frame: frame, emit: emit}
+	defer func() {
+		cancel()
+		stream.closeAndWait()
+	}()
+	if parts == 1 {
+		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq, stream: stream}
+		if len(s.mediaClients) > 0 {
+			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
+		}
+		_, err := s.readMediaRange(ctx, target, r)
+		return err
+	}
+	blocks := len(frame.blocks)
+	results := make(chan error, parts)
+	for i := range parts {
+		r := driveMediaRequest{
+			start:  (i * blocks / parts) * driveStreamBlockBytes,
+			end:    min(((i+1)*blocks/parts)*driveStreamBlockBytes, frame.size),
+			size:   frame.size,
+			seq:    frame.seq,
+			stream: stream,
+		}
+		if len(s.mediaClients) > 0 {
+			r.client = s.mediaClients[int((first+uint32(i))%uint32(len(s.mediaClients)))]
+		}
+
+		go func() {
+			_, err := s.readMediaRange(ctx, target, r)
+			results <- err
+		}()
+	}
+	var firstErr error
+	canceled := ctx.Done()
+	for pending := parts; pending > 0; {
+		select {
+		case err := <-results:
+			pending--
+			if err != nil && firstErr == nil {
+				firstErr = err
+				cancel()
+				canceled = nil
+			}
+		case <-canceled:
+			firstErr = ctx.Err()
+			cancel()
+			canceled = nil
+		}
+	}
+	return firstErr
+}
+
+// Streaming negotiation.
+
+const (
+	driveStreamCapsVersionKey = "xdriveStream"
+	driveStreamCapsSessionKey = "xdriveSession"
+	driveStreamCapsVersion    = "1"
+)
+
+// Session-local negotiation, not authentication or integrity protection.
+
+type driveStreamCaps struct {
+	session   string
+	advertise bool
+	peerReady atomic.Bool
+}
+
+// Configure before traffic; a new nonce starts a fresh capability epoch.
+
+func (s *driveStorage) configureStreaming(session string, peerSupports bool) {
+	if session == "" {
+		return
+	}
+	for {
+		current := s.streamCaps.Load()
+		if current != nil && current.session == session {
+			if peerSupports {
+				current.peerReady.Store(true)
+			}
+			return
+		}
+		next := &driveStreamCaps{session: session, advertise: peerSupports}
+		next.peerReady.Store(peerSupports)
+		if s.streamCaps.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+func (s *driveStorage) streamingEnabled() bool {
+	caps := s.streamCaps.Load()
+	return caps != nil && caps.peerReady.Load()
+}
+
+// Only servers acknowledge accepted offers; client metadata must not self-enable.
+
+func (s *driveStorage) streamingProperties() map[string]string {
+	caps := s.streamCaps.Load()
+	if caps == nil || !caps.advertise {
+		return nil
+	}
+	return map[string]string{
+		driveStreamCapsVersionKey: driveStreamCapsVersion,
+		driveStreamCapsSessionKey: caps.session,
+	}
+}
+
+func (s *driveStorage) observeStreamingProperties(properties map[string]string) {
+	caps := s.streamCaps.Load()
+	if caps != nil && properties[driveStreamCapsVersionKey] == driveStreamCapsVersion && properties[driveStreamCapsSessionKey] == caps.session {
+		caps.peerReady.Store(true)
+	}
+}
+
+func (s *driveStorage) streamingFields() string {
+	if s.streamCaps.Load() != nil {
+		return "description,properties"
+	}
+	return "description"
+}
+
+// Head-range experiment.
+
+const streamHeadRangesEnv = "XRAY_XDRIVE_STREAM_HEAD_RANGES"
+
+func parseStreamHeadRanges(raw string) (int, bool) {
+	switch strings.TrimSpace(raw) {
+	case "", "4":
+		return 4, true
+	case "2":
+		return 2, true
+	default:
+		return 4, false
+	}
+}
+
+func (s *driveStorage) streamHeadRangeLimit() int {
+	if s.streamHeadRanges == 2 {
+		return 2
+	}
+	return 4
+}
+
+// Latency and request telemetry.
+
+const (
+	kindCreate = iota
+	kindSlotInline
+	kindSlotMedia
+	kindWatermark
+	kindHeadRead
+	kindOtherRead
+	kindBodyRead
+	kindDelete
+	kindList
+	kindToken
+	kindCount
+)
+
+var kindNames = [kindCount]string{
+	"create", "slot-write-inline", "slot-write-media", "watermark-write",
+	"head-read", "other-read", "body-read", "delete", "list", "token-fetch",
+}
+
+type watermarkWriteKey struct{}
+
+type timingSample struct {
+	total       time.Duration
+	waitCool    time.Duration
+	waitPool    time.Duration
+	waitToken   time.Duration
+	waitConn    time.Duration
+	dialTLS     time.Duration
+	send        time.Duration
+	server      time.Duration
+	body        time.Duration
+	reused      bool
+	newConn     bool
+	hedge       bool
+	won         bool
+	hasConn     bool
+	hasDial     bool
+	hasSend     bool
+	hasServer   bool
+	dispatch    time.Duration
+	hasDispatch bool
+}
+
+const (
+	timingWindow      = 60 * time.Second
+	timingRing        = 512
+	slowRequestTiming = 2 * time.Second
+	rangeLatencyRing  = 32
+	rangeLatencyMin   = 12
+	mediaHedgeFloor   = 900 * time.Millisecond
+)
+
+// Only validated first-primary samples train size-class dispatch-to-EOF p50.
+
+type rangeLatency struct {
+	mu   sync.Mutex
+	n    int
+	pos  int
+	ring [rangeLatencyRing]time.Duration
+}
+
+func (l *rangeLatency) note(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.ring[l.pos] = d
+	l.pos = (l.pos + 1) % rangeLatencyRing
+	l.n = min(l.n+1, rangeLatencyRing)
+}
+
+func (l *rangeLatency) median() (time.Duration, bool) {
+	l.mu.Lock()
+	if l.n < rangeLatencyMin {
+		l.mu.Unlock()
+		return 0, false
+	}
+	v := append([]time.Duration(nil), l.ring[:l.n]...)
+	l.mu.Unlock()
+	sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+	return percentile(v, .5), true
+}
+
+func rangeClass(r driveMediaRequest) int {
+	if r.end-r.start <= driveMediaPart {
+		return 0
+	}
+	return 1
+}
+
+// Hedge at 1.3x p50, clamped to 900ms–2s; cold classes keep 2s.
+
+func (s *driveStorage) mediaHedgeDelay(r driveMediaRequest) time.Duration {
+	median, ok := s.mediaLatency[rangeClass(r)].median()
+	if !ok {
+		return slotBodyHedge
+	}
+	if median >= slotBodyHedge {
+		return slotBodyHedge
+	}
+	return min(max(median*13/10, mediaHedgeFloor), slotBodyHedge)
+}
+
+func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSample, status, attempt int, replayed bool, err error) {
+	if r == nil || r.rescue || attempt != 0 || replayed || err != nil || !sample.hasDispatch ||
+		(status != http.StatusOK && status != http.StatusPartialContent) {
+		return
+	}
+	s.mediaLatency[rangeClass(*r)].note(sample.dispatch)
+}
+
+type timingAggregator struct {
+	mu         sync.Mutex
+	started    bool
+	stopOnce   sync.Once
+	done       chan struct{}
+	n          [kindCount]int
+	pos        [kindCount]int
+	ring       [kindCount][timingRing]timingSample
+	conns      [kindCount]int
+	hedges     [kindCount]int
+	won        [kindCount]int
+	requests   [kindCount]int
+	failed     [kindCount]int
+	canceled   [kindCount]int
+	rateLimits [kindCount]int
+	deferred   [kindCount]int
+}
+
+func (a *timingAggregator) noteFailure(kind int, canceled bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if canceled {
+		a.canceled[kind]++
+	} else {
+		a.failed[kind]++
+	}
+}
+
+func (a *timingAggregator) noteRateLimit(kind int) {
+	a.mu.Lock()
+	a.rateLimits[kind]++
+	a.mu.Unlock()
+}
+
+func (a *timingAggregator) request(kind int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.started {
+		a.started = true
+		go a.loop()
+	}
+	a.requests[kind]++
+}
+
+func driveQuotaCost(kind int) int {
+	switch kind {
+	case kindToken:
+		return 0
+	case kindCreate, kindSlotInline, kindSlotMedia, kindWatermark, kindDelete:
+		return 50
+	case kindBodyRead:
+		return 200
+	case kindList:
+		return 100
+	default:
+		return 5
+	}
+}
+
+func newTimingAggregator() *timingAggregator {
+	return &timingAggregator{done: make(chan struct{})}
+}
+
+func (a *timingAggregator) record(kind int, s timingSample) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.started {
+		a.started = true
+		go a.loop()
+	}
+	i := a.pos[kind]
+	a.ring[kind][i] = s
+	a.pos[kind] = (i + 1) % timingRing
+	if a.n[kind] < timingRing {
+		a.n[kind]++
+	}
+	if s.newConn {
+		a.conns[kind]++
+	}
+	if s.hedge {
+		a.hedges[kind]++
+	}
+	if s.won {
+		a.won[kind]++
+	}
+}
+
+func (a *timingAggregator) stop() {
+	a.stopOnce.Do(func() { close(a.done) })
+}
+
+func (a *timingAggregator) noteHedge(kind int, won bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.hedges[kind]++
+	if won {
+		a.won[kind]++
+	}
+}
+
+func (a *timingAggregator) noteHedgeWin(kind int) {
+	a.mu.Lock()
+	a.won[kind]++
+	a.mu.Unlock()
+}
+
+func (a *timingAggregator) noteDeferredHedge(kind int) {
+	a.mu.Lock()
+	a.deferred[kind]++
+	a.mu.Unlock()
+}
+
+func (a *timingAggregator) loop() {
+	t := time.NewTicker(timingWindow)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.done:
+			return
+		case <-t.C:
+			a.flush()
+		}
+	}
+}
+
+func percentile(v []time.Duration, p float64) time.Duration {
+	if len(v) == 0 {
+		return -1
+	}
+	return v[min(int(p*float64(len(v))), len(v)-1)]
+}
+
+func dialEnd(tlsDone, connDone time.Time) time.Time {
+	if !tlsDone.IsZero() {
+		return tlsDone
+	}
+	return connDone
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func (s *driveStorage) recordTiming(kind int, sample timingSample) {
+	if s.timing == nil {
+		return
+	}
+	s.timing.record(kind, sample)
+}
+
+func (s *driveStorage) logSlowRequest(ctx context.Context, kind int, path string, sample timingSample, media *driveMediaRequest, headAtDispatch, headAtCompletion bool, status, attempt int) {
+	if kind < 0 || kind >= kindCount || sample.total < slowRequestTiming {
+		return
+	}
+	send, server, connection, dispatch := time.Duration(-1), time.Duration(-1), time.Duration(-1), time.Duration(-1)
+	if sample.hasSend {
+		send = sample.send
+	}
+	if sample.hasServer {
+		server = sample.server
+	}
+	if sample.hasConn {
+		connection = sample.waitConn
+	}
+	if sample.hasDispatch {
+		dispatch = sample.dispatch
+	}
+	if media != nil {
+		errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),
+			" status=", status, " attempt=", attempt,
+			" seq=", media.seq, " range=", media.start, "-", media.end,
+			" frame-bytes=", media.size, " requested-bytes=", media.end-media.start,
+			" total=", sample.total, " pool=", sample.waitPool, " cool=", sample.waitCool,
+			" dispatch-to-eof=", dispatch,
+			" token=", sample.waitToken, " connection=", connection, " send=", send,
+			" server=", server, " body=", sample.body, " rescue=", media.rescue,
+			" head-at-dispatch=", headAtDispatch, " head-at-completion=", headAtCompletion)
+		return
+	}
+	errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),
+		" status=", status, " attempt=", attempt,
+		" total=", sample.total, " pool=", sample.waitPool, " cool=", sample.waitCool,
+		" token=", sample.waitToken, " connection=", connection, " send=", send,
+		" server=", server, " body=", sample.body)
+}
+
+type timingBatch struct {
+	samples                      []timingSample
+	requests, conns, hedges, won int
+	failed, canceled, rateLimits int
+	deferred                     int
+}
+
+func (a *timingAggregator) snapshot() [kindCount]timingBatch {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var batches [kindCount]timingBatch
+	for k := range batches {
+		batches[k] = timingBatch{
+			samples:  append([]timingSample(nil), a.ring[k][:a.n[k]]...),
+			requests: a.requests[k], conns: a.conns[k], hedges: a.hedges[k], won: a.won[k],
+			failed: a.failed[k], canceled: a.canceled[k], rateLimits: a.rateLimits[k],
+			deferred: a.deferred[k],
+		}
+		a.n[k], a.pos[k], a.conns[k], a.hedges[k], a.won[k], a.requests[k] = 0, 0, 0, 0, 0, 0
+		a.failed[k], a.canceled[k], a.rateLimits[k] = 0, 0, 0
+		a.deferred[k] = 0
+	}
+	return batches
+}
+
+func (a *timingAggregator) flush() {
+	for k, batch := range a.snapshot() {
+		n := len(batch.samples)
+		if n == 0 && batch.requests == 0 && batch.hedges == 0 && batch.won == 0 && batch.failed == 0 && batch.canceled == 0 && batch.rateLimits == 0 && batch.deferred == 0 {
+			continue
+		}
+		total := make([]time.Duration, 0, n)
+		pool := make([]time.Duration, 0, n)
+		cool := make([]time.Duration, 0, n)
+		token := make([]time.Duration, 0, n)
+		conn := make([]time.Duration, 0, n)
+		dial := make([]time.Duration, 0, n)
+		send := make([]time.Duration, 0, n)
+		server := make([]time.Duration, 0, n)
+		body := make([]time.Duration, 0, n)
+		dispatch := make([]time.Duration, 0, n)
+		for _, s := range batch.samples {
+			total = append(total, s.total)
+			pool = append(pool, s.waitPool)
+			cool = append(cool, s.waitCool)
+			token = append(token, s.waitToken)
+			if s.hasConn {
+				conn = append(conn, s.waitConn)
+			}
+			if s.hasDial {
+				dial = append(dial, s.dialTLS)
+			}
+			if s.hasSend {
+				send = append(send, s.send)
+			}
+			if s.hasServer {
+				server = append(server, s.server)
+			}
+			body = append(body, s.body)
+			if s.hasDispatch {
+				dispatch = append(dispatch, s.dispatch)
+			}
+		}
+		sort.Slice(total, func(i, j int) bool { return total[i] < total[j] })
+		sort.Slice(pool, func(i, j int) bool { return pool[i] < pool[j] })
+		sort.Slice(cool, func(i, j int) bool { return cool[i] < cool[j] })
+		sort.Slice(token, func(i, j int) bool { return token[i] < token[j] })
+		sort.Slice(conn, func(i, j int) bool { return conn[i] < conn[j] })
+		sort.Slice(dial, func(i, j int) bool { return dial[i] < dial[j] })
+		sort.Slice(send, func(i, j int) bool { return send[i] < send[j] })
+		sort.Slice(server, func(i, j int) bool { return server[i] < server[j] })
+		sort.Slice(body, func(i, j int) bool { return body[i] < body[j] })
+		sort.Slice(dispatch, func(i, j int) bool { return dispatch[i] < dispatch[j] })
+		errors.LogInfo(context.Background(), "xdrive timing ", kindNames[k],
+			" n=", n,
+			" requests=", batch.requests, " units=", batch.requests*driveQuotaCost(k),
+			" failed=", batch.failed, " canceled=", batch.canceled, " rate-limits=", batch.rateLimits,
+			" total p50/p95/max ", percentile(total, .5), "/", percentile(total, .95), "/", percentile(total, 1),
+			" wait-pool p50 ", percentile(pool, .5),
+			" wait-cool p50 ", percentile(cool, .5),
+			" wait-token p50 ", percentile(token, .5),
+			" wait-conn p50 ", percentile(conn, .5),
+			" dial+tls p50 ", percentile(dial, .5),
+			" server p50 ", percentile(server, .5),
+			" body p50 ", percentile(body, .5),
+			" newconns=", batch.conns, " hedges=", batch.hedges, " won=", batch.won,
+			" hedge-deferrals=", batch.deferred,
+			" send-p50/p95/max=", percentile(send, .5), "/", percentile(send, .95), "/", percentile(send, 1),
+			" pool-p95/max=", percentile(pool, .95), "/", percentile(pool, 1),
+			" connection-p95/max=", percentile(conn, .95), "/", percentile(conn, 1),
+			" server-p95/max=", percentile(server, .95), "/", percentile(server, 1),
+			" body-p95/max=", percentile(body, .95), "/", percentile(body, 1))
+		if k == kindBodyRead {
+			errors.LogInfo(context.Background(), "xdrive timing body-read dispatch-to-eof p50/p90/max ",
+				percentile(dispatch, .5), "/", percentile(dispatch, .9), "/", percentile(dispatch, 1))
+		}
+	}
+}
+
+func classifyDriveRequest(ctx context.Context, method, target, contentType string, body []byte) int {
+	switch method {
+	case "DELETE":
+		return kindDelete
+	case "POST":
+		return kindCreate
+	case "PATCH":
+		if ctx.Value(watermarkWriteKey{}) != nil {
+			return kindWatermark
+		}
+		mediaType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && mediaType == "multipart/related" {
+			return kindSlotMedia
+		}
+		if isWatermarkBody(body) {
+			return kindWatermark
+		}
+		return kindSlotInline
+	case "GET":
+		switch {
+		case strings.Contains(target, "alt=media"):
+			return kindBodyRead
+		case strings.Contains(target, "q="):
+			return kindList
+		case ctx.Value(laneKey{}) != nil:
+			return kindHeadRead
+		default:
+			return kindOtherRead
+		}
+	}
+	return kindOtherRead
+}
+
+func isWatermarkBody(body []byte) bool {
+	if len(body) > 128 {
+		return false
+	}
+	var doc struct {
+		Description string `json:"description"`
+	}
+	if json.Unmarshal(body, &doc) != nil || doc.Description == "" {
+		return false
+	}
+	for _, c := range doc.Description {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

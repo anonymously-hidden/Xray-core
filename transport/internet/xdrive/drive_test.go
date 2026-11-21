@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +29,8 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
+
+// Google Drive storage tests.
 
 type fakeFile struct {
 	id          string
@@ -134,7 +138,7 @@ func (d *fakeDrive) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if id, ok := strings.CutPrefix(r.URL.Path, "/upload/"); ok {
-		// an update of the body and description of a file
+
 		d.mu.Lock()
 		file := d.files[id]
 		if file != nil {
@@ -239,7 +243,6 @@ func (d *fakeDrive) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshot fakeFile
 	if ok {
-		// a file can be updated, its fields are read here
 		snapshot = *file
 	}
 	d.mu.Unlock()
@@ -364,7 +367,6 @@ func setDriveEndpoints(s *driveStorage, token, files, upload string) {
 	s.tokenURL, s.filesURL, s.uploadURL = token, files, upload
 }
 
-// Configure owners before Dial or Listener starts any shared work.
 func prepareDrive(t *testing.T, settings *internet.MemoryStreamConfig, token, files, upload string) {
 	t.Helper()
 	if settings.FinalMask != nil {
@@ -635,7 +637,7 @@ func TestDriveSharedClient(t *testing.T) {
 	if first == second || first.(*leasedDriveStorage).lease.owner != second.(*leasedDriveStorage).lease.owner {
 		t.Fatal("same settings must share an owner, not an acquisition lease")
 	}
-	// a session has an inflight of its own, as large
+
 	session := sessionStorage(first).(*leasedDriveStorage)
 	defer session.Close()
 	if session.inflight == first.(*leasedDriveStorage).inflight || cap(session.inflight) != driveMaxInflight {
@@ -943,7 +945,6 @@ func TestDriveGeneratedIDsRejectInvalidRingIdentities(t *testing.T) {
 
 func TestDriveInvalidIDSurplusDoesNotPoisonPool(t *testing.T) {
 	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
-		// The pool keeps one full generateIds batch, at least 1000 ids.
 		if r.URL.Query().Get("count") != "1000" {
 			t.Fatal("unexpected surplus allocation size")
 		}
@@ -1119,7 +1120,7 @@ func TestDriveKeyedSlotCreationPreservesMetadataAndMedia(t *testing.T) {
 func TestDriveColdIDsBatchDemandAndSurplus(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		entered, release := make(chan struct{}), make(chan struct{})
-		// The pool keeps one full generateIds batch, at least 1000 ids.
+
 		const batch = 1000
 		calls := 0
 		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
@@ -1191,8 +1192,6 @@ func TestDriveIDWaiterIgnoresWrappedCallerCancellation(t *testing.T) {
 	})
 }
 
-// A flight can fail after it filled the pool, so the waiter must look at the
-// pool before it repeats the flight's failure.
 func TestDriveIDWaiterTakesPoolAfterFailedFlight(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected allocation"); return nil, io.EOF }))
@@ -1212,8 +1211,6 @@ func TestDriveIDWaiterTakesPoolAfterFailedFlight(t *testing.T) {
 	})
 }
 
-// The death of one session must not leave the shared pool in error: the other
-// sessions have to be able to allocate for themselves.
 func TestDriveIDPoolSessionCloseDoesNotPoisonWaiters(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
@@ -1760,9 +1757,6 @@ func TestDriveReservedTokenRetryFailsFast(t *testing.T) {
 	})
 }
 
-// The token backoff exists to spare the token endpoint. A wait that cannot end
-// inside the request's own budget is pure latency: report the last token error
-// now instead of stalling the caller for the whole budget.
 func TestDriveTokenBackoffBeyondBudgetFailsFast(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		calls := 0
@@ -1777,8 +1771,6 @@ func TestDriveTokenBackoffBeyondBudgetFailsFast(t *testing.T) {
 	})
 }
 
-// A refresh grant can be rejected while the cached access token is still valid;
-// that must not discard the usable token before it expires.
 func TestDriveCachedTokenSurvivesRefreshRejection(t *testing.T) {
 	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected request"); return nil, io.EOF }))
 	s.tokenMu.Lock()
@@ -1789,9 +1781,6 @@ func TestDriveCachedTokenSurvivesRefreshRejection(t *testing.T) {
 	}
 }
 
-// A persistent API 401 means the answer will not change. One retry with a
-// freshly fetched token may ride out a token that expired early; refetching a
-// token for all eight attempts only multiplies requests against the account.
 func TestDriveRejectedTokenStopsAfterOneRefresh(t *testing.T) {
 	var tokens, api atomic.Int32
 	s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
@@ -1896,8 +1885,6 @@ func TestDriveQuotaRetryBudget(t *testing.T) {
 	}
 }
 
-// A request whose first rate-limited answer arrives after the budget is spent
-// must stop there: the budget is the limit, not the attempt count.
 func TestDriveQuotaBudgetStopsLateRateLimit(t *testing.T) {
 	driveClock(t, func(t *testing.T) {
 		var calls atomic.Int32
@@ -1958,7 +1945,7 @@ func TestDriveDescriptionRescueBudgetDoesNotRearmPendingRead(t *testing.T) {
 		}
 		<-primaryDone
 		synctest.Wait()
-		// A subsequent head read may spend the token; the old pending read may not.
+
 		status, body, err := s.readDescHedged(context.WithValue(context.Background(), laneKey{}, true), "http://drive.invalid/files/item")
 		if err != nil || status != http.StatusOK || string(body) != "rescued" {
 			t.Fatalf("next read did not use available rescue credit: status=%d body=%q err=%v", status, body, err)
@@ -2132,4 +2119,1879 @@ func TestDriveMediaRangePoolLeavesSlotPermitsFree(t *testing.T) {
 			t.Fatalf("range completion: %v", err)
 		}
 	})
+}
+
+// Media range tests.
+
+type mediaTestResult struct {
+	body []byte
+	err  error
+}
+
+type mediaTestGatedBody struct {
+	io.Reader
+	ctx        context.Context
+	release    <-chan struct{}
+	started    chan struct{}
+	canceled   chan struct{}
+	closed     chan struct{}
+	startOnce  sync.Once
+	cancelOnce sync.Once
+	closeOnce  sync.Once
+	closes     atomic.Int32
+}
+
+func newMediaTestGatedBody(ctx context.Context, data []byte, release <-chan struct{}) *mediaTestGatedBody {
+	return &mediaTestGatedBody{
+		Reader: bytes.NewReader(data), ctx: ctx, release: release,
+		started: make(chan struct{}), canceled: make(chan struct{}), closed: make(chan struct{}),
+	}
+}
+
+func (b *mediaTestGatedBody) Read(p []byte) (int, error) {
+	b.startOnce.Do(func() { close(b.started) })
+	select {
+	case <-b.release:
+		return b.Reader.Read(p)
+	case <-b.ctx.Done():
+		b.cancelOnce.Do(func() { close(b.canceled) })
+		return 0, b.ctx.Err()
+	}
+}
+
+func (b *mediaTestGatedBody) Close() error {
+	b.closes.Add(1)
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func mediaTestPayload(size int) []byte {
+	body := make([]byte, size)
+	for i := range body {
+		body[i] = byte((i * 31) ^ (i >> 8) ^ (i >> 16))
+	}
+	return body
+}
+
+func mediaTestCheckRequest(t *testing.T, r *http.Request, start, end int) {
+	t.Helper()
+	if r.Method != http.MethodGet || r.URL.Path != "/files/item" || r.URL.Query().Get("alt") != "media" || r.URL.Query().Get("supportsAllDrives") != "true" {
+		t.Errorf("unexpected media request: %s %s", r.Method, r.URL)
+	}
+	if got, want := r.Header.Get("Range"), fmt.Sprintf("bytes=%d-%d", start, end-1); got != want {
+		t.Errorf("Range = %q, want %q", got, want)
+	}
+	if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+		t.Errorf("Accept-Encoding = %q, want identity", got)
+	}
+}
+
+func mediaTestClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func mediaTestAssertBody(t *testing.T, body *mediaTestGatedBody, canceled bool) {
+	t.Helper()
+	if !mediaTestClosed(body.closed) || body.closes.Load() != 1 {
+		t.Errorf("response body was not closed exactly once: closes=%d", body.closes.Load())
+	}
+	if got := mediaTestClosed(body.canceled); got != canceled {
+		t.Errorf("response body canceled = %v, want %v", got, canceled)
+	}
+}
+
+func mediaTestAssertNoPermits(t *testing.T, s *driveStorage) {
+	t.Helper()
+	if len(s.inflight) != 0 || len(s.reserved) != 0 || len(s.mediaRanges) != 0 || len(s.mediaRescue) != 0 {
+		t.Errorf("leaked permits: inflight=%d reserved=%d media=%d rescue=%d", len(s.inflight), len(s.reserved), len(s.mediaRanges), len(s.mediaRescue))
+	}
+}
+
+func mediaTestAssertPending(t *testing.T, done <-chan mediaTestResult) {
+	t.Helper()
+	select {
+	case res := <-done:
+		t.Fatalf("read returned before the remaining requests completed: bytes=%d err=%v", len(res.body), res.err)
+	default:
+	}
+}
+
+type mediaTestSplitFlight struct {
+	storage  *driveStorage
+	cancel   context.CancelFunc
+	done     chan mediaTestResult
+	releases []chan struct{}
+	bodies   []chan *mediaTestGatedBody
+	calls    []atomic.Int32
+}
+
+func startMediaTestSplit(t *testing.T, frame slotFrame, sources [][]byte, fullBody bool, invalidRange int) *mediaTestSplitFlight {
+	t.Helper()
+	parts := len(sources)
+	width := (frame.size + parts - 1) / parts
+	flight := &mediaTestSplitFlight{
+		done: make(chan mediaTestResult, 1), releases: make([]chan struct{}, parts),
+		bodies: make([]chan *mediaTestGatedBody, parts), calls: make([]atomic.Int32, parts),
+	}
+	clients := make([]*http.Client, parts)
+	for i := range parts {
+		flight.releases[i] = make(chan struct{})
+		flight.bodies[i] = make(chan *mediaTestGatedBody, driveMaxAttempts)
+		clients[i] = &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+			flight.calls[i].Add(1)
+			start, end := i*width, min((i+1)*width, frame.size)
+			mediaTestCheckRequest(t, r, start, end)
+			status, data := http.StatusPartialContent, sources[i][start:end]
+			if fullBody && i%2 == 1 {
+				status, data = http.StatusOK, sources[i]
+			}
+			body := newMediaTestGatedBody(r.Context(), data, flight.releases[i])
+			flight.bodies[i] <- body
+			resp := memoryResponse(status, "")
+			resp.Body = body
+			if status == http.StatusPartialContent {
+				offset := start
+				if i == invalidRange {
+					offset++
+				}
+				resp.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, end-1, frame.size))
+			}
+			return resp, nil
+		})}
+	}
+	flight.storage = memoryDrive(clients[0].Transport)
+	flight.storage.mediaClients = clients
+	flight.storage.mediaRanges = make(chan struct{}, parts)
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), mediaHeadKey{}, true))
+	flight.cancel = cancel
+	go func() {
+		body, err := flight.storage.readFrameBody(ctx, "item", frame)
+		flight.done <- mediaTestResult{body, err}
+	}()
+	return flight
+}
+
+func (f *mediaTestSplitFlight) awaitBodies(t *testing.T) []*mediaTestGatedBody {
+	t.Helper()
+	bodies := make([]*mediaTestGatedBody, len(f.bodies))
+	for i := range bodies {
+		bodies[i] = <-f.bodies[i]
+		<-bodies[i].started
+	}
+	synctest.Wait()
+	if len(f.storage.mediaRanges) != len(bodies) || len(f.storage.inflight) != 0 || len(f.storage.reserved) != 0 {
+		t.Fatalf("split ranges did not acquire only their own permits: media=%d inflight=%d reserved=%d", len(f.storage.mediaRanges), len(f.storage.inflight), len(f.storage.reserved))
+	}
+	mediaTestAssertPending(t, f.done)
+	return bodies
+}
+
+func TestDriveMediaRegressionSplitAssembly(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fullBody   bool
+		alteration string
+	}{
+		{name: "exact_206"},
+		{name: "mixed_200_and_206", fullBody: true},
+		{name: "crc_corruption", fullBody: true, alteration: "corruption"},
+		{name: "mixed_versions", fullBody: true, alteration: "versions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				payload := mediaTestPayload(3*driveMediaPart + 3)
+				frame := newSlotFrame(1, slotMedia, payload)
+				width := (len(payload) + driveMediaLanes - 1) / driveMediaLanes
+				if len(payload)%driveMediaLanes == 0 {
+					t.Fatal("fixture must have an uneven final range")
+				}
+				sources := make([][]byte, driveMediaLanes)
+				for i := range sources {
+					sources[i] = payload
+				}
+				switch tc.alteration {
+				case "corruption":
+					corrupt := bytes.Clone(payload)
+					corrupt[2*width+11] ^= 0x80
+					sources[2] = corrupt
+				case "versions":
+					other := bytes.Clone(payload)
+					for i := range other {
+						other[i] ^= 0x80
+					}
+					sources[1], sources[3] = other, other
+				}
+				assembled := make([]byte, len(payload))
+				for i, source := range sources {
+					start, end := i*width, min((i+1)*width, len(payload))
+					copy(assembled[start:end], source[start:end])
+				}
+				if got, want := frame.holds(assembled), tc.alteration == ""; got != want {
+					t.Fatalf("checksum fixture matches = %v, want %v", got, want)
+				}
+
+				flight := startMediaTestSplit(t, frame, sources, tc.fullBody, -1)
+				defer flight.cancel()
+				bodies := flight.awaitBodies(t)
+				for i := len(bodies) - 1; i >= 0; i-- {
+					close(flight.releases[i])
+					synctest.Wait()
+					mediaTestAssertBody(t, bodies[i], false)
+					flight.storage.readHedgeMu.Lock()
+					completed := flight.storage.mediaHedgeCount
+					flight.storage.readHedgeMu.Unlock()
+					if want := len(bodies) - i; completed != want {
+						t.Fatalf("completed ranges = %d, want %d after releasing range %d", completed, want, i)
+					}
+					if i > 0 {
+						mediaTestAssertPending(t, flight.done)
+					}
+				}
+				res := <-flight.done
+				if tc.alteration != "" {
+					if res.body != nil || res.err == nil || !strings.Contains(res.err.Error(), "checksum") {
+						t.Fatalf("invalid assembled data was not rejected: bytes=%d err=%v", len(res.body), res.err)
+					}
+				} else if res.err != nil || !bytes.Equal(res.body, payload) {
+					t.Fatalf("out-of-order ranges changed the payload: bytes=%d err=%v", len(res.body), res.err)
+				}
+				synctest.Wait()
+				mediaTestAssertNoPermits(t, flight.storage)
+				for i := range flight.calls {
+					if got := flight.calls[i].Load(); got != 1 {
+						t.Errorf("range %d fetched %d times, want 1", i, got)
+					}
+				}
+			})
+		})
+	}
+}
+
+func TestDriveMediaRegressionSplitCleanup(t *testing.T) {
+	for _, invalidRange := range []int{-1, 2} {
+		name := "caller_cancellation"
+		if invalidRange >= 0 {
+			name = "invalid_range_cancels_siblings"
+		}
+		t.Run(name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				payload := mediaTestPayload(3*driveMediaPart + 3)
+				sources := make([][]byte, driveMediaLanes)
+				for i := range sources {
+					sources[i] = payload
+				}
+				flight := startMediaTestSplit(t, newSlotFrame(1, slotMedia, payload), sources, false, invalidRange)
+				defer flight.cancel()
+				bodies := flight.awaitBodies(t)
+				if invalidRange >= 0 {
+					close(flight.releases[invalidRange])
+				} else {
+					flight.cancel()
+				}
+				res := <-flight.done
+				if res.body != nil || res.err == nil {
+					t.Fatalf("failed split returned data or no error: bytes=%d err=%v", len(res.body), res.err)
+				}
+				if invalidRange < 0 && res.err != context.Canceled {
+					t.Errorf("cancellation returned %v, want context.Canceled", res.err)
+				}
+				if invalidRange >= 0 && !strings.Contains(res.err.Error(), "unexpected offset or length") {
+					t.Errorf("invalid range returned an unrelated error: %v", res.err)
+				}
+				synctest.Wait()
+				for i, body := range bodies {
+					mediaTestAssertBody(t, body, i != invalidRange)
+					if got := flight.calls[i].Load(); got != 1 {
+						t.Errorf("range %d fetched %d times, want 1", i, got)
+					}
+				}
+				mediaTestAssertNoPermits(t, flight.storage)
+			})
+		})
+	}
+}
+
+func TestDriveMediaRegressionRangeValidation(t *testing.T) {
+	payload := mediaTestPayload(29)
+	start, end := 7, 19
+	exact := fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(payload))
+	for _, tc := range []struct {
+		name         string
+		status       int
+		contentRange string
+		body         []byte
+		valid        bool
+	}{
+		{"exact_206", http.StatusPartialContent, exact, payload[start:end], true},
+		{"full_200", http.StatusOK, "", payload, true},
+		{"wrong_start", http.StatusPartialContent, "bytes 8-18/29", payload[start:end], false},
+		{"wrong_end", http.StatusPartialContent, "bytes 7-19/29", payload[start:end], false},
+		{"wrong_total", http.StatusPartialContent, "bytes 7-18/30", payload[start:end], false},
+		{"missing_content_range", http.StatusPartialContent, "", payload[start:end], false},
+		{"short_206", http.StatusPartialContent, exact, payload[start : end-1], false},
+		{"long_206", http.StatusPartialContent, exact, payload[start : end+1], false},
+		{"short_200", http.StatusOK, "", payload[:len(payload)-1], false},
+		{"long_200", http.StatusOK, "", append(bytes.Clone(payload), 0), false},
+		{"404_with_matching_range", http.StatusNotFound, exact, payload[start:end], false},
+		{"416_with_matching_range", http.StatusRequestedRangeNotSatisfiable, exact, payload[start:end], false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				release := make(chan struct{})
+				close(release)
+				var body *mediaTestGatedBody
+				var calls atomic.Int32
+				s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+					calls.Add(1)
+					mediaTestCheckRequest(t, r, start, end)
+					body = newMediaTestGatedBody(r.Context(), tc.body, release)
+					resp := memoryResponse(tc.status, "")
+					resp.Body = body
+					resp.Header.Set("Content-Range", tc.contentRange)
+					return resp, nil
+				}))
+				s.mediaRanges = make(chan struct{}, 1)
+				r := driveMediaRequest{start: start, end: end, size: len(payload), client: s.client}
+				got, err := s.readMediaRange(context.Background(), s.filesURL+"/item?alt=media&supportsAllDrives=true", r)
+				if tc.valid {
+					if err != nil || !bytes.Equal(got, payload[start:end]) {
+						t.Errorf("valid range rejected or changed: bytes=%d err=%v", len(got), err)
+					}
+				} else if err == nil || got != nil {
+					t.Errorf("invalid response returned data or no error: bytes=%d err=%v", len(got), err)
+				}
+				synctest.Wait()
+				mediaTestAssertBody(t, body, false)
+				mediaTestAssertNoPermits(t, s)
+				if got := calls.Load(); got != 1 {
+					t.Errorf("range fetched %d times, want 1", got)
+				}
+			})
+		})
+	}
+}
+
+type mediaTestHedgeFlight struct {
+	storage  *driveStorage
+	payload  []byte
+	cancel   context.CancelFunc
+	done     chan mediaTestResult
+	releases [2]chan struct{}
+	bodies   [2]chan *mediaTestGatedBody
+	calls    [2]atomic.Int32
+}
+
+func startMediaTestHedge(t *testing.T, statuses [2]int) *mediaTestHedgeFlight {
+	t.Helper()
+	flight := &mediaTestHedgeFlight{payload: mediaTestPayload(257), done: make(chan mediaTestResult, 1)}
+	var clients [2]*http.Client
+	for i := range clients {
+		flight.releases[i] = make(chan struct{})
+		flight.bodies[i] = make(chan *mediaTestGatedBody, driveMaxAttempts)
+		clients[i] = &http.Client{Transport: roundTrip(func(r *http.Request) (*http.Response, error) {
+			flight.calls[i].Add(1)
+			mediaTestCheckRequest(t, r, 0, len(flight.payload))
+			body := newMediaTestGatedBody(r.Context(), flight.payload, flight.releases[i])
+			flight.bodies[i] <- body
+			resp := memoryResponse(statuses[i], "")
+			resp.Body = body
+			resp.Header.Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(flight.payload)-1, len(flight.payload)))
+			return resp, nil
+		})}
+	}
+	flight.storage = memoryDrive(clients[0].Transport)
+	flight.storage.mediaClients = []*http.Client{clients[0]}
+	flight.storage.bulkClient = clients[1]
+	flight.storage.mediaRanges = make(chan struct{}, 1)
+	flight.storage.mediaRescue = make(chan struct{}, 1)
+	flight.storage.mediaHedgeTokens = 1
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), mediaHeadKey{}, true))
+	flight.cancel = cancel
+	go func() {
+		body, err := flight.storage.readFrameBody(ctx, "item", newSlotFrame(1, slotMedia, flight.payload))
+		flight.done <- mediaTestResult{body, err}
+	}()
+	return flight
+}
+
+func (f *mediaTestHedgeFlight) awaitBody(t *testing.T, lane int) *mediaTestGatedBody {
+	t.Helper()
+	body := <-f.bodies[lane]
+	<-body.started
+	synctest.Wait()
+	if len(f.storage.mediaRanges) != 1 || len(f.storage.mediaRescue) != lane || len(f.storage.inflight) != 0 || len(f.storage.reserved) != 0 {
+		t.Fatalf("unexpected active hedge permits: media=%d rescue=%d inflight=%d reserved=%d", len(f.storage.mediaRanges), len(f.storage.mediaRescue), len(f.storage.inflight), len(f.storage.reserved))
+	}
+	mediaTestAssertPending(t, f.done)
+	return body
+}
+
+func (f *mediaTestHedgeFlight) assertAccounting(t *testing.T, hedged bool, completed int) {
+	t.Helper()
+	wantHedges := int32(0)
+	wantTokens := 1
+	if hedged {
+		wantHedges, wantTokens = 1, 0
+	}
+	if primary, hedge := f.calls[0].Load(), f.calls[1].Load(); primary != 1 || hedge != wantHedges {
+		t.Errorf("request counts: primary=%d hedge=%d, want 1/%d", primary, hedge, wantHedges)
+	}
+	f.storage.readHedgeMu.Lock()
+	tokens, count := f.storage.mediaHedgeTokens, f.storage.mediaHedgeCount
+	f.storage.readHedgeMu.Unlock()
+	if tokens != wantTokens || count != completed {
+		t.Errorf("hedge accounting: tokens=%d completed=%d, want %d/%d", tokens, count, wantTokens, completed)
+	}
+	mediaTestAssertNoPermits(t, f.storage)
+}
+
+func TestDriveMediaRegressionHedgeWinnerCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		hedged bool
+		winner int
+	}{
+		{"primary_before_hedge", false, 0},
+		{"primary_after_hedge", true, 0},
+		{"hedge_wins", true, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				flight := startMediaTestHedge(t, [2]int{http.StatusPartialContent, http.StatusPartialContent})
+				defer flight.cancel()
+				bodies := []*mediaTestGatedBody{flight.awaitBody(t, 0)}
+				if tc.hedged {
+					bodies = append(bodies, flight.awaitBody(t, 1))
+					if mediaTestClosed(bodies[0].canceled) {
+						t.Fatal("launching a hedge canceled the primary")
+					}
+				}
+				close(flight.releases[tc.winner])
+				res := <-flight.done
+				if res.err != nil || !bytes.Equal(res.body, flight.payload) {
+					t.Fatalf("winner returned invalid data: bytes=%d err=%v", len(res.body), res.err)
+				}
+				synctest.Wait()
+				for i, body := range bodies {
+					mediaTestAssertBody(t, body, i != tc.winner)
+				}
+				flight.assertAccounting(t, tc.hedged, 1)
+			})
+		})
+	}
+}
+
+func TestDriveMediaRegressionHedgeCancellationCleanup(t *testing.T) {
+	for _, hedged := range []bool{false, true} {
+		name := "before_hedge"
+		if hedged {
+			name = "after_hedge"
+		}
+		t.Run(name, func(t *testing.T) {
+			driveClock(t, func(t *testing.T) {
+				flight := startMediaTestHedge(t, [2]int{http.StatusPartialContent, http.StatusPartialContent})
+				defer flight.cancel()
+				bodies := []*mediaTestGatedBody{flight.awaitBody(t, 0)}
+				if hedged {
+					bodies = append(bodies, flight.awaitBody(t, 1))
+				}
+				flight.cancel()
+				res := <-flight.done
+				if res.body != nil || res.err != context.Canceled {
+					t.Fatalf("canceled read returned bytes=%d err=%v, want nil/context.Canceled", len(res.body), res.err)
+				}
+				synctest.Wait()
+				for _, body := range bodies {
+					mediaTestAssertBody(t, body, true)
+				}
+				flight.assertAccounting(t, hedged, 0)
+			})
+		})
+	}
+}
+
+func TestDriveMediaRegressionHedgeBothErrorsCleanup(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		flight := startMediaTestHedge(t, [2]int{http.StatusNotFound, http.StatusNotFound})
+		defer flight.cancel()
+		primary, hedge := flight.awaitBody(t, 0), flight.awaitBody(t, 1)
+		close(flight.releases[0])
+		synctest.Wait()
+		mediaTestAssertBody(t, primary, false)
+		mediaTestAssertPending(t, flight.done)
+		if mediaTestClosed(hedge.canceled) || len(flight.storage.mediaRanges) != 0 || len(flight.storage.mediaRescue) != 1 {
+			t.Fatal("primary failure canceled the pending hedge or leaked its permit")
+		}
+		close(flight.releases[1])
+		res := <-flight.done
+		if res.body != nil || res.err != errNotFound {
+			t.Fatalf("failed requests returned bytes=%d err=%v, want nil/errNotFound", len(res.body), res.err)
+		}
+		synctest.Wait()
+		mediaTestAssertBody(t, hedge, false)
+		flight.assertAccounting(t, true, 0)
+	})
+}
+
+// Adaptive recovery tests.
+
+func TestMediaHedgeDelayUsesSizeClassMedian(t *testing.T) {
+	s := &driveStorage{driveShared: &driveShared{}}
+	small := driveMediaRequest{end: driveMediaPart}
+	large := driveMediaRequest{end: driveMediaPart + 1}
+	for i := 0; i < rangeLatencyMin-1; i++ {
+		s.mediaLatency[0].note(time.Second)
+	}
+	if got := s.mediaHedgeDelay(small); got != slotBodyHedge {
+		t.Fatalf("cold threshold = %v, want %v", got, slotBodyHedge)
+	}
+	s.mediaLatency[0].note(time.Second)
+	if got := s.mediaHedgeDelay(small); got != 1300*time.Millisecond {
+		t.Fatalf("threshold = %v, want 1.3 times p50", got)
+	}
+	if got := s.mediaHedgeDelay(large); got != slotBodyHedge {
+		t.Fatalf("small samples changed large-range threshold: %v", got)
+	}
+	for i := 0; i < rangeLatencyRing; i++ {
+		s.mediaLatency[0].note(time.Millisecond)
+		s.mediaLatency[1].note(10 * time.Second)
+	}
+	if got := s.mediaHedgeDelay(small); got != mediaHedgeFloor {
+		t.Fatalf("floor = %v, want %v", got, mediaHedgeFloor)
+	}
+	if got := s.mediaHedgeDelay(large); got != slotBodyHedge {
+		t.Fatalf("cap = %v, want %v", got, slotBodyHedge)
+	}
+	peer := &driveStorage{driveShared: s.driveShared}
+	if got := peer.mediaHedgeDelay(small); got != mediaHedgeFloor {
+		t.Fatalf("sessions did not share the rolling estimate: %v", got)
+	}
+}
+
+func TestMediaLatencyAdmitsOnlyValidatedFirstPrimaryAttempts(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		attempt  int
+		rescue   bool
+		replayed bool
+		known    bool
+		err      error
+		want     int
+	}{
+		{name: "partial", status: http.StatusPartialContent, known: true, want: 1},
+		{name: "full", status: http.StatusOK, known: true, want: 1},
+		{name: "rescue", status: http.StatusPartialContent, known: true, rescue: true},
+		{name: "retry", status: http.StatusPartialContent, known: true, attempt: 1},
+		{name: "replay", status: http.StatusPartialContent, known: true, replayed: true},
+		{name: "failure", status: http.StatusPartialContent, known: true, err: io.ErrUnexpectedEOF},
+		{name: "rate_limit", status: http.StatusTooManyRequests, known: true},
+		{name: "not_found", status: http.StatusNotFound, known: true},
+		{name: "undispatched", status: http.StatusPartialContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &driveStorage{driveShared: &driveShared{}}
+			r := &driveMediaRequest{end: driveMediaPart, rescue: tc.rescue}
+			sample := timingSample{total: 20 * time.Second, dispatch: time.Second, hasDispatch: tc.known}
+			s.observeMediaLatency(r, sample, tc.status, tc.attempt, tc.replayed, tc.err)
+			if got := s.mediaLatency[0].n; got != tc.want {
+				t.Fatalf("samples = %d, want %d", got, tc.want)
+			}
+			if tc.want == 1 && s.mediaLatency[0].ring[0] != time.Second {
+				t.Fatal("local admission time contaminated the sample")
+			}
+		})
+	}
+}
+
+func TestMediaLatencyRingConcurrentAndBounded(t *testing.T) {
+	var latency rangeLatency
+	latency.note(0)
+	latency.note(-time.Second)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 100 {
+				latency.note(time.Second)
+				if median, ready := latency.median(); ready && median != time.Second {
+					t.Errorf("concurrent median = %v", median)
+				}
+			}
+		})
+	}
+	wg.Wait()
+	if latency.n != rangeLatencyRing || latency.pos < 0 || latency.pos >= rangeLatencyRing {
+		t.Fatalf("ring grew or has an invalid cursor: n=%d pos=%d", latency.n, latency.pos)
+	}
+}
+
+func TestMediaLatencyMeasuresActualDispatchAndRejectsInvalidRange(t *testing.T) {
+	for _, valid := range []bool{false, true} {
+		t.Run(fmt.Sprint(valid), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				entered := make(chan struct{}, 1)
+				s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+					entered <- struct{}{}
+					time.Sleep(time.Second)
+					response := memoryResponse(http.StatusPartialContent, "data")
+					if valid {
+						response.Header.Set("Content-Range", "bytes 0-3/4")
+					}
+					return response, nil
+				}))
+				s.mediaRanges = make(chan struct{}, 1)
+				s.mediaRanges <- struct{}{}
+				r := &driveMediaRequest{end: 4, size: 4, client: s.client}
+				ctx := context.WithValue(context.Background(), driveMediaKey{}, r)
+				done := make(chan error, 1)
+				go func() { _, _, err := s.do(ctx, http.MethodGet, s.filesURL+"/item?alt=media", "", nil); done <- err }()
+				synctest.Wait()
+				time.Sleep(5 * time.Second)
+				if len(entered) != 0 {
+					t.Fatal("primary dispatched before its permit was available")
+				}
+				<-s.mediaRanges
+				<-entered
+				if err := <-done; (err == nil) != valid {
+					t.Fatalf("range validation error = %v, valid = %v", err, valid)
+				}
+				synctest.Wait()
+				want := 0
+				if valid {
+					want = 1
+				}
+				if got := s.mediaLatency[0].n; got != want {
+					t.Fatalf("samples = %d, want %d", got, want)
+				}
+				if valid && s.mediaLatency[0].ring[0] != time.Second {
+					t.Fatalf("dispatch latency = %v, want 1s, excluding 5s admission", s.mediaLatency[0].ring[0])
+				}
+			})
+		})
+	}
+}
+
+type adaptiveDelivery struct {
+	mu      sync.Mutex
+	next    int
+	waitAt  time.Time
+	changed chan struct{}
+}
+
+func (d *adaptiveDelivery) snapshot() (int, <-chan struct{}, time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.next, d.changed, d.waitAt
+}
+
+func (d *adaptiveDelivery) set(next int, waitAt time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.next, d.waitAt = next, waitAt
+	close(d.changed)
+	d.changed = make(chan struct{})
+}
+
+type adaptiveRangeFlight struct {
+	s           *driveStorage
+	delivery    *adaptiveDelivery
+	promoted    chan struct{}
+	primary     chan *http.Request
+	rescue      chan *http.Request
+	release     chan struct{}
+	done        chan mediaTestResult
+	cancel      context.CancelFunc
+	primaryGets atomic.Int32
+	rescueGets  atomic.Int32
+}
+
+func startAdaptiveRange(t *testing.T, tracked, head bool, start int, tokens int, queuedRescue, failRescue bool) *adaptiveRangeFlight {
+	t.Helper()
+	f := &adaptiveRangeFlight{
+		delivery: &adaptiveDelivery{waitAt: time.Now(), changed: make(chan struct{})},
+		promoted: make(chan struct{}), primary: make(chan *http.Request, 1), rescue: make(chan *http.Request, 1),
+		release: make(chan struct{}), done: make(chan mediaTestResult, 1),
+	}
+	data := driveStreamTestData(2 * driveStreamBlockBytes)
+	stream := &driveRangeStream{frame: driveStreamTestFrame(data), emit: func(int, []byte) error { return nil }}
+	f.s = memoryDrive(roundTrip(func(request *http.Request) (*http.Response, error) {
+		media := request.Context().Value(driveMediaKey{}).(*driveMediaRequest)
+		body := io.NopCloser(strings.NewReader(string(data[media.start:media.end])))
+		if media.rescue {
+			f.rescueGets.Add(1)
+			f.rescue <- request
+			if failRescue {
+				return nil, io.ErrUnexpectedEOF
+			}
+		} else {
+			f.primaryGets.Add(1)
+			f.primary <- request
+			body = &driveStreamTestGatedBody{
+				ctx: request.Context(), data: data[media.start:media.end],
+				release: f.release, closed: make(chan struct{}),
+			}
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes %d-%d/%d", media.start, media.end-1, len(data)), int64(media.end-media.start), body), nil
+	}))
+	f.s.bulkClient = &http.Client{Transport: f.s.client.Transport}
+	f.s.mediaRanges = make(chan struct{}, 1)
+	f.s.mediaRescue = make(chan struct{}, 1)
+	f.s.mediaHedgeTokens = tokens
+	for range rangeLatencyMin {
+		f.s.mediaLatency[0].note(time.Second)
+	}
+	if queuedRescue {
+		f.s.mediaRescue <- struct{}{}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancel = cancel
+	ctx = context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+	if head {
+		close(f.promoted)
+	}
+	r := driveMediaRequest{start: start, end: start + driveStreamBlockBytes, size: len(data), client: f.s.client}
+	if tracked {
+		r.stream = stream
+		ctx = context.WithValue(ctx, mediaDeliveryKey{}, f.delivery.snapshot)
+	}
+	go func() {
+		body, err := f.s.readMediaRange(ctx, f.s.filesURL+"/item?alt=media", r)
+		f.done <- mediaTestResult{body, err}
+	}()
+	t.Cleanup(func() { cancel(); stream.closeAndWait(); f.s.driveShared.closeWork() })
+	return f
+}
+
+func TestAdaptiveHeadRangeHedgesAtDispatchDeadlineDespiteWireProgress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, true, 0, 1, false, false)
+		request := <-f.primary
+		synctest.Wait()
+		time.Sleep(1300*time.Millisecond - time.Nanosecond)
+		request.Context().Value(readProgressKey{}).(*driveReadProgress).progress()
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 {
+			t.Fatal("hedge fired before 1.3 times the live median")
+		}
+		time.Sleep(time.Nanosecond)
+		<-f.rescue
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+		synctest.Wait()
+		if f.primaryGets.Load() != 1 || f.rescueGets.Load() != 1 || f.s.mediaHedgeTokens != 0 {
+			t.Fatal("adaptive recovery exceeded one primary, one rescue, or one budget token")
+		}
+	})
+}
+
+func TestAdaptiveRangeHedgeOnlyAfterHeadPromotion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, false, 0, 1, false, false)
+		<-f.primary
+		synctest.Wait()
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 || f.s.mediaHedgeTokens != 1 {
+			t.Fatal("speculative tail armed or spent head recovery")
+		}
+		at := time.Now()
+		close(f.promoted)
+		<-f.rescue
+		if time.Now() != at {
+			t.Fatal("promotion restarted the dispatch-age deadline")
+		}
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+	})
+}
+
+func TestAdaptiveRangeHedgeWaitsForRequiredMissingBlock(t *testing.T) {
+	for _, available := range []bool{false, true} {
+		t.Run(fmt.Sprint(available), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				start := driveStreamBlockBytes
+				if available {
+					start = 0
+				}
+				f := startAdaptiveRange(t, true, true, start, 1, false, false)
+				if available {
+					f.delivery.set(0, time.Time{})
+				}
+				<-f.primary
+				synctest.Wait()
+				time.Sleep(3 * time.Second)
+				synctest.Wait()
+				if f.rescueGets.Load() != 0 || f.s.mediaHedgeTokens != 1 {
+					t.Fatal("an available block or later range spent recovery credit")
+				}
+				at := time.Now()
+				f.delivery.set(start, at)
+				<-f.rescue
+				if time.Now() != at {
+					t.Fatal("the new missing-block wait replaced the original dispatch age")
+				}
+				if result := <-f.done; result.err != nil {
+					t.Fatal(result.err)
+				}
+			})
+		})
+	}
+}
+
+func TestAdaptiveQueuedRescueRechecksDeliveryFrontier(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, true, 0, 1, true, false)
+		<-f.primary
+		synctest.Wait()
+		time.Sleep(1300 * time.Millisecond)
+		synctest.Wait()
+		if f.s.mediaHedgeTokens != 0 || f.rescueGets.Load() != 0 {
+			t.Fatal("rescue did not queue behind its existing permit")
+		}
+		f.delivery.set(0, time.Time{})
+		<-f.s.mediaRescue
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 {
+			t.Fatal("queued rescue dispatched after the blocking block became available")
+		}
+		f.cancel()
+		if result := <-f.done; !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("cancellation = %v", result.err)
+		}
+	})
+}
+
+func TestAdaptiveRangeUsesExistingBudgetReplenishment(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, true, 0, 0, false, false)
+		<-f.primary
+		synctest.Wait()
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 {
+			t.Fatal("recovery ignored an empty media budget")
+		}
+		f.s.readHedgeMu.Lock()
+		f.s.mediaHedgeCount = 19
+		f.s.readHedgeMu.Unlock()
+		f.s.noteMediaRange()
+		<-f.rescue
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+		synctest.Wait()
+		if f.rescueGets.Load() != 1 || f.s.mediaHedgeTokens != 0 {
+			t.Fatal("replenishment expanded the existing token budget")
+		}
+	})
+}
+
+func TestAdaptiveRangeRescueHasOneAttemptAndNoRepeat(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, true, 0, 3, false, true)
+		<-f.primary
+		<-f.rescue
+		synctest.Wait()
+		for range 5 {
+			f.delivery.set(0, time.Now())
+			time.Sleep(time.Second)
+			synctest.Wait()
+		}
+		if f.rescueGets.Load() != 1 || f.s.mediaHedgeTokens != 2 {
+			t.Fatal("failed rescue retried or repeated a 200-unit GET")
+		}
+		close(f.release)
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+	})
+}
+
+func TestAdaptiveRangeDoesNotRacePrimaryReplay(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, true, true, 0, 1, false, false)
+		request := <-f.primary
+		request.Context().Value(readProgressKey{}).(*driveReadProgress).replay()
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 || f.s.mediaHedgeTokens != 1 {
+			t.Fatal("adaptive hedge duplicated primary transport recovery")
+		}
+		close(f.release)
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+	})
+}
+
+func TestUnmarkedMediaRangeNeverArmsHeadHedge(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := startAdaptiveRange(t, false, false, 0, 1, false, false)
+		<-f.primary
+		time.Sleep(3 * time.Second)
+		synctest.Wait()
+		if f.rescueGets.Load() != 0 || f.s.mediaHedgeTokens != 1 {
+			t.Fatal("unmarked standalone body GET armed a head-only hedge")
+		}
+		close(f.release)
+		if result := <-f.done; result.err != nil {
+			t.Fatal(result.err)
+		}
+	})
+}
+
+// Verified streaming tests.
+
+func driveStreamTestStorage(t *testing.T, transport roundTrip, lanes int) *driveStorage {
+	t.Helper()
+	client := &http.Client{Transport: transport}
+	s := &driveStorage{
+		driveShared: &driveShared{
+			filesURL:    "https://drive-stream.invalid/files",
+			token:       "fake-token",
+			tokenExpiry: time.Now().Add(time.Hour),
+		},
+		client:      client,
+		inflight:    make(chan struct{}, driveMaxInflight),
+		reserved:    make(chan struct{}, driveReservedInflight),
+		mediaRanges: make(chan struct{}, driveMediaInflight),
+	}
+	for range lanes {
+		s.mediaClients = append(s.mediaClients, &http.Client{Transport: transport})
+	}
+	t.Cleanup(s.driveShared.closeWork)
+	return s
+}
+
+func driveStreamTestData(size int) []byte {
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i*17 + i/driveStreamBlockBytes)
+	}
+	return data
+}
+
+func driveStreamTestFrame(data []byte) slotFrame {
+	frame := slotFrame{seq: 7, mode: slotStream, size: len(data), crc: crc32.ChecksumIEEE(data)}
+	for start := 0; start < len(data); start += driveStreamBlockBytes {
+		frame.blocks = append(frame.blocks, crc32.ChecksumIEEE(data[start:min(start+driveStreamBlockBytes, len(data))]))
+	}
+	return frame
+}
+
+func driveStreamTestResponse(request *http.Request, status int, contentRange string, length int64, body io.ReadCloser) *http.Response {
+	header := make(http.Header)
+	if contentRange != "" {
+		header.Set("Content-Range", contentRange)
+	}
+	return &http.Response{StatusCode: status, Header: header, ContentLength: length, Body: body, Request: request}
+}
+
+type driveStreamTestBlock struct {
+	index int
+	data  []byte
+}
+
+type driveStreamTestGatedBody struct {
+	ctx       context.Context
+	data      []byte
+	position  int
+	pauseAt   int
+	release   <-chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (b *driveStreamTestGatedBody) Read(p []byte) (int, error) {
+	if b.release != nil && b.position >= b.pauseAt {
+		select {
+		case <-b.release:
+			b.release = nil
+		case <-b.ctx.Done():
+			return 0, b.ctx.Err()
+		}
+	}
+	end := len(b.data)
+	if b.release != nil {
+		end = min(end, b.pauseAt)
+	}
+	if b.position == end {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.position:end])
+	b.position += n
+	return n, nil
+}
+
+func (b *driveStreamTestGatedBody) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestDriveFrameStreamEmitsVerifiedBlockBeforeEOF(t *testing.T) {
+	data := driveStreamTestData(2*driveStreamBlockBytes + 23)
+	frame := driveStreamTestFrame(data)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	closed := make(chan struct{})
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		body := &driveStreamTestGatedBody{
+			ctx: request.Context(), data: data, pauseAt: driveStreamBlockBytes, release: release, closed: closed,
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)), int64(len(data)), body), nil
+	}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	emitted := make(chan driveStreamTestBlock, len(frame.blocks))
+	done := make(chan error, 1)
+	go func() {
+		done <- s.readFrameStream(ctx, "slot", frame, func(index int, block []byte) error {
+			emitted <- driveStreamTestBlock{index, block}
+			return nil
+		})
+	}()
+	var first driveStreamTestBlock
+	select {
+	case first = <-emitted:
+	case err := <-done:
+		t.Fatalf("stream ended before its first block: %v", err)
+	case <-ctx.Done():
+		t.Fatal("first verified block was buffered until the rest of the body")
+	}
+	if first.index != 0 || !bytes.Equal(first.data, data[:driveStreamBlockBytes]) {
+		t.Fatal("incorrect first verified block")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("stream completed while its body was blocked: %v", err)
+	default:
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("stream did not finish after releasing its body")
+	}
+
+	blocks := []driveStreamTestBlock{first}
+	for range len(frame.blocks) - 1 {
+		select {
+		case block := <-emitted:
+			blocks = append(blocks, block)
+		default:
+			t.Fatal("successful stream omitted a block")
+		}
+	}
+	for _, block := range blocks {
+		start := block.index * driveStreamBlockBytes
+		if !bytes.Equal(block.data, data[start:min(start+driveStreamBlockBytes, len(data))]) {
+			t.Fatalf("emitted block %d was changed or reused", block.index)
+		}
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("response body was not closed")
+	}
+}
+
+func TestDriveRangeStreamResponseValidation(t *testing.T) {
+	data := driveStreamTestData(3*driveStreamBlockBytes + 19)
+	frame := driveStreamTestFrame(data)
+	part := data[driveStreamBlockBytes : 2*driveStreamBlockBytes]
+	contentRange := fmt.Sprintf("bytes %d-%d/%d", driveStreamBlockBytes, 2*driveStreamBlockBytes-1, len(data))
+	corruptPart := append([]byte(nil), part...)
+	corruptPart[0] ^= 1
+	corruptBefore := append([]byte(nil), data...)
+	corruptBefore[0] ^= 1
+	corruptAfter := append([]byte(nil), data...)
+	corruptAfter[2*driveStreamBlockBytes] ^= 1
+	cases := []struct {
+		name         string
+		status       int
+		contentRange string
+		length       int64
+		body         []byte
+		wantError    bool
+		wantBlocks   []int
+	}{
+		{"partial known length", http.StatusPartialContent, contentRange, int64(len(part)), part, false, []int{1}},
+		{"partial unknown length", http.StatusPartialContent, contentRange, -1, part, false, []int{1}},
+		{"partial known zero length", http.StatusPartialContent, contentRange, 0, part, true, nil},
+		{"ignored range known length", http.StatusOK, "", int64(len(data)), data, false, []int{1}},
+		{"ignored range unknown length", http.StatusOK, "", -1, data, false, []int{1}},
+		{"ignored range known zero length", http.StatusOK, "", 0, data, true, nil},
+		{"wrong range", http.StatusPartialContent, fmt.Sprintf("bytes 0-%d/%d", len(part)-1, len(data)), -1, part, true, nil},
+		{"missing range", http.StatusPartialContent, "", -1, part, true, nil},
+		{"noncanonical range", http.StatusPartialContent, contentRange + " ", -1, part, true, nil},
+		{"unknown total", http.StatusPartialContent, fmt.Sprintf("bytes %d-%d/*", driveStreamBlockBytes, 2*driveStreamBlockBytes-1), -1, part, true, nil},
+		{"wrong partial length", http.StatusPartialContent, contentRange, int64(len(part) - 1), part, true, nil},
+		{"truncated partial", http.StatusPartialContent, contentRange, -1, part[:len(part)-1], true, nil},
+		{"oversized partial", http.StatusPartialContent, contentRange, -1, append(append([]byte(nil), part...), 0), true, []int{1}},
+		{"corrupt assigned block", http.StatusPartialContent, contentRange, int64(len(part)), corruptPart, true, nil},
+		{"ignored range wrong announced length", http.StatusOK, "", int64(len(part)), data, true, nil},
+		{"ignored range truncated", http.StatusOK, "", -1, data[:2*driveStreamBlockBytes], true, []int{1}},
+		{"ignored range oversized", http.StatusOK, "", -1, append(append([]byte(nil), data...), 0), true, []int{1}},
+		{"ignored range corrupt unassigned prefix", http.StatusOK, "", int64(len(data)), corruptBefore, true, nil},
+		{"ignored range corrupt unassigned suffix", http.StatusOK, "", int64(len(data)), corruptAfter, true, []int{1}},
+		{"unexpected status", http.StatusBadGateway, "", -1, part, true, nil},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTrip(func(request *http.Request) (*http.Response, error) {
+				return driveStreamTestResponse(request, test.status, test.contentRange, test.length,
+					io.NopCloser(bytes.NewReader(test.body))), nil
+			})}
+			response, err := client.Get("https://drive-stream.invalid/media")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			var emitted []driveStreamTestBlock
+			stream := &driveRangeStream{frame: frame, emit: func(index int, block []byte) error {
+				emitted = append(emitted, driveStreamTestBlock{index, block})
+				return nil
+			}}
+			request := driveMediaRequest{start: driveStreamBlockBytes, end: 2 * driveStreamBlockBytes, size: len(data), seq: frame.seq}
+			payload, err := stream.read(request, response.StatusCode, response.Header.Get("Content-Range"), response.ContentLength, response.Body)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error = %v, want error %v", err, test.wantError)
+			}
+			if payload != nil {
+				t.Fatal("stream returned a second buffered payload")
+			}
+			if len(emitted) != len(test.wantBlocks) {
+				t.Fatalf("emitted %d blocks, want %v", len(emitted), test.wantBlocks)
+			}
+			for i, block := range emitted {
+				if block.index != test.wantBlocks[i] || !bytes.Equal(block.data, part) {
+					t.Fatalf("unexpected or unverified emitted block %d", block.index)
+				}
+			}
+		})
+	}
+}
+
+func TestDriveRangeStreamEmitterError(t *testing.T) {
+	data := driveStreamTestData(2 * driveStreamBlockBytes)
+	frame := driveStreamTestFrame(data)
+	want := errors.New("collector stopped")
+	calls := 0
+	stream := &driveRangeStream{frame: frame, emit: func(int, []byte) error {
+		calls++
+		return want
+	}}
+	request := driveMediaRequest{end: len(data), size: len(data), seq: frame.seq}
+	payload, err := stream.read(request, http.StatusPartialContent,
+		fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)), int64(len(data)), bytes.NewReader(data))
+	if !errors.Is(err, want) || calls != 1 || payload != nil {
+		t.Fatalf("emitter error was not returned immediately: calls=%d, payload=%d, err=%v", calls, len(payload), err)
+	}
+}
+
+func TestDriveRangeStreamCloseJoinsAndFencesReaders(t *testing.T) {
+	data := driveStreamTestData(driveStreamBlockBytes)
+	frame := driveStreamTestFrame(data)
+	emitting := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	var calls atomic.Int32
+	stream := &driveRangeStream{frame: frame, emit: func(int, []byte) error {
+		calls.Add(1)
+		close(emitting)
+		<-release
+		return nil
+	}}
+	request := driveMediaRequest{end: len(data), size: len(data), seq: frame.seq}
+	contentRange := fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data))
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := stream.read(request, http.StatusPartialContent, contentRange, int64(len(data)), bytes.NewReader(data))
+		readDone <- err
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	select {
+	case <-emitting:
+	case <-ctx.Done():
+		t.Fatal("reader did not enter its emitter")
+	}
+	joined := make(chan struct{})
+	go func() {
+		stream.closeAndWait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+		t.Fatal("stream shutdown did not join its active emitter")
+	case <-time.After(10 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-joined:
+	case <-ctx.Done():
+		t.Fatal("stream shutdown did not join its reader")
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("reader did not complete")
+	}
+	payload, err := stream.read(request, http.StatusPartialContent, contentRange, int64(len(data)), bytes.NewReader(data))
+	if !errors.Is(err, context.Canceled) || payload != nil || calls.Load() != 1 {
+		t.Fatalf("a late worker entered the closed stream: calls=%d, err=%v", calls.Load(), err)
+	}
+}
+
+func TestDriveFrameStreamRangePolicyAndOwnership(t *testing.T) {
+	cases := []struct {
+		name        string
+		size        int
+		lanes       int
+		head        bool
+		promoted    bool
+		rateLimited bool
+		ignored     bool
+		parts       int
+	}{
+		{"default segment", defaultSegmentBytes, 4, false, false, false, false, 1},
+		{"default boundary", defaultSegmentBytes + 1, 4, false, false, false, false, 2},
+		{"default large", 2 * defaultSegmentBytes, 4, false, false, false, false, 2},
+		{"default maximum lanes", 4 * defaultSegmentBytes, 4, false, false, false, false, 4},
+		{"head part", driveMediaPart, 4, true, false, false, false, 1},
+		{"head boundary", driveMediaPart + 1, 4, true, false, false, false, 2},
+		{"head four parts", defaultSegmentBytes, 4, true, false, false, false, 4},
+		{"head three lanes", defaultSegmentBytes + 17, 3, true, false, false, false, 3},
+		{"four part ceiling", defaultSegmentBytes + 17, 8, true, false, false, false, 4},
+		{"no media lanes", defaultSegmentBytes + 17, 0, true, false, false, false, 1},
+		{"recent quota response", defaultSegmentBytes + 17, 4, true, false, true, false, 1},
+		{"promotion keeps primary shape", defaultSegmentBytes, 4, false, true, false, false, 1},
+		{"ignored range ownership", defaultSegmentBytes + 17, 4, true, false, false, true, 4},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			data := driveStreamTestData(test.size)
+			frame := driveStreamTestFrame(data)
+			type interval struct{ start, end int }
+			var mu sync.Mutex
+			var ranges []interval
+			blocks := make(map[int][]byte)
+			counts := make(map[int]int)
+			s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+				var start, last int
+				if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+					return nil, err
+				}
+				if request.Method != http.MethodGet || request.URL.Query().Get("alt") != "media" ||
+					request.URL.Query().Get("supportsAllDrives") != "true" || request.Header.Get("Accept-Encoding") != "identity" {
+					return nil, fmt.Errorf("unexpected media request: %s %s", request.Method, request.URL)
+				}
+				if start < 0 || last < start || last >= len(data) {
+					return nil, fmt.Errorf("invalid range %d-%d", start, last)
+				}
+				mu.Lock()
+				ranges = append(ranges, interval{start, last + 1})
+				mu.Unlock()
+				if test.ignored {
+					return driveStreamTestResponse(request, http.StatusOK, "", int64(len(data)), io.NopCloser(bytes.NewReader(data))), nil
+				}
+				part := data[start : last+1]
+				return driveStreamTestResponse(request, http.StatusPartialContent,
+					fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), int64(len(part)), io.NopCloser(bytes.NewReader(part))), nil
+			}, test.lanes)
+			s.mediaNext.Store(7)
+			if test.rateLimited {
+				s.lastRateLimit = time.Now()
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if test.head {
+				ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+			}
+			if test.promoted {
+				promotion := make(chan struct{})
+				close(promotion)
+				ctx = context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(promotion))
+			}
+			if err := s.readFrameStream(ctx, "slot", frame, func(index int, block []byte) error {
+				mu.Lock()
+				defer mu.Unlock()
+				counts[index]++
+				blocks[index] = block
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(ranges) != test.parts || s.mediaNext.Load() != uint32(7+test.parts) {
+				t.Fatalf("primary ranges=%d, rotation=%d; want %d ranges", len(ranges), s.mediaNext.Load(), test.parts)
+			}
+			sort.Slice(ranges, func(i, j int) bool { return ranges[i].start < ranges[j].start })
+			end := 0
+			for _, part := range ranges {
+				if part.start != end || part.start%driveStreamBlockBytes != 0 ||
+					(part.end != len(data) && part.end%driveStreamBlockBytes != 0) {
+					t.Fatalf("ranges are not contiguous block-aligned partitions: %v", ranges)
+				}
+				end = part.end
+			}
+			if end != len(data) || len(blocks) != len(frame.blocks) {
+				t.Fatal("successful ranges did not cover the whole frame")
+			}
+			for index := range frame.blocks {
+				start := index * driveStreamBlockBytes
+				if counts[index] != 1 || !bytes.Equal(blocks[index], data[start:min(start+driveStreamBlockBytes, len(data))]) {
+					t.Fatalf("block %d was emitted %d times or has incorrect data", index, counts[index])
+				}
+			}
+		})
+	}
+}
+
+func TestDriveFrameStreamRetriesVerifiedPrefix(t *testing.T) {
+	data := driveStreamTestData(2*driveStreamBlockBytes + 19)
+	frame := driveStreamTestFrame(data)
+	var attempts atomic.Int32
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		body := data
+		if attempts.Add(1) == 1 {
+			body = data[:driveStreamBlockBytes+13]
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes 0-%d/%d", len(data)-1, len(data)), -1, io.NopCloser(bytes.NewReader(body))), nil
+	}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	seen := make(map[int][]byte)
+	counts := make(map[int]int)
+	if err := s.readFrameStream(ctx, "slot", frame, func(index int, block []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		counts[index]++
+		if _, ok := seen[index]; !ok {
+			seen[index] = block
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts.Load() != 2 || counts[0] != 2 || len(seen) != len(frame.blocks) {
+		t.Fatalf("retry did not preserve/deduplicate its verified prefix: attempts=%d, counts=%v", attempts.Load(), counts)
+	}
+	for index, block := range seen {
+		start := index * driveStreamBlockBytes
+		if !bytes.Equal(block, data[start:min(start+driveStreamBlockBytes, len(data))]) {
+			t.Fatalf("retry supplied an unverified block %d", index)
+		}
+	}
+}
+
+func TestDriveFrameStreamWaitsForEveryRangeEOF(t *testing.T) {
+	data := driveStreamTestData(driveMediaPart + 1)
+	frame := driveStreamTestFrame(data)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		var start, last int
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+			return nil, err
+		}
+		part := data[start : last+1]
+		var body io.ReadCloser = io.NopCloser(bytes.NewReader(part))
+		if last == len(data)-1 {
+			body = &driveStreamTestGatedBody{
+				ctx: request.Context(), data: part, pauseAt: len(part), release: release, closed: make(chan struct{}),
+			}
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), int64(len(part)), body), nil
+	}, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+	emitted := make(chan struct{}, len(frame.blocks))
+	done := make(chan error, 1)
+	go func() {
+		done <- s.readFrameStream(ctx, "slot", frame, func(int, []byte) error {
+			emitted <- struct{}{}
+			return nil
+		})
+	}()
+	for range frame.blocks {
+		select {
+		case <-emitted:
+		case err := <-done:
+			t.Fatalf("stream ended before all blocks: %v", err)
+		case <-ctx.Done():
+			t.Fatal("stream did not emit all blocks before its EOF check")
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("all blocks incorrectly counted as validated EOF: %v", err)
+	default:
+	}
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("stream did not join all successful ranges")
+	}
+}
+
+func TestDriveFrameStreamErrorCancelsOtherRanges(t *testing.T) {
+	data := driveStreamTestData(driveMediaPart + 1)
+	frame := driveStreamTestFrame(data)
+	started := make(chan struct{})
+	closed := make(chan struct{})
+	var startedOnce sync.Once
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		var start, last int
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+			return nil, err
+		}
+		if start == 0 {
+			select {
+			case <-started:
+			case <-request.Context().Done():
+				return nil, request.Context().Err()
+			}
+			return driveStreamTestResponse(request, http.StatusPartialContent, "wrong range", -1,
+				io.NopCloser(bytes.NewReader(data[start:last+1]))), nil
+		}
+		startedOnce.Do(func() { close(started) })
+		body := &driveStreamTestGatedBody{
+			ctx: request.Context(), data: data[start : last+1], pauseAt: 0, release: make(chan struct{}), closed: closed,
+		}
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), -1, body), nil
+	}, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+	if err := s.readFrameStream(ctx, "slot", frame, func(int, []byte) error {
+		t.Error("invalid or blocked ranges must not emit blocks")
+		return nil
+	}); err == nil {
+		t.Fatal("invalid range succeeded")
+	}
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("failed frame did not cancel and close its other range")
+	}
+}
+
+func TestDriveFrameStreamLeavesLegacyMediaUnchanged(t *testing.T) {
+	data := driveStreamTestData(defaultSegmentBytes + 17)
+	frame := newSlotFrame(7, slotMedia, data)
+	var requests atomic.Int32
+	s := driveStreamTestStorage(t, func(request *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		var start, last int
+		if _, err := fmt.Sscanf(request.Header.Get("Range"), "bytes=%d-%d", &start, &last); err != nil {
+			return nil, err
+		}
+		part := data[start : last+1]
+		return driveStreamTestResponse(request, http.StatusPartialContent,
+			fmt.Sprintf("bytes %d-%d/%d", start, last, len(data)), int64(len(part)), io.NopCloser(bytes.NewReader(part))), nil
+	}, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	body, err := s.readFrameBody(ctx, "slot", frame)
+	if err != nil || !bytes.Equal(body, data) || requests.Load() != 2 {
+		t.Fatalf("legacy media changed: requests=%d, bytes=%d, err=%v", requests.Load(), len(body), err)
+	}
+	frame.crc ^= 1
+	if _, err := s.readFrameBody(ctx, "slot", frame); err == nil {
+		t.Fatal("legacy media no longer checks its whole-frame CRC")
+	}
+}
+
+// Streaming negotiation tests.
+
+func TestDriveStreamCapsLegacyFallback(t *testing.T) {
+	s := &driveStorage{}
+	s.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "session"})
+	s.configureStreaming("", true)
+	if s.streamCaps.Load() != nil || s.streamingEnabled() {
+		t.Fatal("unconfigured or empty-nonce storage enabled streaming")
+	}
+	if properties := s.streamingProperties(); properties != nil {
+		t.Fatalf("unconfigured properties = %v, want nil", properties)
+	}
+	if fields := s.streamingFields(); fields != "description" {
+		t.Fatalf("unconfigured fields = %q, want description", fields)
+	}
+
+	s.configureStreaming("session", false)
+	s.observeStreamingProperties(nil)
+	s.observeStreamingProperties(map[string]string{})
+	if s.streamingEnabled() {
+		t.Fatal("legacy peer with no properties enabled streaming")
+	}
+	if fields := s.streamingFields(); fields != "description,properties" {
+		t.Fatalf("configured fields = %q, want description,properties", fields)
+	}
+	if properties := s.streamingProperties(); properties != nil {
+		t.Fatalf("endpoint without an accepted ring offer advertised properties: %v", properties)
+	}
+}
+
+func TestDriveStreamCapsPeerOffer(t *testing.T) {
+	server := &driveStorage{}
+	server.configureStreaming("session", true)
+	if !server.streamingEnabled() {
+		t.Fatal("declared peer reader did not immediately enable the server writer")
+	}
+	properties := server.streamingProperties()
+	if len(properties) != 2 || properties["xdriveStream"] != "1" || properties["xdriveSession"] != "session" {
+		t.Fatalf("server reader acknowledgment = %v", properties)
+	}
+
+	client := &driveStorage{}
+	client.configureStreaming("session", false)
+	if client.streamingEnabled() {
+		t.Fatal("client writer enabled before the server reader offer")
+	}
+	if properties := client.streamingProperties(); properties != nil {
+		t.Fatalf("client advertised metadata before the server acknowledgment: %v", properties)
+	}
+	client.observeStreamingProperties(properties)
+	if !client.streamingEnabled() {
+		t.Fatal("matching server reader offer did not enable the client writer")
+	}
+	if properties := client.streamingProperties(); properties != nil {
+		t.Fatalf("confirmed client advertised metadata: %v", properties)
+	}
+}
+
+func TestDriveStreamCapsOwnOutgoingMetadataCannotBootstrap(t *testing.T) {
+	client := &driveStorage{}
+	client.configureStreaming("session", false)
+	oldPeer := &driveStorage{}
+	oldPeer.configureStreaming("session", false)
+	ownProperties := client.streamingProperties()
+	if ownProperties != nil {
+		t.Fatalf("client outgoing slot carries a reader acknowledgment: %v", ownProperties)
+	}
+	client.observeStreamingProperties(ownProperties)
+	client.observeStreamingProperties(oldPeer.streamingProperties())
+	if client.streamingEnabled() || oldPeer.streamingEnabled() {
+		t.Fatal("own-slot recovery or a legacy peer enabled a streaming writer")
+	}
+	if properties := oldPeer.streamingProperties(); properties != nil {
+		t.Fatalf("server without an accepted ring offer advertised properties: %v", properties)
+	}
+	server := &driveStorage{}
+	server.configureStreaming("session", true)
+	client.observeStreamingProperties(server.streamingProperties())
+	if !client.streamingEnabled() || client.streamingProperties() != nil {
+		t.Fatal("server acknowledgment did not confirm the client without self-advertising")
+	}
+}
+
+func TestDriveStreamCapsObserveProperties(t *testing.T) {
+	tests := []struct {
+		name       string
+		properties map[string]string
+		want       bool
+	}{
+		{name: "nil"},
+		{name: "empty", properties: map[string]string{}},
+		{name: "missing version", properties: map[string]string{"xdriveSession": "session"}},
+		{name: "missing nonce", properties: map[string]string{"xdriveStream": "1"}},
+		{name: "empty nonce", properties: map[string]string{"xdriveStream": "1", "xdriveSession": ""}},
+		{name: "wrong nonce", properties: map[string]string{"xdriveStream": "1", "xdriveSession": "other"}},
+		{name: "nonce whitespace", properties: map[string]string{"xdriveStream": "1", "xdriveSession": " session"}},
+		{name: "unknown version", properties: map[string]string{"xdriveStream": "2", "xdriveSession": "session"}},
+		{name: "zero version", properties: map[string]string{"xdriveStream": "0", "xdriveSession": "session"}},
+		{name: "empty version", properties: map[string]string{"xdriveStream": "", "xdriveSession": "session"}},
+		{name: "padded version", properties: map[string]string{"xdriveStream": "01", "xdriveSession": "session"}},
+		{name: "version whitespace", properties: map[string]string{"xdriveStream": "1 ", "xdriveSession": "session"}},
+		{name: "wrong key case", properties: map[string]string{"XdriveStream": "1", "xdriveSession": "session"}},
+		{name: "matching", properties: map[string]string{"xdriveStream": "1", "xdriveSession": "session"}, want: true},
+		{name: "unrelated properties", properties: map[string]string{"xdriveStream": "1", "xdriveSession": "session", "unrelated": "value"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &driveStorage{}
+			s.configureStreaming("session", false)
+			s.observeStreamingProperties(tt.properties)
+			if enabled := s.streamingEnabled(); enabled != tt.want {
+				t.Fatalf("streamingEnabled() = %v, want %v", enabled, tt.want)
+			}
+			if properties := s.streamingProperties(); properties != nil {
+				t.Fatalf("observing metadata caused a client advertisement: %v", properties)
+			}
+		})
+	}
+}
+
+func TestDriveStreamCapsPropertiesAreIndependent(t *testing.T) {
+	s := &driveStorage{}
+	s.configureStreaming("session", true)
+	properties := s.streamingProperties()
+	properties["xdriveStream"] = "2"
+	properties["xdriveSession"] = "other"
+	properties["extra"] = "value"
+	other := s.streamingProperties()
+	if len(other) != 2 || other["xdriveStream"] != "1" || other["xdriveSession"] != "session" {
+		t.Fatalf("caller mutation changed subsequent properties: %v", other)
+	}
+	client := &driveStorage{}
+	client.configureStreaming("session", false)
+	client.observeStreamingProperties(properties)
+	if client.streamingEnabled() {
+		t.Fatal("mutated server properties enabled the client writer")
+	}
+	client.observeStreamingProperties(other)
+	if !client.streamingEnabled() {
+		t.Fatal("original reader offer no longer matched after map mutation")
+	}
+}
+
+func TestDriveStreamCapsMonotonicAndEpochReset(t *testing.T) {
+	s := &driveStorage{}
+	s.configureStreaming("first", false)
+	first := s.streamCaps.Load()
+	s.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "first"})
+	s.configureStreaming("first", false)
+	s.configureStreaming("", false)
+	for _, properties := range []map[string]string{
+		nil,
+		{},
+		{"xdriveStream": "0", "xdriveSession": "first"},
+		{"xdriveStream": "1", "xdriveSession": "other"},
+	} {
+		s.observeStreamingProperties(properties)
+		if !s.streamingEnabled() {
+			t.Fatal("confirmed peer capability was revoked within the session")
+		}
+	}
+	if s.streamCaps.Load() != first || first.advertise || s.streamingProperties() != nil {
+		t.Fatal("same-nonce configuration replaced capability state or enabled client advertisement")
+	}
+
+	s.configureStreaming("second", false)
+	second := s.streamCaps.Load()
+	if second == first || second.session != "second" || s.streamingEnabled() {
+		t.Fatal("different nonce did not start a fresh, unconfirmed epoch")
+	}
+	s.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "first"})
+	first.peerReady.Store(true)
+	if s.streamingEnabled() {
+		t.Fatal("old-epoch properties or state enabled the new epoch")
+	}
+	s.configureStreaming("second", true)
+	s.configureStreaming("second", false)
+	if s.streamCaps.Load() != second || !s.streamingEnabled() || second.advertise || s.streamingProperties() != nil {
+		t.Fatal("same-epoch peer offer was not retained independently of advertisement")
+	}
+
+	s.configureStreaming("third", true)
+	third := s.streamCaps.Load()
+	s.configureStreaming("third", false)
+	properties := s.streamingProperties()
+	if third == second || s.streamCaps.Load() != third || !third.advertise || !s.streamingEnabled() || len(properties) != 2 || properties["xdriveSession"] != "third" {
+		t.Fatal("new accepted-offer epoch did not preserve its metadata acknowledgment")
+	}
+	s.configureStreaming("fourth", false)
+	s.observeStreamingProperties(properties)
+	if s.streamingEnabled() || s.streamCaps.Load().advertise || s.streamingProperties() != nil {
+		t.Fatal("previous epoch's advertisement or readiness leaked into a fresh client epoch")
+	}
+}
+
+func TestDriveStreamCapsSessionIsolation(t *testing.T) {
+	root := &driveStorage{driveShared: &driveShared{}}
+	root.configureStreaming("root", true)
+	first := root.session().(*driveStorage)
+	second := root.session().(*driveStorage)
+	t.Cleanup(func() {
+		first.Close()
+		second.Close()
+	})
+	for _, child := range []*driveStorage{first, second} {
+		if child.driveShared != root.driveShared {
+			t.Fatal("session does not share its root's driveShared")
+		}
+		if child.streamCaps.Load() != nil || child.streamingEnabled() || child.streamingProperties() != nil || child.streamingFields() != "description" {
+			t.Fatal("unconfigured child inherited the root's capability state")
+		}
+	}
+	first.configureStreaming("first", false)
+	second.configureStreaming("second", false)
+	first.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "second"})
+	second.observeStreamingProperties(root.streamingProperties())
+	if first.streamingEnabled() || second.streamingEnabled() {
+		t.Fatal("another session's reader offer enabled a child")
+	}
+	first.observeStreamingProperties(first.streamingProperties())
+	if first.streamingEnabled() {
+		t.Fatal("child's own outgoing metadata enabled its writer")
+	}
+	first.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "first"})
+	if !first.streamingEnabled() || second.streamingEnabled() || !root.streamingEnabled() {
+		t.Fatal("peer readiness leaked between storage instances")
+	}
+	if first.streamingProperties() != nil || second.streamingProperties() != nil || root.streamingProperties() == nil {
+		t.Fatal("metadata advertisement leaked between storage instances")
+	}
+	if first.streamCaps.Load() == second.streamCaps.Load() || first.streamCaps.Load() == root.streamCaps.Load() {
+		t.Fatal("configured sessions share capability pointers")
+	}
+	grandchild := first.session().(*driveStorage)
+	t.Cleanup(func() { grandchild.Close() })
+	if grandchild.streamCaps.Load() != nil || grandchild.streamingEnabled() || grandchild.streamingProperties() != nil {
+		t.Fatal("nested session inherited capability state")
+	}
+}
+
+func TestDriveStreamCapsLeaseMethods(t *testing.T) {
+	backend := &driveStorage{}
+	var storage Storage = &leasedDriveStorage{driveStorage: backend}
+	caps, ok := storage.(interface {
+		configureStreaming(string, bool)
+		streamingEnabled() bool
+		streamingProperties() map[string]string
+		observeStreamingProperties(map[string]string)
+		streamingFields() string
+	})
+	if !ok {
+		t.Fatal("Drive lease does not expose the embedded capability helpers")
+	}
+	caps.configureStreaming("session", false)
+	if caps.streamingEnabled() || caps.streamingFields() != "description,properties" {
+		t.Fatal("lease did not configure the backend reader")
+	}
+	caps.observeStreamingProperties(caps.streamingProperties())
+	if caps.streamingEnabled() || caps.streamingProperties() != nil {
+		t.Fatal("lease enabled its backend from outgoing client metadata")
+	}
+	server := &driveStorage{}
+	server.configureStreaming("session", true)
+	caps.observeStreamingProperties(server.streamingProperties())
+	if !caps.streamingEnabled() || !backend.streamingEnabled() {
+		t.Fatal("lease did not update the backend peer capability")
+	}
+	if caps.streamingProperties() != nil {
+		t.Fatal("confirmed client lease advertised a metadata acknowledgment")
+	}
+}
+
+func TestDriveStreamCapsConcurrentConfiguration(t *testing.T) {
+	s := &driveStorage{}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for worker := 0; worker < 32; worker++ {
+		wg.Add(1)
+		go func(peerSupports bool) {
+			defer wg.Done()
+			<-start
+			s.configureStreaming("session", peerSupports)
+		}(worker%2 == 0)
+	}
+	close(start)
+	wg.Wait()
+	caps := s.streamCaps.Load()
+	if caps == nil || caps.session != "session" || !s.streamingEnabled() {
+		t.Fatal("concurrent same-epoch configuration lost a peer reader offer")
+	}
+	advertise := caps.advertise
+	s.configureStreaming("session", false)
+	s.configureStreaming("session", true)
+	if s.streamCaps.Load() != caps || !s.streamingEnabled() || caps.advertise != advertise || (s.streamingProperties() != nil) != advertise {
+		t.Fatal("same-epoch configuration changed advertisement or revoked a confirmed offer")
+	}
+}
+
+func TestDriveStreamCapsConcurrentObserveAndProperties(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		peerSupports bool
+	}{
+		{name: "client", peerSupports: false},
+		{name: "accepted server", peerSupports: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &driveStorage{}
+			s.configureStreaming("session", tt.peerSupports)
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			for worker := 0; worker < 16; worker++ {
+				wg.Add(1)
+				go func(worker int) {
+					defer wg.Done()
+					<-start
+					for i := 0; i < 128; i++ {
+						wasReady := s.streamingEnabled()
+						switch worker % 4 {
+						case 0:
+							s.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "session"})
+						case 1:
+							s.observeStreamingProperties(map[string]string{"xdriveStream": "1", "xdriveSession": "other"})
+						case 2:
+							s.observeStreamingProperties(map[string]string{"xdriveStream": "2", "xdriveSession": "session"})
+						case 3:
+							s.configureStreaming("session", i%2 == 0)
+						}
+						properties := s.streamingProperties()
+						if tt.peerSupports {
+							if len(properties) != 2 || properties["xdriveStream"] != "1" || properties["xdriveSession"] != "session" {
+								t.Errorf("concurrent server acknowledgment changed: %v", properties)
+								return
+							}
+							properties["xdriveSession"] = "mutated"
+							delete(properties, "xdriveStream")
+						} else if properties != nil {
+							t.Errorf("concurrent observation or reconfiguration enabled client advertisement: %v", properties)
+							return
+						}
+						if s.streamingFields() != "description,properties" {
+							t.Error("concurrent metadata fields changed")
+							return
+						}
+						if wasReady && !s.streamingEnabled() {
+							t.Error("concurrent observation revoked confirmed readiness")
+							return
+						}
+					}
+				}(worker)
+			}
+			close(start)
+			wg.Wait()
+			if !s.streamingEnabled() {
+				t.Fatal("concurrent matching reader offer was lost")
+			}
+		})
+	}
 }
