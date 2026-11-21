@@ -533,7 +533,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if streams {
 			r.StreamVersion = 1
 			r.StreamPrefix, r.Down.streamPrefix = true, true
-			r.DirectMedia = os.Getenv("XRAY_XDRIVE_DIRECT_MEDIA") == "1"
+			r.DirectMedia = os.Getenv("XRAY_XDRIVE_DIRECT_MEDIA") != "0"
 			r.Down.directMedia = r.DirectMedia
 		}
 		if !canAllocate && !lazy && streamSettings.FinalMask == nil {

@@ -1,9 +1,11 @@
 <!-- coderabbit-ai-generated:v1 -->
 
-# Optional direct media experiment
+<!-- coderabbit-ai-generated-section:v1:0c3694501a8b2d5ab8aa73a22e008a4b297858fa3840da5a990580fac9d4fae3 -->
 
-Set `XRAY_XDRIVE_DIRECT_MEDIA=1` on the **client** process and reconnect. Use
-updated binaries at both ends. The option advertises support in the ring offer;
+# Direct media
+
+Direct media is enabled by default. Use updated binaries at both ends and
+start a new connection. The client advertises support in the ring offer;
 older servers ignore it and upgraded servers keep the existing format for
 unadvertised clients. It applies to downstream frames already selected for
 media, up to 512 KiB. Inline frames and larger media frames use their existing
@@ -20,5 +22,8 @@ still needs discovery. Speculation is disabled during quota recovery.
 
 This mode buffers eligible frames until validation and does not divide them
 across media ranges. An unsuccessful speculation can cost an extra media GET.
-Compare tail latency and Drive quota before enabling it broadly. The option is
-off by default; unset it and reconnect to restore existing media behavior.
+Compare tail latency and Drive quota. To restore the previous streaming mode,
+set `XRAY_XDRIVE_DIRECT_MEDIA=0` on the client and reconnect.
+
+
+<!-- /coderabbit-ai-generated:v1 -->

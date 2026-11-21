@@ -3,6 +3,7 @@ package xdrive
 import (
 	"bytes"
 	"context"
+	"io"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -125,4 +126,57 @@ func TestDriveDirectMediaWriterRequiresClientOffer(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestDriveDirectMediaDefaultSession(t *testing.T) {
+	t.Setenv("XRAY_XDRIVE_DIRECT_MEDIA", "")
+	drive := newFakeDrive(t)
+	settings := drive.settings(t)
+	settings.ProtocolSettings.(*Config).Concurrency = 8
+	client, server, cleanup := pairWith(t, settings)
+	defer cleanup()
+	reader := client.(*Conn).reader.(*slotReader)
+	writer := server.(*Conn).writer.(*slotWriter)
+	if !reader.table.directMedia || !writer.table.directMedia {
+		t.Fatal("default session did not negotiate direct media in both directions")
+	}
+
+	data := bytes.Repeat([]byte("d"), defaultSegmentBytes)
+	written := make(chan error, 1)
+	go func() { _, err := server.Write(data); written <- err }()
+	if err := client.SetReadDeadline(time.Now().Add(testPatience)); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(data))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-written; err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("default direct transfer failed: %v", err)
+	}
+	drive.mu.Lock()
+	defer drive.mu.Unlock()
+	found := false
+	for _, file := range drive.files {
+		if frame, ok := decodeSlot(file.description); ok && frame.mode == slotDirectMedia {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no direct frame was published in the default session")
+	}
+}
+
+func TestDriveDirectMediaCanBeDisabled(t *testing.T) {
+	t.Setenv("XRAY_XDRIVE_DIRECT_MEDIA", "0")
+	drive := newFakeDrive(t)
+	settings := drive.settings(t)
+	settings.ProtocolSettings.(*Config).Concurrency = 8
+	client, server, cleanup := pairWith(t, settings)
+	defer cleanup()
+	reader := client.(*Conn).reader.(*slotReader)
+	writer := server.(*Conn).writer.(*slotWriter)
+	if reader.table.directMedia || writer.table.directMedia {
+		t.Fatal("disabled session unexpectedly negotiated direct media")
+	}
 }
