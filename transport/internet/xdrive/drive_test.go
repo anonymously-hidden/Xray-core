@@ -4236,3 +4236,53 @@ func TestDriveHeadRetryAvoidsFailedSpreadConnection(t *testing.T) {
 		})
 	}
 }
+
+func TestDriveStaleSnapshotDoesNotCancelValidRead(t *testing.T) {
+	for _, miss := range []int{http.StatusNotFound, http.StatusOK} {
+		t.Run(fmt.Sprint(miss), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				cancelled := make(chan bool, 1)
+				fresh := newSlotFrame(9, slotInline, []byte("fresh")).encode()
+				stale := newSlotFrame(8, slotInline, []byte("stale")).encode()
+				s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+					select {
+					case <-r.Context().Done():
+						cancelled <- true
+						return nil, r.Context().Err()
+					case <-time.After(15 * time.Millisecond):
+						cancelled <- false
+						return memoryResponse(http.StatusOK, fmt.Sprintf(`{"description":%q}`, fresh)), nil
+					}
+				}))
+				s.bulkClient = &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+					return memoryResponse(miss, fmt.Sprintf(`{"description":%q}`, stale)), nil
+				})}
+				s.readHedge, s.readHedgeTokens = 10*time.Millisecond, 1
+				ctx := context.WithValue(context.Background(), laneKey{}, true)
+				ctx = context.WithValue(ctx, slotExpectedSeqKey{}, int64(9))
+				desc, err := s.readDescription(ctx, "item")
+				abandoned := <-cancelled
+				if desc != fresh || err != nil || abandoned {
+					t.Fatalf("got description=%q; primary canceled=%t; err=%v", desc, abandoned, err)
+				}
+			})
+		})
+	}
+}
+
+func TestDriveListStopsRepeatedPageToken(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	s := memoryDrive(roundTrip(func(*http.Request) (*http.Response, error) {
+		calls++
+		if calls == 4 {
+			cancel() // Fail safely even if cycle detection regresses.
+		}
+		return memoryResponse(http.StatusOK, `{"nextPageToken":"same","files":[{"id":"slot","name":"item"}]}`), nil
+	}))
+	items, err := s.query(ctx, "name = 'item'")
+	if err == nil || calls != 2 || items["item"].id != "slot" {
+		t.Fatalf("want partial results and duplicate token error after 2 requests; got %d requests, err=%v", calls, err)
+	}
+}

@@ -118,13 +118,18 @@ func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
 	return f
 }
 
-func (f slotFrame) encode() string {
+func (f slotFrame) header() []byte {
 	b := make([]byte, slotHeaderLen, slotHeaderLen+len(f.data))
 	copy(b, slotMagic)
 	binary.BigEndian.PutUint64(b[8:], uint64(f.seq))
 	b[16] = f.mode
 	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
 	binary.BigEndian.PutUint32(b[21:], f.crc)
+	return b
+}
+
+func (f slotFrame) encode() string {
+	b := f.header()
 	if f.mode == slotStream {
 		b = appendStreamChecksums(b, f.blocks)
 		if len(f.prefix) != 0 {
@@ -140,7 +145,14 @@ func (f slotFrame) encode() string {
 
 func decodeSlot(description string) (slotFrame, bool) {
 	b, err := base64.StdEncoding.DecodeString(description)
-	if err != nil || len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
+	if err != nil {
+		return slotFrame{}, false
+	}
+	return decodeSlotBytes(b)
+}
+
+func decodeSlotBytes(b []byte) (slotFrame, bool) {
+	if len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
 		return slotFrame{}, false
 	}
 	f := slotFrame{
@@ -158,8 +170,8 @@ func decodeSlot(description string) (slotFrame, bool) {
 		if f.size == 0 || !f.holds(f.data) {
 			return slotFrame{}, false
 		}
-	case slotMedia:
-		if f.size == 0 || len(b) != slotHeaderLen {
+	case slotMedia, slotDirectMedia:
+		if f.mode == slotDirectMedia && f.size > slotDirectMediaMax || f.size == 0 || len(b) != slotHeaderLen {
 			return slotFrame{}, false
 		}
 	case slotStream, slotStreamPrefix:
@@ -204,6 +216,7 @@ type slotTable struct {
 	name         string
 	lazy         bool
 	streamPrefix bool
+	directMedia  bool
 }
 
 // ring is what a client announces a session with, the tables are named from
@@ -213,6 +226,7 @@ type ring struct {
 	Down          slotTable `json:"d"`
 	First         []byte    `json:"first,omitempty"`
 	Lazy          bool      `json:"lazy,omitempty"`
+	DirectMedia   bool      `json:"directMedia,omitempty"`
 	StreamPrefix  bool      `json:"streamPrefix,omitempty"` // downstream reader also accepts a verified metadata prefix
 	StreamVersion uint32    `json:"stream,omitempty"`       // receiver capability, not a v1 watermark change
 }
@@ -809,6 +823,9 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	awaited := time.Since(began)
 	putAt := time.Now()
 	var prefix []byte
+	if mode == slotStream && w.table.directMedia && len(chunk) <= slotDirectMediaMax {
+		mode = slotDirectMedia
+	}
 	if mode == slotStream && result.inlinePrefix {
 		prefix = chunk[:slotStreamPrefixBytes]
 	}
@@ -858,6 +875,8 @@ func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error
 	var body []byte
 	if mode == slotMedia || mode == slotStream {
 		body = data
+	} else if mode == slotDirectMedia {
+		body = encodeDirectSlot(f, data)
 	}
 	id := w.slotID(seq)
 	if w.lazy {
@@ -1161,6 +1180,7 @@ type slotReader struct {
 	frontier        int64
 	frontierAt      time.Time // last advance of the observed description frontier
 	frontierChanged chan struct{}
+	directNext      int64 // next head eligible for a direct read after contiguous media
 	err             error
 	stop            context.CancelFunc
 	reads           atomic.Int64
@@ -1375,6 +1395,9 @@ func (r *slotReader) run() {
 		// the slot is free once the bytes are here, not once they are read
 		r.mu.Lock()
 		r.head++
+		if f.mode == slotDirectMedia {
+			r.directNext = r.head
+		}
 		r.started = true
 		r.mu.Unlock()
 		size := len(f.body)
@@ -1472,7 +1495,12 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 	descriptionCtx, cancelDescription := newDescriptionContext()
 	defer func() { cancelDescription() }()
-	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
+	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), probeContext: ctx}
+	defer func() {
+		if hunt.probe != nil {
+			hunt.probe.stop()
+		}
+	}()
 	backoff := r.huntFloor
 	tailMisses, absentMisses := 0, 0
 	_, drive := r.store.(throttleStore)
@@ -1480,6 +1508,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	for {
 		observations, present := hunt.observations, hunt.present
 		description, err := r.huntSlotDescription(descriptionCtx, id, seq, f.promoted, &hunt)
+
 		if hunt.observations != observations {
 			failedSince = time.Time{}
 		}
@@ -1526,6 +1555,9 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		switch {
 		case err == nil && ok && frame.seq == seq:
 			cancelDescription()
+			if frame.mode != slotDirectMedia && hunt.probe != nil {
+				hunt.probe.stop()
+			}
 			if f.visibleAt.IsZero() {
 				f.visibleAt = time.Now()
 			}
@@ -1594,7 +1626,11 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					return
 				}
 				fallthrough
-			case slotMedia:
+			case slotDirectMedia, slotMedia:
+				if frame.mode == slotDirectMedia && !r.table.directMedia {
+					f.err = errors.New("unnegotiated direct media frame")
+					return
+				}
 				admissionAt := time.Now()
 				permit, admitted := r.bodies.acquire(ctx, seq, frame.size)
 				if !admitted {
@@ -1606,7 +1642,34 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
 				timing := &bodyReadTiming{}
 				bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
-				body, bodyErr := r.readMediaBody(bodyCtx, id, seq, frame)
+				var body []byte
+				var bodyErr error
+				if frame.mode == slotDirectMedia {
+					store, supported := r.store.(directSlotStore)
+					if !supported {
+						bodyErr = errors.New("unnegotiated direct media frame")
+					} else {
+						direct := hunt.direct
+						if hunt.probe != nil && hunt.probe.result != nil {
+							select {
+							case direct = <-hunt.probe.result:
+							case <-ctx.Done():
+								permit.finish(timing.result(0), false)
+								return
+							}
+							hunt.probe.result = nil
+						}
+						if direct.size == 0 {
+							direct, bodyErr = store.readDirectSlot(bodyCtx, id, seq)
+						}
+						if bodyErr == nil && (direct.size != frame.size || direct.crc != frame.crc) {
+							bodyErr = errors.New("direct media frame does not match its description")
+						}
+						body = direct.data
+					}
+				} else {
+					body, bodyErr = r.readMediaBody(bodyCtx, id, seq, frame)
+				}
 				bodyTime := time.Since(began)
 				f.bodyTime += bodyTime
 				if bodyErr == nil {
@@ -1639,6 +1702,9 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 					return
 				}
 				descriptionCtx, cancelDescription = newDescriptionContext()
+				if hunt.probe != nil {
+					hunt.probe.stop()
+				}
 				hunt = slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), observations: hunt.observations, present: hunt.present, frontierProbe: hunt.frontierProbe}
 			}
 		case err == nil && !ok && description != "":
@@ -1770,12 +1836,19 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 }
 
+type slotExpectedSeqKey struct{}
+
+const slotDescriptionMissGrace = 150 * time.Millisecond
+
 type slotDescriptionResult struct {
 	description string
 	err         error
 }
 
 type slotDescriptionHunt struct {
+	probeContext  context.Context
+	probe         *directSlotProbe
+	direct        slotFrame
 	results       chan slotDescriptionResult
 	outstanding   int
 	lastLaunch    time.Time  // retained across observations and tail promotion
@@ -1894,6 +1967,7 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		role := head
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
+			readCtx = context.WithValue(readCtx, slotExpectedSeqKey{}, seq)
 			readCtx = context.WithValue(readCtx, avoidConnKey{}, &pending.spread)
 		}
 		results := pending.results
@@ -1933,6 +2007,14 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	admit()
 	_, drive := r.store.(throttleStore)
 	for {
+		var direct <-chan slotFrame
+		if head && pending.probeContext != nil {
+			pending.probe = r.startDirectProbe(pending.probeContext, seq, id)
+			pending.probeContext = nil
+		}
+		if pending.probe != nil {
+			direct = pending.probe.result
+		}
 		var frontierChanged <-chan struct{}
 		if drive && !head && !pending.frontierProbe && pending.outstanding == 1 {
 			var evidence bool
@@ -1947,6 +2029,14 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			}
 		}
 		select {
+		case frame := <-direct:
+			pending.probe.result = nil
+			if frame.size > 0 {
+				pending.direct = frame
+				wire := frame
+				wire.data = nil
+				return wire.encode(), nil
+			}
 		case <-frontierChanged:
 			continue
 		case res := <-pending.results:

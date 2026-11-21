@@ -771,7 +771,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	descriptionHedge := method == http.MethodGet && ctx.Value(descriptionHedgeKey{}) != nil
 	media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
 	mediaTiming, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
-	readHedgeAttempt := descriptionHedge || method == http.MethodGet && media != nil && media.rescue
+	readHedgeAttempt := descriptionHedge || method == http.MethodGet &&
+		(media != nil && media.rescue || ctx.Value(directProbeKey{}) != nil)
 	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
 		return 0, nil, errReadHedgeSkipped
@@ -1556,6 +1557,7 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 	found := make(map[string]driveFile)
 	seen := make(map[string]map[string]struct{})
 	pageToken := ""
+	seenTokens := make(map[string]struct{})
 	fields := "nextPageToken,files(id,name,description)"
 	if ctx.Value(namesOnlyKey{}) != nil {
 		fields = "nextPageToken,files(id,name)"
@@ -1624,6 +1626,10 @@ func (s *driveStorage) query(ctx context.Context, condition string) (map[string]
 		if pageToken == "" {
 			return found, nil
 		}
+		if _, repeated := seenTokens[pageToken]; repeated {
+			return found, errors.New("Drive listing repeated a page token")
+		}
+		seenTokens[pageToken] = struct{}{}
 	}
 }
 
@@ -2172,7 +2178,7 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 			return false
 		}
 	}
-	if ctx.Value(descriptionHedgeKey{}) != nil {
+	if ctx.Value(descriptionHedgeKey{}) != nil || ctx.Value(directProbeKey{}) != nil {
 		return s.descriptionHedgeAllowed()
 	}
 	if media, ok := ctx.Value(driveMediaKey{}).(*driveMediaRequest); ok && media.rescue {
@@ -2263,24 +2269,54 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 		st, pl, e := s.do(ctx2, http.MethodGet, target, "", nil)
 		ch <- res{st, pl, e, true}
 	}()
-	var last res
-	for i := 0; i < 2; i++ {
-		var r res
-		select {
-		case r = <-ch:
-		case <-ctx.Done():
-			return 0, nil, ctx.Err()
+	expected, slotRead := ctx.Value(slotExpectedSeqKey{}).(int64)
+	match := func(r res) bool {
+		if r.status != http.StatusOK || r.err != nil {
+			return false
 		}
-		if r.err == nil && (r.status == http.StatusOK || r.status == http.StatusNotFound) {
-			if r.hedge && s.timing != nil {
-				s.timing.noteHedgeWin(kindHeadRead)
-			}
-			last = r
-			break
+		if !slotRead {
+			return true
 		}
-		last = r
+		var payload struct{ Description string }
+		if json.Unmarshal(r.payload, &payload) != nil {
+			return false
+		}
+		frame, ok := decodeSlot(payload.Description)
+		return ok && frame.seq == expected
 	}
-	return last.status, last.payload, last.err
+	pick := func(r res) (int, []byte, error) {
+		if r.hedge && match(r) && s.timing != nil {
+			s.timing.noteHedgeWin(kindHeadRead)
+		}
+		return r.status, r.payload, r.err
+	}
+	var first res
+	select {
+	case first = <-ch:
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+	if match(first) || isAuthError(first.err) {
+		return pick(first)
+	}
+	// A fresh frame can race a missing or previous-lap snapshot. Give the
+	// already dispatched sibling a short chance to answer without making
+	// each genuine miss wait through the full HTTP timeout.
+	grace := time.NewTimer(slotDescriptionMissGrace)
+	defer grace.Stop()
+	select {
+	case second := <-ch:
+		if match(second) || isAuthError(second.err) ||
+			second.err == nil && (second.status == http.StatusOK ||
+				second.status == http.StatusNotFound && (first.err != nil || first.status != http.StatusOK)) {
+			return pick(second)
+		}
+		return pick(first)
+	case <-grace.C:
+		return pick(first)
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
 }
 
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {

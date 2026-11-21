@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -532,6 +533,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if streams {
 			r.StreamVersion = 1
 			r.StreamPrefix, r.Down.streamPrefix = true, true
+			r.DirectMedia = os.Getenv("XRAY_XDRIVE_DIRECT_MEDIA") == "1"
+			r.Down.directMedia = r.DirectMedia
 		}
 		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
 			warmSpares(streamSettings, config, p)
@@ -942,6 +945,7 @@ func (l *Listener) newSessionConn(logCtx context.Context, session string, announ
 			if capable, ok := storage.(interface{ configureStreaming(string, bool) }); ok {
 				capable.configureStreaming(session, r.StreamVersion == 1)
 				r.Down.streamPrefix = r.StreamVersion == 1 && r.StreamPrefix
+				r.Down.directMedia = r.StreamVersion == 1 && r.DirectMedia
 			}
 			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
 			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
