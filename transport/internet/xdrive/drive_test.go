@@ -4202,3 +4202,37 @@ func TestDriveStreamCapsConcurrentObserveAndProperties(t *testing.T) {
 		})
 	}
 }
+
+func TestDriveHeadRetryAvoidsFailedSpreadConnection(t *testing.T) {
+	for _, limit := range []int32{1, 2} {
+		t.Run(strconv.Itoa(int(limit)), func(t *testing.T) {
+			var made, attempts int
+			pool := newConnPool(&splithttp.XmuxConfig{MaxConnections: &splithttp.RangeConfig{From: limit, To: limit}}, func(context.Context) *http.Client {
+				made++
+				id := made
+				return &http.Client{Transport: roundTrip(func(*http.Request) (*http.Response, error) {
+					attempts++
+					if attempts == 1 || limit == 2 && id == 1 {
+						return nil, io.ErrUnexpectedEOF
+					}
+					return memoryResponse(http.StatusOK, "ready"), nil
+				})}
+			})
+			defer pool.Close()
+			session := &sessionTransport{pool: pool}
+			defer session.Close()
+			s := memoryDrive(session)
+			t.Cleanup(s.closeWork)
+			sp := new(connSpread)
+			ctx := context.WithValue(context.Background(), avoidConnKey{}, sp)
+			ctx = context.WithValue(ctx, laneKey{}, true)
+			_, data, err := s.do(ctx, http.MethodGet, s.filesURL+"/slot", "", nil)
+			if err != nil || string(data) != "ready" || attempts != 2 || made != int(limit) {
+				t.Fatalf("got %q, %v; attempts=%d connections=%d", data, err, attempts, made)
+			}
+			if len(sp.used) != 0 {
+				t.Fatal("completed retry left reserved connections")
+			}
+		})
+	}
+}

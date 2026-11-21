@@ -218,9 +218,11 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 			defer func() { slotReadAhead = previous }()
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
-				store := &batchTestSlots{memSlots: newMemSlots(), warm: 1 << 20,
+				store := &batchTestSlots{
+					memSlots: newMemSlots(), warm: 1 << 20,
 					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
-					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond}
+					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond,
+				}
 				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
 				ring, err := makeRing(ctx, store, "live-sized", p)
 				if err != nil {
@@ -279,9 +281,11 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
-				store := &batchTestSlots{memSlots: newMemSlots(), streaming: streaming, warm: 1 << 20,
+				store := &batchTestSlots{
+					memSlots: newMemSlots(), streaming: streaming, warm: 1 << 20,
 					latency: 600 * time.Millisecond, mediaLatency: 1100 * time.Millisecond,
-					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond}
+					descriptionLatency: 300 * time.Millisecond, bodyLatency: 900 * time.Millisecond,
+				}
 				p := paramsFromConfig(&Config{Concurrency: 64, FlushIntervalMs: 10})
 				ring, err := makeRing(ctx, store, "sustained", p)
 				if err != nil {

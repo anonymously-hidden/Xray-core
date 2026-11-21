@@ -685,6 +685,9 @@ func xmuxWithConnections(c *splithttp.XmuxConfig, n int32) *splithttp.XmuxConfig
 // is using, so one dead connection cannot hold all of them.
 type avoidConnKey struct{}
 
+// Per-attempt exclusion, independent of the shared head hunt.
+type failedConnKey struct{}
+
 type connSpread struct {
 	mu   sync.Mutex
 	used []*poolConn
@@ -713,7 +716,7 @@ func (s *connSpread) remove(c *poolConn) {
 // spreadTrip sends r over a connection of the pool that sp does not use,
 // preferring established ones and dialing a new one only while the pool is
 // below maxConnections. It does not move the session's own connection.
-func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread) (*http.Response, error) {
+func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread, failed *poolConn) (*http.Response, error) {
 	t.mu.Lock()
 	closed := t.closed
 	t.mu.Unlock()
@@ -732,7 +735,7 @@ func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread) (*http.Re
 		if c == nil {
 			break
 		}
-		if pc := c.XmuxConn.(*poolConn); !sp.has(pc) && pc.acquire() {
+		if pc := c.XmuxConn.(*poolConn); pc != failed && !sp.has(pc) && pc.acquire() {
 			client, conn = c, pc
 		}
 	}
@@ -743,6 +746,7 @@ func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread) (*http.Re
 		}
 	}
 	if client != nil {
+		sp.add(conn)
 		client.AddRunning()
 		client.LeftRequests.Add(-1)
 	}
@@ -750,7 +754,6 @@ func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread) (*http.Re
 	if client == nil {
 		return nil, errNoSpread
 	}
-	sp.add(conn)
 	release := sync.OnceFunc(func() { sp.remove(conn); client.DoneRunning() })
 	if selected, ok := r.Context().Value(poolConnKey{}).(func(*poolConn)); ok {
 		selected(conn)
@@ -783,8 +786,13 @@ type sessionTransport struct {
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	if sp, ok := r.Context().Value(avoidConnKey{}).(*connSpread); ok {
-		if resp, err := t.spreadTrip(r, sp); err != errNoSpread {
+	sp, _ := r.Context().Value(avoidConnKey{}).(*connSpread)
+	failed, _ := r.Context().Value(failedConnKey{}).(*poolConn)
+	if sp != nil || failed != nil {
+		if sp == nil {
+			sp = new(connSpread)
+		}
+		if resp, err := t.spreadTrip(r, sp, failed); err != errNoSpread {
 			return resp, err
 		}
 	}

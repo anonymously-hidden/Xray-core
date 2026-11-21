@@ -1019,8 +1019,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		var selected atomic.Pointer[poolConn]
 		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, selected.Store))
-		if _, spread := req.Context().Value(avoidConnKey{}).(*connSpread); !spread && failedConn != nil {
-			req = req.WithContext(context.WithValue(req.Context(), avoidConnKey{}, &connSpread{used: []*poolConn{failedConn}}))
+		if failedConn != nil {
+			req = req.WithContext(context.WithValue(req.Context(), failedConnKey{}, failedConn))
 		}
 		began := time.Now()
 		dispatchClient := *httpc
