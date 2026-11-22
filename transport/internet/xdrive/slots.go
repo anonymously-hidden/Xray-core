@@ -401,6 +401,7 @@ type slotWriter struct {
 	gates              []*slotWriteResult // completion and result of the last assigned physical write
 	uplink             latencyWindow      // bulk upload window steered by media put latency; guarded by mu
 	batch              *slotBatchWindow
+	singleWave         bool // XRAY_XDRIVE_INLINE_SINGLE_WAVE, fixed at construction
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -416,22 +417,24 @@ type slotWriter struct {
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
 	ctx, cancel := context.WithCancel(ctx)
+	singleWave := slotInlineSingleWave
 	w := &slotWriter{
-		ctx:       ctx,
-		cancel:    cancel,
-		store:     store,
-		table:     table,
-		params:    p,
-		slots:     make(chan struct{}, min(len(table.Slots), max(slotWriteInflight, slotBulkInflight))),
-		flushDone: make(chan struct{}),
-		flushStop: make(chan struct{}),
-		available: make(chan struct{}),
-		failed:    make(chan struct{}),
-		size:      min(slotInlineLimit, p.segmentBytes),
-		acked:     -1,
-		progress:  time.Now(),
-		lazy:      table.lazy,
-		gates:     make([]*slotWriteResult, len(table.Slots)),
+		ctx:        ctx,
+		cancel:     cancel,
+		store:      store,
+		table:      table,
+		params:     p,
+		slots:      make(chan struct{}, min(len(table.Slots), slotPermitCap(singleWave))),
+		singleWave: singleWave,
+		flushDone:  make(chan struct{}),
+		flushStop:  make(chan struct{}),
+		available:  make(chan struct{}),
+		failed:     make(chan struct{}),
+		size:       min(slotInlineLimit, p.segmentBytes),
+		acked:      -1,
+		progress:   time.Now(),
+		lazy:       table.lazy,
+		gates:      make([]*slotWriteResult, len(table.Slots)),
 
 		ackRetry:     slotAckRetry,
 		watermarkTTL: slotWatermarkTTL,
@@ -558,7 +561,7 @@ func (w *slotWriter) flushLoop() {
 				// committed remainder while permits are immediately free.
 				for {
 					if err := w.flushLocked(nil, nil); err != nil || w.batch == nil ||
-						w.batch.planned == 0 || len(w.slots) >= w.batch.window {
+						w.batch.planned == 0 || len(w.slots) >= w.inlineWindowLocked() {
 						break
 					}
 				}
@@ -621,7 +624,7 @@ func (w *slotWriter) writeWindowFor(inline bool) int {
 	depth := len(w.table.Slots)
 	base := min(depth, slotWriteInflight)
 	if inline {
-		return w.batch.window
+		return w.inlineWindowLocked()
 	}
 	if depth < slotBulkDepth || w.bulkSegments < 2*depth || w.bulkLimited {
 		return base
@@ -634,7 +637,32 @@ func (w *slotWriter) writeWindowFor(inline bool) int {
 	}
 	// Beyond the bandwidth-delay product more bulk uploads only queue, and a
 	// small frame written behind them waits for the whole queue.
-	return max(base, w.uplink.current(cap(w.slots)))
+	return max(base, w.uplink.current(w.bulkCeiling()))
+}
+
+// bulkCeiling keeps the bulk window at its own limit even when the permit
+// channel is sized for a single-wave inline plan.
+func (w *slotWriter) bulkCeiling() int {
+	return min(cap(w.slots), slotBulkInflight)
+}
+
+// inlineWindowLocked is called with mu held. With the single-wave opt-in, a
+// committed inline plan may use every permit up to slotInlineBurstFrames, so
+// its last frame does not wait for a second upload wave. Fresh plans are still
+// admitted under the ordinary inline window, and quota recovery restores it.
+func (w *slotWriter) inlineWindowLocked() int {
+	if w.singleWave && w.batch.planned > 0 && !w.quotaRecovery() {
+		return max(w.batch.window, min(cap(w.slots), slotInlineBurstFrames))
+	}
+	return w.batch.window
+}
+
+func (w *slotWriter) quotaRecovery() bool {
+	s, ok := w.store.(interface {
+		cooling() bool
+		lastRateLimitAt() time.Time
+	})
+	return ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second)
 }
 
 // releaseSlotLocked wakes every flusher so a reduced window or a cancelled
@@ -866,7 +894,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	put := time.Since(putAt)
 	if mode != slotInline {
 		w.mu.Lock()
-		w.uplink.observe(put, bodyGateMin, cap(w.slots))
+		w.uplink.observe(put, bodyGateMin, w.bulkCeiling())
 		w.mu.Unlock()
 	}
 	bufferEpisodeAge, permitWait, queueWait, prefetchSetup := result.durations(workerAt, prefetchAt, began)
@@ -1554,6 +1582,17 @@ func (r *slotReader) bursting() bool {
 	return time.Since(r.hitAt) <= slotReadAheadBurst
 }
 
+// streamingNear reports whether seq is one of the first successors of the
+// head while a media body is still being retrieved. hitAt advances only when a
+// whole frame completes, so a long media read would otherwise leave the next
+// frames of the same burst on the ordinary tail pace (up to tailMax).
+func (r *slotReader) streamingNear(seq int64) bool {
+	r.mu.Lock()
+	near := seq > r.head && seq-r.head <= slotFrontierProbeAhead
+	r.mu.Unlock()
+	return near && r.bodies.active()
+}
+
 func (r *slotReader) reach(seq int64) {
 	r.mu.Lock()
 	grown := seq > r.frontier
@@ -1887,7 +1926,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				// carry a far-future extension into the ordinary near schedule.
 				wait = min(wait, r.tailMax)
 				extended = false
-				if r.bursting() {
+				if r.bursting() || r.streamingNear(seq) {
 					wait = slotReadAheadPoll
 				}
 			default:

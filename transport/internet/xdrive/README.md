@@ -783,6 +783,35 @@ Mux/carrier isolation remains outside this implementation. The carrier still
 delivers one ordered stream, so ready small frames can remain blocked behind bulk.
 For downstream batching benefits, upgrade the server writer as well as the client.
 
+### Live segments: successor discovery during media reads
+
+A live media segment larger than one frame is published as consecutive media
+frames. Near successors normally poll at the 40 ms read-ahead pace only within
+500 ms of the last *completed* frame; a verified block handoff refreshed
+activity but not that clock, so during a roughly one-second media read the next
+frame of the same segment was polled at the ordinary tail pace (up to 800 ms
+plus one metadata request). While any media body holds a retrieval permit, the
+first `slotFrontierProbeAhead` (3) successors of the head now use the read-ahead
+pace. This is reader-local: no wire, configuration or integrity change. With
+about 330 ms metadata reads it adds roughly five metadata GETs per second for each
+connection while media downloads, about 1,600 units/minute at the published
+5-unit price. Compare
+`discover` for frames that follow a media head before and after.
+
+### Single-wave inline publication
+
+By default, an already committed inline plan of at most 32 frames can use up to
+32 upload permits, instead of sending frames 25-32 after the first 24 uploads
+return. Fresh plans are still admitted under the ordinary 24-upload window, and
+Drive cooldown or a rate limit in the last five seconds restores that window.
+The warmed bulk media window stays at 24. Request counts and frame boundaries are
+unchanged; only peak concurrent PATCHes rise from 24 to 32, and their throttling
+behavior on live Drive has not yet been measured. Setting
+`XRAY_XDRIVE_INLINE_SINGLE_WAVE=0` before startup restores the two-wave window.
+This is a writer-side change: for downstream video, upgrade the server. Compare
+`upload-permit-wait`, the reader's `discover`/`blocked` timings and both peers'
+`rate-limits`.
+
 ### Google Drive code layout
 
 The Drive backend, media recovery, streaming negotiation, and telemetry live in

@@ -1,5 +1,23 @@
 package xdrive
 
+import "os"
+
+// slotInlineSingleWave lets a committed inline plan (at most
+// slotInlineBurstFrames frames) publish in one wave instead of waiting for a
+// second slotInlineWriteInflight wave. It is on by default and read once at
+// process start; XRAY_XDRIVE_INLINE_SINGLE_WAVE=0 restores the two-wave window.
+var slotInlineSingleWave = os.Getenv("XRAY_XDRIVE_INLINE_SINGLE_WAVE") != "0"
+
+// slotPermitCap sizes the writer's permit channel. It must cover every window
+// writeWindowFor can return, or a flusher holding mu would block on the send.
+func slotPermitCap(singleWave bool) int {
+	n := max(slotWriteInflight, slotBulkInflight)
+	if singleWave {
+		n = max(n, slotInlineBurstFrames)
+	}
+	return n
+}
+
 const (
 	slotInlineBurstWaves = 2
 	// Large plans multiply Drive writes and ring occupancy. Keep up to 32

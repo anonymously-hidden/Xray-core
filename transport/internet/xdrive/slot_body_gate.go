@@ -75,6 +75,13 @@ func (g *bodyGate) snapshot() (window, active, outstanding, buffered, budget int
 	return (g.budget + g.quantum - 1) / g.quantum, g.inflight, g.resident, g.buffered, g.budget
 }
 
+// active reports whether any media retrieval currently holds a request permit.
+func (g *bodyGate) active() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.inflight > 0
+}
+
 func (g *bodyGate) advance(head int64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

@@ -324,7 +324,7 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 				store.mu.Lock()
 				media := len(store.bodies)
 				store.mu.Unlock()
-				if store.peak.Load() > int32(tc.window) || tc.name == "resume57" && media != 1 || tc.name != "resume57" && media != 0 {
+				if store.peak.Load() > int32(inlineUploadCeiling(w, tc.window)) || tc.name == "resume57" && media != 1 || tc.name != "resume57" && media != 0 {
 					t.Fatal("publication class or upload ceiling changed")
 				}
 				if tc.name == "resume58" && (first > time.Second || time.Since(began) > 1700*time.Millisecond) {
@@ -389,7 +389,7 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 				if media != 3 || w.seq != int64(burstFrames+4) {
 					t.Fatalf("backlog renewed inline plans: media=%d frames=%d", media, w.seq)
 				}
-				if store.peak.Load() > int32(slotInlineWriteInflight) {
+				if store.peak.Load() > int32(inlineUploadCeiling(w, slotInlineWriteInflight)) {
 					t.Fatal("sustained batching exceeded upload admission")
 				}
 				if elapsed := time.Since(began); elapsed > 4*time.Second {
@@ -475,7 +475,7 @@ func TestSlotWriterSparseTrafficDoesNotForceModestBurstIntoMedia(t *testing.T) {
 				if err := w.Close(); err != nil {
 					t.Fatal(err)
 				}
-				if store.peak.Load() > int32(slotInlineWriteInflight) {
+				if store.peak.Load() > int32(inlineUploadCeiling(w, slotInlineWriteInflight)) {
 					t.Fatal("a two-wave inline plan exceeded inline upload concurrency")
 				}
 				store.mu.Lock()
