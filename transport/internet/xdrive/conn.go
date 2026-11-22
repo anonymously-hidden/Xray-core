@@ -64,6 +64,7 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 
 func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, first []byte, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
+	p.link = new(slotLink)
 	return &Conn{
 		ctx:     ctx,
 		cancel:  cancel,

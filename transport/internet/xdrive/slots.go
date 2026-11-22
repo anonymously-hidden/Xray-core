@@ -415,6 +415,13 @@ type slotWriter struct {
 	batch              *slotBatchWindow
 	singleWave         bool // XRAY_XDRIVE_INLINE_SINGLE_WAVE, fixed at construction
 	liveInline         bool // XRAY_XDRIVE_LIVE_INLINE, fixed at construction
+	liveHybrid         bool // XRAY_XDRIVE_LIVE_HYBRID, fixed at construction
+	inlineInflight     int  // assigned inline uploads not yet finished; guarded by mu
+
+	// burst is the open write burst and burstDone the finished ones not yet
+	// logged; both are guarded by mu.
+	burst     slotWriteBurst
+	burstDone []*slotWriteBurst
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -440,6 +447,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		slots:      make(chan struct{}, min(len(table.Slots), slotPermitCap(singleWave))),
 		singleWave: singleWave,
 		liveInline: slotLiveInline,
+		liveHybrid: slotLiveHybrid,
 		flushDone:  make(chan struct{}),
 		flushStop:  make(chan struct{}),
 		available:  make(chan struct{}),
@@ -485,6 +493,9 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 	defer w.mu.Unlock()
 	if len(w.slots) == 0 {
 		w.bulkSegments, w.bulkLimited = 0, false
+		if w.batch != nil && len(w.buf) == 0 {
+			w.batch.hybrid = false
+		}
 	}
 	w.applyGrowLocked()
 
@@ -581,11 +592,31 @@ func (w *slotWriter) flushLoop() {
 				}
 			}
 			done := w.closed || w.err != nil
+			bursts := w.takeBurstsLocked(time.Now(), false)
 			w.mu.Unlock()
+			w.logBursts(bursts)
 			if done {
 				return
 			}
 		}
+	}
+}
+
+// takeBurstsLocked is called with mu held. It returns the finished bursts and
+// the open one once idle with nothing buffered, or at close (all) whatever
+// its state.
+func (w *slotWriter) takeBurstsLocked(now time.Time, all bool) []*slotWriteBurst {
+	done := w.burstDone
+	w.burstDone = nil
+	if w.burst.open && (all || w.burst.idle(now) && len(w.buf) == 0) {
+		done = append(done, w.burst.take())
+	}
+	return done
+}
+
+func (w *slotWriter) logBursts(bursts []*slotWriteBurst) {
+	for _, b := range bursts {
+		b.log(w.ctx, w.table.Watermark)
 	}
 }
 
@@ -643,7 +674,17 @@ func (w *slotWriter) inlineNextLocked() bool {
 		return false
 	}
 	w.batch.live = w.liveInline && w.bulkSegments < 2*len(w.table.Slots) && !w.quotaRecovery()
+	w.batch.hybridOn, w.batch.planCap = w.liveHybrid, w.planCapLocked()
 	return w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots))
+}
+
+// planCapLocked is called with mu held: the uploads a committed inline plan
+// may have in flight, see inlineWindowLocked.
+func (w *slotWriter) planCapLocked() int {
+	if w.singleWave && !w.quotaRecovery() {
+		return max(w.batch.window, min(cap(w.slots), slotInlineBurstFrames))
+	}
+	return w.batch.window
 }
 
 func (w *slotWriter) writeWindowFor(inline bool) int {
@@ -653,6 +694,10 @@ func (w *slotWriter) writeWindowFor(inline bool) int {
 		return w.inlineWindowLocked()
 	}
 	if depth < slotBulkDepth || w.bulkSegments < 2*depth || w.bulkLimited {
+		if w.liveHybrid && w.batch != nil && w.batch.live {
+			// Live media goes up beside inline uploads, not behind them.
+			return min(cap(w.slots), base+w.inlineInflight)
+		}
 		return base
 	}
 	if s, ok := w.store.(throttleStore); ok && s.throttled() != w.throttles {
@@ -813,6 +858,9 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	}
 	seq := w.seq
 	w.seq++
+	if done := w.burst.add(seq, n, bufferEpisodeAt, selectedAt, permitWait, w.link); done != nil {
+		w.burstDone = append(w.burstDone, done)
+	}
 	if seq == 0 && w.first != nil {
 		select {
 		case w.first <- chunk:
@@ -825,6 +873,9 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	idx := int(seq % int64(len(w.table.Slots)))
 	inlinePrefix := w.useInlinePrefix(n)
 	w.pendingUploadBytes += n
+	if n <= slotInlineLimit {
+		w.inlineInflight++
+	}
 	prev, result := w.gates[idx], &slotWriteResult{
 		done:                   make(chan struct{}),
 		bufferEpisodeAt:        bufferEpisodeAt,
@@ -875,11 +926,25 @@ func (w *slotWriter) slotID(seq int64) string {
 func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResult) {
 	workerAt := time.Now()
 	defer w.wg.Done()
+	var (
+		burstMode  byte
+		burstPutAt time.Time
+		burstPut   time.Duration
+		burstAwait time.Duration
+		burstOK    bool
+	)
 	defer func() {
 		w.mu.Lock()
 		if result.accounted {
 			w.pendingUploadBytes -= result.accountedBytes
+			if len(chunk) <= slotInlineLimit {
+				w.inlineInflight--
+			}
+			if w.inlineInflight == 0 && len(w.buf) == 0 && w.batch != nil {
+				w.batch.hybrid = false
+			}
 		}
+		w.burst.finish(burstMode, burstPutAt, burstPut, burstAwait, burstOK, time.Now())
 		w.releaseSlotLocked()
 		w.mu.Unlock()
 	}()
@@ -902,6 +967,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	}
 	awaited := time.Since(began)
 	putAt := time.Now()
+	burstAwait, burstPutAt = awaited, putAt
 	var prefix []byte
 	if mode == slotStream && w.table.directMedia && !w.table.progressiveMedia && len(chunk) <= slotDirectMediaMax {
 		mode = slotDirectMedia
@@ -918,6 +984,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 		return
 	}
 	put := time.Since(putAt)
+	burstMode, burstPut, burstOK = mode, put, true
 	if mode != slotInline {
 		w.mu.Lock()
 		w.uplink.observe(put, bodyGateMin, w.bulkCeiling())
@@ -1258,6 +1325,10 @@ func (w *slotWriter) closeOrdered() error {
 
 	<-w.flushDone
 	w.wg.Wait()
+	w.mu.Lock()
+	bursts := w.takeBurstsLocked(time.Now(), true)
+	w.mu.Unlock()
+	w.logBursts(bursts)
 
 	if err := w.Err(); err != nil {
 		return err
@@ -1458,6 +1529,19 @@ func (r *slotReader) run() {
 		r.bodies.close()
 	}()
 
+	// summary is the open read burst. It is logged once nothing was
+	// delivered for slotBurstGap while no later frame was found and no media
+	// body is being read.
+	var summary slotReadBurst
+	idle := time.NewTimer(slotBurstGap)
+	idle.Stop()
+	defer func() {
+		idle.Stop()
+		if summary.open {
+			summary.take().log(r.ctx, r.table.Watermark)
+		}
+	}()
+
 	fetches := make(map[int64]*slotFetch)
 	for {
 		r.mu.Lock()
@@ -1502,6 +1586,16 @@ func (r *slotReader) run() {
 		case <-f.ready:
 		case <-f.streamReady:
 		case <-r.grow:
+			continue
+		case <-idle.C:
+			r.mu.Lock()
+			found := r.frontier >= head
+			r.mu.Unlock()
+			if !found && summary.idle(time.Now()) && !r.bodies.active() {
+				summary.take().log(r.ctx, r.table.Watermark)
+			} else if summary.open {
+				idle.Reset(slotBurstGap)
+			}
 			continue
 		case <-ctx.Done():
 			return
@@ -1558,6 +1652,8 @@ func (r *slotReader) run() {
 			" missing-block-wait=", f.delivery.missingTotal, " missing-block-max=", f.delivery.missingMax,
 			" enqueue-wait=", f.delivery.enqueueTotal, " enqueue-max=", f.delivery.enqueueMax,
 			" completion-after-blocks=", f.delivery.completionWait(f.readyAt), " slot=", slotTag(r.slotID(head)), " inline-prefix-bytes=", f.prefixBytes)
+		summary.add(head, f.mode, size, f.visibleAt, max(0, f.readyAt.Sub(f.headAt)), firstBlockWait, f.bodyTime, time.Now(), r.link)
+		idle.Reset(slotBurstGap)
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {

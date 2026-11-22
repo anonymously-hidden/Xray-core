@@ -157,6 +157,11 @@ func TestSlotWriterFullBurstAvoidsInlineStraggler(t *testing.T) {
 			t.Fatal(err)
 		}
 		w := newSlotWriter(ctx, store, ring.Up, p)
+		// This covers the media path a full burst takes without the live
+		// split, XRAY_XDRIVE_LIVE_HYBRID=0; the split has its own tests.
+		w.mu.Lock()
+		w.liveHybrid = false
+		w.mu.Unlock()
 		r := newSlotReader(ctx, store, ring.Up, p, nil)
 		defer func() { cancel(); w.wait(); r.wait() }()
 		payload := randomPayload(defaultSegmentBytes)
@@ -393,7 +398,7 @@ func TestSlotWriterBacklogDoesNotRenewInlinePlanAfterPermitWait(t *testing.T) {
 				if media != 3 || w.seq != int64(burstFrames+4) {
 					t.Fatalf("backlog renewed inline plans: media=%d frames=%d", media, w.seq)
 				}
-				if store.peak.Load() > int32(inlineUploadCeiling(w, slotInlineWriteInflight)) {
+				if store.peak.Load() > int32(liveUploadCeiling(w, slotInlineWriteInflight)) {
 					t.Fatal("sustained batching exceeded upload admission")
 				}
 				if elapsed := time.Since(began); elapsed > 4*time.Second {
@@ -694,6 +699,11 @@ func TestSlotProgressivePrefixDuringOverlap(t *testing.T) {
 				ring.Down.streamPrefix, ring.Down.progressiveMedia = true, tc.progressive
 				r := newSlotReader(ctx, store, ring.Down, p, nil)
 				w := newSlotWriter(ctx, store, ring.Down, p)
+				// The prefix belongs to a full media frame, which the live
+				// split would turn into an inline wave and a shorter frame.
+				w.mu.Lock()
+				w.liveHybrid = false
+				w.mu.Unlock()
 				defer func() { cancel(); w.wait(); r.wait() }()
 				control := bytes.Repeat([]byte("c"), slotInlineLimit)
 				payload := randomPayload(defaultSegmentBytes)

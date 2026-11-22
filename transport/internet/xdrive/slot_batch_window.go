@@ -14,12 +14,22 @@ var slotInlineSingleWave = os.Getenv("XRAY_XDRIVE_INLINE_SINGLE_WAVE") != "0"
 // recovery. On by default; XRAY_XDRIVE_LIVE_INLINE=0 restores the old rule.
 var slotLiveInline = os.Getenv("XRAY_XDRIVE_LIVE_INLINE") != "0"
 
+// slotLiveHybrid splits a live burst larger than one inline wave: its first
+// wave goes inline and the rest as media, uploaded alongside, and while live
+// traffic is inline, outstanding inline uploads do not count against the media
+// window. On by default; XRAY_XDRIVE_LIVE_HYBRID=0 turns both off.
+var slotLiveHybrid = os.Getenv("XRAY_XDRIVE_LIVE_HYBRID") != "0"
+
 // slotPermitCap sizes the writer's permit channel. It must cover every window
 // writeWindowFor can return, or a flusher holding mu would block on the send.
 func slotPermitCap(singleWave bool) int {
 	n := max(slotWriteInflight, slotBulkInflight)
 	if singleWave {
 		n = max(n, slotInlineBurstFrames)
+	}
+	if slotLiveHybrid {
+		// A hybrid head wave plus the ordinary media window.
+		n = max(n, slotInlineWriteInflight+slotWriteInflight)
 	}
 	return n
 }
@@ -37,6 +47,15 @@ type slotBatchWindow struct {
 	burstBudget          int
 	planned              int
 	live                 bool // refreshed by the writer under its lock before each admission
+
+	// hybridOn and planCap are refreshed with live: whether a live burst may
+	// be split, and how many uploads a committed inline plan may have in
+	// flight. hybrid is set when a split burst's inline wave is planned and
+	// kept until the writer has no inline upload in flight and nothing
+	// buffered, so the rest of that burst goes to media.
+	hybridOn bool
+	planCap  int
+	hybrid   bool
 }
 
 func newSlotBatchWindow(size, depth int) *slotBatchWindow {
@@ -48,6 +67,10 @@ func newSlotBatchWindow(size, depth int) *slotBatchWindow {
 }
 
 func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
+	if b.hybrid {
+		// The rest of a split burst follows its inline wave as media.
+		return false
+	}
 	// A segment-sized burst is cheaper inline than as a media frame behind
 	// other traffic: the reader skips a media GET and the PUT queue.
 	if b.live && buffered <= b.budget {
@@ -62,8 +85,16 @@ func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
 	return buffered <= budget-outstanding && (buffered+b.unit-1)/b.unit <= frames-active
 }
 
+// splits reports whether a live burst too large for one inline wave should
+// send a full wave inline now, with the rest as media. The wave must be able
+// to go out at once beside what is already in flight.
+func (b *slotBatchWindow) splits(buffered, active int) bool {
+	return b.live && b.hybridOn && !b.hybrid && b.planned == 0 && b.window >= slotInlineWriteInflight &&
+		buffered > b.budget && active+b.window <= b.planCap
+}
+
 func (b *slotBatchWindow) inlineNext(buffered, outstanding, active int) bool {
-	return buffered > 0 && (buffered <= 4*b.unit || b.planned > 0 || b.fits(buffered, outstanding, active))
+	return buffered > 0 && (buffered <= 4*b.unit || b.planned > 0 || b.fits(buffered, outstanding, active) || b.splits(buffered, active))
 }
 
 func (b *slotBatchWindow) frameSize(buffered, outstanding, active, maximum int) int {
@@ -73,6 +104,8 @@ func (b *slotBatchWindow) frameSize(buffered, outstanding, active, maximum int) 
 	}
 	if b.planned == 0 && b.fits(buffered, outstanding, active) {
 		b.planned = buffered
+	} else if b.splits(buffered, active) {
+		b.planned, b.hybrid = b.budget, true
 	}
 	if b.planned > 0 {
 		n := min(buffered, b.planned, b.unit)

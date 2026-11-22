@@ -44,6 +44,10 @@ func TestMain(m *testing.M) {
 		os.Unsetenv(name)
 	}
 	log.RegisterHandler(testLogHandler{})
+	// Spare warm-ups add requests and fast dead-connection retirement acts on
+	// slow test servers; tests that cover them turn them on for themselves.
+	connSpare.Store(false)
+	connDeadFast.Store(false)
 	testServiceDial = func(dest net.Destination) error { return localTestTarget(dest.Address.String()) }
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil

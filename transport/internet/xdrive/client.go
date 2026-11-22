@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
+	"os"
 	"reflect"
 	"runtime"
 	"slices"
@@ -510,6 +511,115 @@ type connPool struct {
 
 	connMu sync.Mutex
 	conns  map[*poolConn]struct{}
+
+	spareAt  atomic.Int64 // unix nanoseconds of the last spare check
+	maxConns int          // connections XMUX surely opens; 0 when it opens one
+}
+
+// Both are on by default and read once at startup: connSpare keeps an
+// established idle connection in each pool that carries requests, and
+// connDeadFast retires a connection that went silent under waiting requests
+// before the HTTP/2 keepalive does. XRAY_XDRIVE_SPARE_CONN=0 and
+// XRAY_XDRIVE_FAST_DEAD_CONN=0 turn them off.
+var connSpare, connDeadFast atomic.Bool
+
+func init() {
+	connSpare.Store(os.Getenv("XRAY_XDRIVE_SPARE_CONN") != "0")
+	connDeadFast.Store(os.Getenv("XRAY_XDRIVE_FAST_DEAD_CONN") != "0")
+}
+
+const (
+	// A spare is checked for at most this often per pool, and an idle
+	// connection counts as ready while it answered within spareFresh; an
+	// older one is probed again with a HEAD to the service host, which
+	// costs no API quota.
+	spareCheckEvery   = time.Second
+	spareFresh        = 30 * time.Second
+	spareProbeTimeout = 15 * time.Second
+	// sparePoolConnections lets pools that would otherwise hold a single
+	// connection keep a spare.
+	sparePoolConnections = 2
+
+	// Requests with at most deadConnSmallBody of body normally answer within a
+	// second. A connection that answered nothing deadConnSuspect after such a
+	// request went out, while another connection answered meanwhile, takes no
+	// new requests; with two such requests waiting deadConnConfirm, it is
+	// closed and they are retried elsewhere. The HTTP/2 keepalive takes up to
+	// 4 s (1.5 s idle, then a 2.5 s ping timeout).
+	deadConnSmallBody = 64 << 10
+	deadConnSuspect   = 1500 * time.Millisecond
+	deadConnConfirm   = 2500 * time.Millisecond
+)
+
+// connHeardAny is when any pool connection last received a response byte, in
+// unix nanoseconds.
+var connHeardAny atomic.Int64
+
+func noteHeardAny(now time.Time) {
+	for at := now.UnixNano(); ; {
+		last := connHeardAny.Load()
+		if last >= at || connHeardAny.CompareAndSwap(last, at) {
+			return
+		}
+	}
+}
+
+// spareXmux gives a pool without maxConnections room for a spare.
+func spareXmux(c *splithttp.XmuxConfig) *splithttp.XmuxConfig {
+	if !connSpare.Load() {
+		return c
+	}
+	return xmuxWithConnections(c, sparePoolConnections)
+}
+
+// keepSpare makes sure, at most once per spareCheckEvery, that a pool carrying
+// requests has an established connection that none of them uses, so that the
+// requests of a connection that dies move without waiting for a dial.
+func (p *connPool) keepSpare(r *http.Request) {
+	if !connSpare.Load() || r.URL == nil || r.URL.Host == "" || r.Context().Value(keeperProbeKey{}) != nil {
+		return
+	}
+	now := time.Now()
+	last := p.spareAt.Load()
+	if now.UnixNano()-last < int64(spareCheckEvery) || !p.spareAt.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	var spare *poolConn
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	ready, open := false, 0
+	p.connMu.Lock()
+	for c := range p.conns {
+		c.mu.Lock()
+		if !c.closing {
+			open++
+		}
+		usable := !c.closing && !c.warming && c.inflight == 0
+		fresh := usable && !c.heardAt.IsZero() && now.Sub(c.heardAt) < spareFresh
+		c.mu.Unlock()
+		if fresh {
+			ready = true
+			break
+		}
+		if usable && spare == nil {
+			spare = c
+		}
+	}
+	p.connMu.Unlock()
+	if !ready && spare == nil && open < p.maxConns {
+		// Below that XMUX makes a new connection rather than hand out a
+		// busy one; asking it at the limit would spend reuse counts.
+		if c := p.xmux.GetXmuxClient(r.Context()).XmuxConn.(*poolConn); c.unused() {
+			spare = c
+		}
+	}
+	p.mu.Unlock()
+	if !ready && spare != nil {
+		spare.warm(r.URL.Scheme, r.URL.Host)
+	}
 }
 
 func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Context) *http.Client) *connPool {
@@ -518,6 +628,10 @@ func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Co
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	pool := &connPool{ctx: ctx, cancel: cancel, conns: make(map[*poolConn]struct{})}
+	if config.MaxConnections != nil {
+		// XMUX opens connections at least up to the lower bound.
+		pool.maxConns = int(config.MaxConnections.From)
+	}
 	pool.xmux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
 		MaxConcurrency:   config.MaxConcurrency,
 		MaxConnections:   config.MaxConnections,
@@ -527,7 +641,7 @@ func newConnPool(config *splithttp.XmuxConfig, newClient func(connCtx context.Co
 		HKeepAlivePeriod: config.HKeepAlivePeriod,
 	}, func() splithttp.XmuxConn {
 		ctx, cancel := context.WithCancel(pool.ctx)
-		conn := &poolConn{next: newClient(ctx).Transport, ctx: ctx}
+		conn := &poolConn{next: newClient(ctx).Transport, ctx: ctx, id: poolConnIDs.Add(1)}
 		conn.cancel = sync.OnceFunc(func() {
 			cancel()
 			closeIdleTransport(conn.next)
@@ -563,18 +677,183 @@ func (p *connPool) Close() {
 	}
 }
 
+// poolConnIDs numbers the connections of all pools for the logs, from 1.
+var poolConnIDs atomic.Uint64
+
 // poolConn is a connection of XMUX, which closes once XMUX drops it and the
 // requests on it end
 type poolConn struct {
 	next   http.RoundTripper
 	ctx    context.Context
 	cancel context.CancelFunc
+	id     uint64 // for the logs only; 0 when the connection is not from a pool
 
 	mu       sync.Mutex
 	inflight int
 	closing  bool
 	servedAt time.Time
 	servedBy *sessionTransport
+
+	heardAt time.Time // last response headers or body bytes
+	waits   map[*connWait]struct{}
+	warming bool
+	dead    bool
+}
+
+// connWait is a small request sent on a connection and not answered yet.
+type connWait struct {
+	wroteAt time.Time
+	timers  [2]*time.Timer
+	done    bool
+}
+
+func (c *poolConn) heard() {
+	now := time.Now()
+	c.mu.Lock()
+	c.heardAt = now
+	c.mu.Unlock()
+	if connDeadFast.Load() {
+		noteHeardAny(now)
+	}
+}
+
+// unused reports a connection that never carried a request.
+func (c *poolConn) unused() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closing && !c.warming && c.inflight == 0 && c.heardAt.IsZero()
+}
+
+// ready reports a connection that answered within spareFresh and takes requests.
+func (c *poolConn) ready(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closing && !c.heardAt.IsZero() && now.Sub(c.heardAt) < spareFresh
+}
+
+// warm establishes the connection with a HEAD to the service host, which needs
+// no authorization and costs no API quota.
+func (c *poolConn) warm(scheme, host string) {
+	if !c.acquire() {
+		return
+	}
+	c.mu.Lock()
+	c.warming = true
+	c.mu.Unlock()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			c.warming = false
+			c.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(c.ctx, spareProbeTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, scheme+"://"+host+"/", nil)
+		if err != nil {
+			c.done()
+			return
+		}
+		resp, err := c.roundTrip(req)
+		if err != nil {
+			errors.LogDebug(ctx, "xdrive spare connection ", c.id, ": ", err)
+			return
+		}
+		resp.Body.Close()
+		errors.LogDebug(ctx, "xdrive spare connection ", c.id, " ready, status ", resp.StatusCode)
+	}()
+}
+
+// watch has a small request's answer timed once it is written; see
+// deadConnSuspect.
+func (c *poolConn) watch(ctx context.Context, r *http.Request) (context.Context, *connWait) {
+	if !connDeadFast.Load() || r.ContentLength < 0 || r.ContentLength > deadConnSmallBody {
+		return ctx, nil
+	}
+	w := new(connWait)
+	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+		if info.Err == nil {
+			c.wrote(w)
+		}
+	}}), w
+}
+
+func (c *poolConn) wrote(w *connWait) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if w.done {
+		return
+	}
+	w.wroteAt = time.Now()
+	if w.timers[0] != nil {
+		// written again, after the transport retried it
+		w.timers[0].Reset(deadConnSuspect)
+		w.timers[1].Reset(deadConnConfirm)
+		return
+	}
+	if c.waits == nil {
+		c.waits = make(map[*connWait]struct{})
+	}
+	c.waits[w] = struct{}{}
+	w.timers[0] = time.AfterFunc(deadConnSuspect, func() { c.checkDead(false) })
+	w.timers[1] = time.AfterFunc(deadConnConfirm, func() { c.checkDead(true) })
+}
+
+func (c *poolConn) unwatch(w *connWait) {
+	if w == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	w.done = true
+	delete(c.waits, w)
+	for _, t := range w.timers {
+		if t != nil {
+			t.Stop()
+		}
+	}
+}
+
+// checkDead retires a connection that answered nothing since its oldest
+// waiting small request went out deadConnSuspect ago, while another connection
+// answered meanwhile, so the path itself works. With confirm, two such
+// requests and deadConnConfirm, it also closes it, which fails the requests on
+// it so that they are retried on another connection.
+func (c *poolConn) checkDead(confirm bool) {
+	now := time.Now()
+	c.mu.Lock()
+	var oldest time.Time
+	for w := range c.waits {
+		if oldest.IsZero() || w.wroteAt.Before(oldest) {
+			oldest = w.wroteAt
+		}
+	}
+	waiting := len(c.waits)
+	silent := waiting > 0 && now.Sub(oldest) >= deadConnSuspect && !c.heardAt.After(oldest) &&
+		connHeardAny.Load() > oldest.UnixNano()
+	drain := silent && !c.closing
+	kill := silent && confirm && !c.dead && waiting >= 2 && now.Sub(oldest) >= deadConnConfirm
+	if kill {
+		c.dead = true
+	}
+	c.mu.Unlock()
+	switch {
+	case kill:
+		errors.LogInfo(context.Background(), "xdrive connection ", c.id, " answered nothing for ", now.Sub(oldest),
+			" with ", waiting, " requests waiting while others answered; closing it")
+		c.forceClose()
+	case drain:
+		errors.LogDebug(context.Background(), "xdrive connection ", c.id, " silent for ", now.Sub(oldest),
+			" with ", waiting, " requests waiting; no new requests on it")
+		c.Close()
+	}
+}
+
+// logID is the connection's id in the logs, 0 when no pool connection was used.
+func (c *poolConn) logID() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.id
 }
 
 func (c *poolConn) IsClosed() bool {
@@ -630,18 +909,35 @@ func (c *poolConn) roundTrip(r *http.Request) (*http.Response, error) {
 	if c.ctx.Err() != nil {
 		cancel()
 	}
-	finish := sync.OnceFunc(func() { stop(); cancel(); c.done() })
+	ctx, wait := c.watch(ctx, r)
+	finish := sync.OnceFunc(func() { stop(); cancel(); c.unwatch(wait); c.done() })
 	if err := ctx.Err(); err != nil {
 		finish()
 		return nil, err
 	}
 	resp, err := dispatchRoundTrip(c.next, r.WithContext(ctx))
+	c.unwatch(wait)
 	if err != nil {
 		finish()
 		return nil, err
 	}
-	resp.Body = &doneBody{ReadCloser: resp.Body, done: finish}
+	c.heard()
+	resp.Body = &doneBody{ReadCloser: &heardBody{ReadCloser: resp.Body, conn: c}, done: finish}
 	return resp, nil
+}
+
+// heardBody notes each read of response bytes on its connection.
+type heardBody struct {
+	io.ReadCloser
+	conn *poolConn
+}
+
+func (b *heardBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.conn.heard()
+	}
+	return n, err
 }
 
 type doneBody struct {
@@ -758,6 +1054,7 @@ func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread, failed *p
 	if selected, ok := r.Context().Value(poolConnKey{}).(func(*poolConn)); ok {
 		selected(conn)
 	}
+	t.pool.keepSpare(r)
 	resp, err := conn.roundTrip(r)
 	if err != nil {
 		release()
@@ -829,7 +1126,17 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			}
 			return nil, errSessionClosed
 		}
-		next := t.pool.xmux.GetXmuxClient(r.Context())
+		var next *splithttp.XmuxClient
+		if client != nil && connSpare.Load() {
+			// Moving off a connection: an established one, such as the
+			// spare, takes the requests without a dial.
+			if c := t.pool.xmux.GetExistingXmuxClient(r.Context()); c != nil && c != client && c.XmuxConn.(*poolConn).ready(time.Now()) {
+				next = c
+			}
+		}
+		if next == nil {
+			next = t.pool.xmux.GetXmuxClient(r.Context())
+		}
 		next.AddRunning()
 		next.LeftRequests.Add(-1)
 		t.pool.mu.Unlock()
@@ -856,6 +1163,8 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if selected, ok := r.Context().Value(poolConnKey{}).(func(*poolConn)); ok {
 		selected(conn)
 	}
+	// After the request counts on its connection, which is then not idle.
+	t.pool.keepSpare(r)
 	resp, err := conn.roundTrip(r)
 	if err == nil {
 		resp.Body = &servedBody{ReadCloser: resp.Body, ctx: r.Context(), served: sync.OnceFunc(func() {

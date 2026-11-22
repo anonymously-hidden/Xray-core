@@ -840,6 +840,81 @@ inline frames. Each has an escape hatch read once at startup.
   pace beyond head+11. The fetch window is unchanged, so no new slots are
   polled. `XRAY_XDRIVE_BURST_READ_AHEAD=0` restores head+11.
 
+### Per-segment and per-download logs
+
+Measurement only; nothing here changes requests, timing or the wire. Both peers
+log, so matched client and server lines can be compared without clock offsets.
+
+- `xdrive burst write <watermark>` (info): one line per write burst, that is,
+  frames cut while the writer never sat idle (no upload in flight and nothing
+  buffered) for 1.5 s. A segment fetched one at a time is one burst on each
+  peer, because the request leg between segments is longer than that gap; with
+  mux, other streams of the session can share a burst. Fields: `seqs`,
+  `frames`/`inline`/`media`/`failed`, `bytes`, `span` (first buffered byte to the
+  last upload finishing), `first-put` (first byte to the first upload leaving),
+  `last-cut` (first byte to the last frame being cut, which shows when the
+  origin finished), `inline-put-p50/max` and `media-put-p50/max` (Drive update
+  durations), `await-max` (slot reuse wait), `permit-wait-max`, `mbps` (bytes
+  over span) and `after-read` (time from this Conn's last delivered read frame
+  to the first buffered byte, -1 if none; on the server this is the request
+  handling and origin time).
+- `xdrive burst read <watermark>` (info): one line per read burst, closed once
+  nothing was delivered for 1.5 s while no later frame had been found and no
+  media body was being read. Fields: `span` (first frame found to last frame
+  delivered), `first-delivery`, `last-found`, `delivery-gap-max`,
+  `head-wait-max`, `first-block-wait-max`, `body-max`, `mbps` and `after-write`
+  (time from this Conn's last write burst beginning to the last delivery, -1 if
+  that write began after the read burst; on the client this is request to last
+  byte of the segment on one clock).
+- `xdrive download` (debug): one line per media GET that returned headers:
+  `seq`, `range`, `status`, `attempt`, `bytes`, `ttfb` (request written to first
+  byte), `body` (headers to end of body), `dispatch-to-eof`, `mbps` (bytes over
+  body time), `conn` (process-wide pooled connection number, 0 when no pool
+  connection was used), `new-conn`, `lane` (`media`, `head`, `bulk`, `priority`
+  or `main`), `overlap-start` and `overlap-max` (other media downloads of the
+  process reading bodies when this one began and at most while it ran), `head`,
+  `rescue` and `result`. A shared bandwidth cap shows as per-download `mbps`
+  falling as `overlap-max` rises while their sum stays flat; a per-connection
+  cap shows as the sum rising with overlap.
+
+### HD live segments: split bursts, spare connections, adaptive upload copies
+
+Three default-on changes for ~6 s live segments of 1.4-5.1 MB, whose fixed cost
+was about 4 s per segment. Each has an escape hatch read once at startup.
+
+- Writer, split bursts (upgrade the server for downstream video). A live burst
+  larger than one inline wave (336 KiB) now sends its first 24 frames inline and
+  the rest as media, instead of all media. The wave is planned only when it can
+  go out at once (at most 8 uploads already in flight with the single-wave
+  window), in rings of at least 24 slots, and not during a sustained transfer or
+  quota recovery. After the wave, the rest of that burst goes to media except a
+  tail of at most four frames. While live traffic is inline, outstanding inline
+  uploads no longer count against the media window, so media uploads start
+  beside the inline wave rather than after it; the permit channel grows from 32
+  to 36 (24 inline plus the 12-upload media window). Cost: about 24 more inline
+  updates per segment (1,200 units, ~12,000 units/minute at 6 s segments) on
+  the writer and 24 more metadata reads (120 units) on the reader, minus at most
+  one media upload and download. A straggling inline update in the wave now
+  delays its segment; the upload copies below bound it.
+  `XRAY_XDRIVE_LIVE_HYBRID=0` restores all-media bursts and the old media window.
+- Connections, both peers. Every pool that carries requests keeps one
+  established idle connection, warmed with a HEAD to the service host (no
+  authorization, no API quota) and probed again when unused for 30 s. Pools
+  without an Xmux `maxConnections` (bulk, media lanes, isolated media head) may
+  now hold two connections instead of one. When a session moves off a closed
+  connection it takes an established one before dialing. A connection that
+  answered nothing for 1.5 s after a request of at most 64 KiB went out, while
+  another connection answered meanwhile, takes no new requests; with two such
+  requests waiting 2.5 s it is closed and they are retried elsewhere (the HTTP/2
+  keepalive takes up to 4 s). A lone straggler is never closed this way.
+  `XRAY_XDRIVE_SPARE_CONN=0` and `XRAY_XDRIVE_FAST_DEAD_CONN=0` turn these off.
+  Logs: `xdrive spare connection <n> ready` and `xdrive connection <n> silent`
+  (debug), `xdrive connection <n> answered nothing ... closing it` (info).
+- Drive upload copies, both peers. The copy of a straggling inline update waits
+  until the update has run longer than the p95 of the last 32 successful ones,
+  at least 1.2 s and at most 2.4 s; with fewer than 12 samples it stays 1.2 s.
+  The `xdrive upload hedge ... after=` line shows the delay used.
+
 ### Google Drive code layout
 
 The Drive backend, media recovery, streaming negotiation, and telemetry live in

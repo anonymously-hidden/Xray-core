@@ -182,6 +182,10 @@ func TestDriveWriterPublishesPrefixAndMediaInOneRequest(t *testing.T) {
 			writer := newSlotWriter(context.Background(), store, slotTable{
 				Slots: append([]string{"out0", "out1"}, make([]string, 62)...), Watermark: "writer-wm", streamPrefix: tc.prefix,
 			}, streamReaderParams())
+			// One full media frame, as without the live split (XRAY_XDRIVE_LIVE_HYBRID=0).
+			writer.mu.Lock()
+			writer.liveHybrid = false
+			writer.mu.Unlock()
 			payload := streamTestData(defaultSegmentBytes)
 			if _, err := writer.Write(payload); err != nil {
 				t.Fatal(err)
@@ -300,6 +304,10 @@ func TestDriveDirectMediaWriterRequiresClientOffer(t *testing.T) {
 			}
 			ring.Down.directMedia = offered
 			w := newSlotWriter(ctx, store, ring.Down, p)
+			// One full media frame, as without the live split (XRAY_XDRIVE_LIVE_HYBRID=0).
+			w.mu.Lock()
+			w.liveHybrid = false
+			w.mu.Unlock()
 			payload := bytes.Repeat([]byte{42}, slotDirectMediaMax)
 			if _, err := w.Write(payload); err != nil {
 				cancel()

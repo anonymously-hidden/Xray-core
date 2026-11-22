@@ -117,6 +117,18 @@ var slotUploadHedge = func() time.Duration {
 	return 1200 * time.Millisecond
 }()
 
+// uploadHedgeDelay is when a straggling inline update gets its copy: once it
+// has run longer than all but the slowest of the recent successful updates
+// (their p95), never sooner than slotUploadHedge and never later than twice
+// that. Without enough history it is slotUploadHedge.
+func (s *driveStorage) uploadHedgeDelay() time.Duration {
+	q, ok := s.inlineUpdates.quantile(.95)
+	if !ok {
+		return slotUploadHedge
+	}
+	return min(max(q, slotUploadHedge), 2*slotUploadHedge)
+}
+
 type readHedgeGate struct {
 	primary   *driveReadProgress
 	delay     time.Duration
@@ -164,6 +176,16 @@ func (p *driveReadProgress) progress() {
 	if p.pending {
 		p.progressAt = time.Now()
 	}
+}
+
+// sinceDispatch is the time since the latest dispatch, false before any.
+func (p *driveReadProgress) sinceDispatch() (time.Duration, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dispatchAt.IsZero() {
+		return 0, false
+	}
+	return time.Since(p.dispatchAt), true
 }
 
 func (p *driveReadProgress) finish() {
@@ -290,8 +312,11 @@ type driveShared struct {
 	throttle      atomic.Int64
 	mediaLatency  [2]rangeLatency // shared, per requested-size class
 	mediaStartup  [2]rangeLatency // dispatch to first verified block for progressive media
+	inlineUpdates rangeLatency    // dispatch to answer of successful hedgeable inline updates
 	sessionGuard  driveSessionGuard
 	timing        *timingAggregator
+	// downloads counts the media downloads whose bodies are being read.
+	downloads transferMeter
 	idPoolState
 
 	cleanupMu         sync.Mutex
@@ -357,7 +382,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			priorityConns: newConnPool(xmuxWithConnections(config.Xmux, defaultPoolConnections), func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight)
 			}),
-			bulkConns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+			bulkConns: newConnPool(spareXmux(config.Xmux), func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 			}),
 			folder:       config.RemoteFolder,
@@ -398,10 +423,10 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 	}
 	for i := range st.mediaConns {
-		st.mediaConns[i] = newConnPool(config.Xmux, newMediaClient)
+		st.mediaConns[i] = newConnPool(spareXmux(config.Xmux), newMediaClient)
 	}
 	if os.Getenv("XRAY_XDRIVE_ISOLATE_MEDIA_HEAD") != "0" {
-		st.headMediaConns = newConnPool(config.Xmux, newMediaClient)
+		st.headMediaConns = newConnPool(spareXmux(config.Xmux), newMediaClient)
 	}
 	st.driveShared.keepWarmEvery = 4 * time.Minute
 	st.driveShared.keepWarmWindow = 3 * time.Hour
@@ -1082,22 +1107,22 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
-		httpc := s.client
+		httpc, lane := s.client, "main"
 		if ctx.Value(laneKey{}) != nil && !descriptionHedge && s.priorityClient != nil {
-			httpc = s.priorityClient
+			httpc, lane = s.priorityClient, "priority"
 		}
 		if ctx.Value(bodyKey{}) != nil && s.bulkClient != nil {
-			httpc = s.bulkClient
+			httpc, lane = s.bulkClient, "bulk"
 		}
 		if media != nil && media.client != nil {
-			httpc = media.client
+			httpc, lane = media.client, "media"
 		}
 		// Check after permit acquisition so queued prefetch that became
 		// the head can take the isolated pool without restarting a GET.
 		isolatedHead := s.headMediaClient != nil && media != nil &&
 			media.progressive && !media.rescue && mediaHead(ctx)
 		if isolatedHead {
-			httpc = s.headMediaClient
+			httpc, lane = s.headMediaClient, "head"
 		}
 		if err := ctx.Err(); err != nil {
 			cancel()
@@ -1121,6 +1146,11 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		dispatchClient.Transport = dispatchTransport{next: httpc.Transport}
 		resp, err := dispatchClient.Do(req)
 		respAt := time.Now()
+		var download *downloadBody
+		if err == nil && method == http.MethodGet && strings.Contains(target, "alt=media") {
+			download = &downloadBody{ReadCloser: resp.Body, span: s.downloads.begin()}
+			resp.Body = download
+		}
 		noteTimeout := func() {
 			if ctx.Err() == nil && dispatched.Load() && !admissionFailed.Load() && (attemptCtx.Err() == context.DeadlineExceeded || errors.Cause(err) == errStalled) {
 
@@ -1191,6 +1221,23 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		releasePermit()
 		bodyEnd := time.Now()
 		headAtCompletion := media != nil && mediaHead(ctx)
+		if download != nil {
+			tr.mu.Lock()
+			record := downloadRecord{
+				path: req.URL.Path, media: requestMedia, status: resp.StatusCode, attempt: attempt + 1,
+				bytes: download.n, ttfb: -1, body: bodyEnd.Sub(respAt), dispatch: -1, lane: lane,
+				conn: selected.Load().logID(), fresh: tr.gotConn && !tr.reused, head: headAtCompletion, err: err,
+			}
+			if !tr.wrote.IsZero() && !tr.first.IsZero() {
+				record.ttfb = tr.first.Sub(tr.wrote)
+			}
+			if !tr.admitted.IsZero() {
+				record.dispatch = bodyEnd.Sub(tr.admitted)
+			}
+			tr.mu.Unlock()
+			record.others, record.peak = s.downloads.end(download.span)
+			record.log(ctx)
+		}
 		if primary != nil {
 			primary.finish()
 		}
@@ -2235,13 +2282,14 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 }
 
 // patchHedged sends a metadata-only slot update and, once it has run
-// slotUploadHedge since dispatch, an identical copy on another connection.
+// uploadHedgeDelay since dispatch, an identical copy on another connection.
 // The first success wins. Neither request is cancelled, since Drive may still
 // apply it; the next write to id waits for both through the slot tail.
 func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType string, metadata []byte) (int, []byte, error) {
 	if slotUploadHedge <= 0 || s.uploadHedges == nil {
 		return s.do(ctx, http.MethodPatch, target, contentType, metadata)
 	}
+	delay := s.uploadHedgeDelay()
 	type result struct {
 		status  int
 		payload []byte
@@ -2256,10 +2304,15 @@ func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType 
 	go func() {
 		defer close(primaryDone)
 		status, payload, err := s.do(primaryCtx, http.MethodPatch, target, contentType, metadata)
+		if err == nil && status == http.StatusOK {
+			if d, ok := primary.sinceDispatch(); ok {
+				s.inlineUpdates.note(d)
+			}
+		}
 		results <- result{status, payload, err, false}
 	}()
 
-	timer := time.NewTimer(slotUploadHedge)
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	for launch := false; !launch; {
 		select {
@@ -2269,11 +2322,11 @@ func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType 
 			return 0, nil, ctx.Err()
 		case <-timer.C:
 		}
-		remaining, pending := primary.remainingSinceDispatch(slotUploadHedge)
+		remaining, pending := primary.remainingSinceDispatch(delay)
 		switch {
 		case !pending:
 			// Not dispatched yet, or backing off between attempts.
-			timer.Reset(min(slotUploadHedge, 100*time.Millisecond))
+			timer.Reset(min(delay, 100*time.Millisecond))
 		case remaining > 0:
 			timer.Reset(remaining)
 		case !s.descriptionHedgeAllowed() || !s.takeUploadHedge():
@@ -2311,7 +2364,7 @@ func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType 
 		s.timing.noteHedge(kindSlotInline, false)
 	}
 	launchedAt := time.Now()
-	errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " after=", slotUploadHedge)
+	errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " after=", delay)
 
 	ok := func(r result) bool { return r.err == nil && r.status == http.StatusOK }
 	pick := func(r result) (int, []byte, error) {
@@ -4089,6 +4142,11 @@ func (l *rangeLatency) note(d time.Duration) {
 }
 
 func (l *rangeLatency) median() (time.Duration, bool) {
+	return l.quantile(.5)
+}
+
+// quantile is the p quantile of the samples, false below rangeLatencyMin.
+func (l *rangeLatency) quantile(p float64) (time.Duration, bool) {
 	l.mu.Lock()
 	if l.n < rangeLatencyMin {
 		l.mu.Unlock()
@@ -4097,7 +4155,7 @@ func (l *rangeLatency) median() (time.Duration, bool) {
 	v := append([]time.Duration(nil), l.ring[:l.n]...)
 	l.mu.Unlock()
 	sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
-	return percentile(v, .5), true
+	return percentile(v, p), true
 }
 
 func rangeClass(r driveMediaRequest) int {

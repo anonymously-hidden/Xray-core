@@ -125,6 +125,15 @@ func inlineUploadCeiling(w *slotWriter, window int) int {
 	return window
 }
 
+// liveUploadCeiling adds the media window that live media may use beside
+// outstanding inline uploads, see slotLiveHybrid.
+func liveUploadCeiling(w *slotWriter, window int) int {
+	if w.liveHybrid {
+		return min(cap(w.slots), inlineUploadCeiling(w, window)+slotWriteInflight)
+	}
+	return inlineUploadCeiling(w, window)
+}
+
 func TestSlotWriterUsesSingleWaveDefault(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := paramsFromConfig(&Config{Concurrency: 64})
@@ -224,6 +233,8 @@ func TestSlotWriterLiveBurstStaysInlineBesideBacklog(t *testing.T) {
 				defer func() { cancel(); w.wait() }()
 				w.mu.Lock()
 				w.liveInline = !tc.disabled
+				// The backlog below must be two full media frames, not a split burst.
+				w.liveHybrid = false
 				w.mu.Unlock()
 				// Unrelated page traffic: two full media frames still uploading.
 				if _, err := w.Write(randomPayload(2 * p.segmentBytes)); err != nil {

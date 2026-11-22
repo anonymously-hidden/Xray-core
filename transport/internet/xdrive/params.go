@@ -25,6 +25,9 @@ type params struct {
 	holeTimeout     time.Duration
 	sessionTTL      time.Duration
 	concurrency     int
+	// link is shared by the writer and reader of one slot Conn for their
+	// burst logs; nil elsewhere.
+	link *slotLink
 }
 
 func millis(value uint32, fallback time.Duration) time.Duration {

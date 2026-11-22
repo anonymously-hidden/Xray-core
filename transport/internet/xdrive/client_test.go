@@ -955,10 +955,20 @@ func TestDriveOverH3(t *testing.T) {
 	if n := len(rec.conns); n < 4 || n > 6+xmuxConnections+driveMediaLanes {
 		t.Errorf("%d connections went through the mask, want 4 to %d", n, 6+xmuxConnections+driveMediaLanes)
 	}
+	// The four XMUX connections of the session carry data; the mask must have
+	// been exercised on each of them.
+	used := 0
 	for i, conn := range rec.conns {
 		conn.mu.Lock()
 		sent := conn.sent
 		conn.mu.Unlock()
+		if len(sent) == 0 {
+			// Dialed but nothing written yet: a speculative, prefetched or
+			// handshaking connection whose Initial had not been flushed when
+			// the session data finished. It shows no noise ordering either.
+			continue
+		}
+		used++
 		if len(sent) < 2 {
 			t.Errorf("connection %d sent %d datagrams", i, len(sent))
 			continue
@@ -969,6 +979,9 @@ func TestDriveOverH3(t *testing.T) {
 		if string(first) != "noise" || len(initial) != 1250 || initial[0]&0xf0 != 0xc0 || !bytes.Equal(initial[1:5], []byte{0, 0, 0, 1}) || initial[6+int(initial[5])] != 0 {
 			t.Errorf("connection %d began with %q and %d bytes %x", i, first, len(initial), initial[:min(len(initial), 24)])
 		}
+	}
+	if used < xmuxConnections {
+		t.Errorf("%d connections carried datagrams, want at least %d", used, xmuxConnections)
 	}
 }
 
