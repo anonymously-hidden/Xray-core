@@ -211,6 +211,8 @@ type driveStorage struct {
 	mediaPrefetch  chan struct{}
 	release        func()
 
+	headMediaClient *http.Client
+
 	readHedge       time.Duration
 	readHedgeMu     sync.Mutex
 	readHedgeTokens int
@@ -239,6 +241,8 @@ type driveShared struct {
 	filesURL      string
 	uploadURL     string
 	backoff       time.Duration
+
+	headMediaConns *connPool
 
 	tokenMu       sync.Mutex
 	token         string
@@ -361,10 +365,14 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		mediaHedgeTokens: 3,
 	}
 	st.driveShared.owner = st
+	newMediaClient := func(connCtx context.Context) *http.Client {
+		return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
+	}
 	for i := range st.mediaConns {
-		st.mediaConns[i] = newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
-			return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
-		})
+		st.mediaConns[i] = newConnPool(config.Xmux, newMediaClient)
+	}
+	if os.Getenv("XRAY_XDRIVE_ISOLATE_MEDIA_HEAD") == "1" {
+		st.headMediaConns = newConnPool(config.Xmux, newMediaClient)
 	}
 	st.driveShared.keepWarmEvery = 4 * time.Minute
 	st.driveShared.keepWarmWindow = 3 * time.Hour
@@ -397,6 +405,11 @@ func (s *driveStorage) session() Storage {
 		t := &sessionTransport{pool: s.priorityConns}
 		transports = append(transports, t)
 		st.priorityClient = &http.Client{Transport: t}
+	}
+	if s.headMediaConns != nil {
+		t := &sessionTransport{pool: s.headMediaConns}
+		transports = append(transports, t)
+		st.headMediaClient = &http.Client{Transport: t}
 	}
 	for _, pool := range s.mediaConns {
 		if pool == nil {
@@ -1048,6 +1061,13 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		if media != nil && media.client != nil {
 			httpc = media.client
 		}
+		// Check after permit acquisition so queued prefetch that became
+		// the head can take the isolated pool without restarting a GET.
+		isolatedHead := s.headMediaClient != nil && media != nil &&
+			media.progressive && !media.rescue && mediaHead(ctx)
+		if isolatedHead {
+			httpc = s.headMediaClient
+		}
 		if err := ctx.Err(); err != nil {
 			cancel()
 			releasePermit()
@@ -1180,6 +1200,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			hasSend:     tr.wroteOK && !tr.admitted.IsZero() && !tr.wrote.IsZero() && !tr.wrote.Before(tr.admitted),
 			hasServer:   !tr.wrote.IsZero() && !tr.first.IsZero(),
 			hasDispatch: !tr.admitted.IsZero(),
+
+			isolatedHead: isolatedHead,
 		}
 		if sample.hasDispatch {
 			sample.dispatch = bodyEnd.Sub(tr.admitted)
@@ -2105,6 +2127,7 @@ func (s *driveStorage) Close() error {
 		s.conns.Close()
 		s.priorityConns.Close()
 		s.bulkConns.Close()
+		s.headMediaConns.Close()
 		for _, pool := range s.mediaConns {
 			pool.Close()
 		}
@@ -3833,6 +3856,8 @@ type timingSample struct {
 	dispatch      time.Duration
 	firstVerified time.Duration
 	hasDispatch   bool
+
+	isolatedHead bool
 }
 
 const (
@@ -4099,7 +4124,7 @@ func (s *driveStorage) logSlowRequest(ctx context.Context, kind int, path string
 			" dispatch-to-eof=", dispatch,
 			" token=", sample.waitToken, " connection=", connection, " send=", send,
 			" server=", server, " body=", sample.body, " rescue=", media.rescue,
-			" head-at-dispatch=", headAtDispatch, " head-at-completion=", headAtCompletion)
+			" isolated-head=", sample.isolatedHead, " head-at-dispatch=", headAtDispatch, " head-at-completion=", headAtCompletion)
 		return
 	}
 	errors.LogDebug(ctx, "xdrive slow timing kind=", kindNames[kind], " slot=", slotTag(path),

@@ -2301,6 +2301,115 @@ func TestDriveMediaPrefetchLeavesRoomForOrderedHead(t *testing.T) {
 	})
 }
 
+func TestDriveIsolatedHeadMediaRoutesAtAdmission(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		release := make(chan struct{})
+		promoted := make(chan struct{})
+		routes := make(chan string, 8)
+		reply := func(req *http.Request, lane string) (*http.Response, error) {
+			routes <- lane + ":" + strings.TrimPrefix(req.URL.Path, "/files/")
+			resp := memoryResponse(http.StatusPartialContent, "x")
+			resp.Header.Set("Content-Range", "bytes 0-0/1")
+			return resp, nil
+		}
+		s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/files/active" {
+				routes <- "shared:active"
+				select {
+				case <-release:
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				}
+				resp := memoryResponse(http.StatusPartialContent, "x")
+				resp.Header.Set("Content-Range", "bytes 0-0/1")
+				return resp, nil
+			}
+			return reply(req, "shared")
+		}))
+		s.mediaRanges = make(chan struct{}, 2)
+		s.mediaPrefetch = make(chan struct{}, 1)
+		s.headMediaClient = &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
+			return reply(req, "head")
+		})}
+		s.bulkClient = &http.Client{Transport: roundTrip(func(req *http.Request) (*http.Response, error) {
+			return reply(req, "rescue")
+		})}
+		defer s.closeWork()
+		read := func(ctx context.Context, name string, progressive, rescue bool) <-chan error {
+			done := make(chan error, 1)
+			request := driveMediaRequest{end: 1, size: 1, client: s.client, progressive: progressive, rescue: rescue}
+			if rescue {
+				request.client = s.bulkClient
+			}
+			go func() {
+				_, body, err := s.do(context.WithValue(ctx, driveMediaKey{}, &request), http.MethodGet, s.filesURL+"/"+name+"?alt=media", "", nil)
+				if err == nil && string(body) != "x" {
+					err = fmt.Errorf("unexpected body %q", body)
+				}
+				done <- err
+			}()
+			return done
+		}
+		expectRoute := func(want string) {
+			t.Helper()
+			synctest.Wait()
+			select {
+			case got := <-routes:
+				if got != want {
+					t.Fatalf("route = %q, want %q", got, want)
+				}
+			default:
+				t.Fatalf("no route, want %q", want)
+			}
+		}
+		active := read(ctx, "active", true, false)
+		expectRoute("shared:active")
+		queued := read(context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(promoted)), "queued", true, false)
+		synctest.Wait()
+		if len(routes) != 0 {
+			t.Fatal("prefetch bypassed its admission limit")
+		}
+		close(promoted)
+		expectRoute("head:queued")
+		if err := <-queued; err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-active:
+			t.Fatal("routing the head interrupted active prefetch")
+		default:
+		}
+		close(release)
+		if err := <-active; err != nil {
+			t.Fatal(err)
+		}
+		head := context.WithValue(ctx, mediaHeadKey{}, true)
+		for _, tc := range []struct {
+			name, lane          string
+			progressive, rescue bool
+		}{
+			{"primary", "head", true, false},
+			{"legacy", "shared", false, false},
+			{"rescue", "rescue", true, true},
+			{"disabled", "shared", true, false},
+		} {
+			if tc.name == "disabled" {
+				s.headMediaClient = nil
+			}
+			done := read(head, tc.name, tc.progressive, tc.rescue)
+			expectRoute(tc.lane + ":" + tc.name)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(routes) != 0 {
+			t.Fatal("routing added requests")
+		}
+	})
+}
+
 // Media range tests.
 
 type mediaTestResult struct {
