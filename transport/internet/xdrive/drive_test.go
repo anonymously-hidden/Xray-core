@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -2299,6 +2300,48 @@ func TestDriveMediaPrefetchLeavesRoomForOrderedHead(t *testing.T) {
 			t.Fatal("shutdown leaked a permit or dispatched the canceled prefetch")
 		}
 	})
+}
+
+func TestDriveHeadIsolationDefault(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		unset   bool
+		enabled bool
+	}{
+		{"unset", "", true, true},
+		{"empty", "", false, true},
+		{"enabled", "1", false, true},
+		{"disabled", "0", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const key = "XRAY_XDRIVE_ISOLATE_MEDIA_HEAD"
+			t.Setenv(key, tc.value)
+			if tc.unset {
+				if err := os.Unsetenv(key); err != nil {
+					t.Fatal(err)
+				}
+			}
+			settings := driveSettings()
+			owner, err := newDriveStorage(settings, settings.ProtocolSettings.(*Config))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer owner.Close()
+			peer := owner.session().(*driveStorage)
+			defer peer.Close()
+			if (owner.headMediaConns != nil) != tc.enabled || (peer.headMediaClient != nil) != tc.enabled {
+				t.Fatalf("head media isolation: owner=%v session=%v, want %v",
+					owner.headMediaConns != nil, peer.headMediaClient != nil, tc.enabled)
+			}
+			if tc.enabled {
+				transport, ok := peer.headMediaClient.Transport.(*sessionTransport)
+				if !ok || transport.pool != owner.headMediaConns {
+					t.Fatal("session does not use the owner's isolated media pool")
+				}
+			}
+		})
+	}
 }
 
 func TestDriveIsolatedHeadMediaRoutesAtAdmission(t *testing.T) {

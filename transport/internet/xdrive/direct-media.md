@@ -1,6 +1,6 @@
 <!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:18abdf8cf5a34dc7c73524120638d215fd409929956fcac22e87089fda9dc1dc -->
+<!-- coderabbit-ai-generated-section:v1:e20e02b308daf41306b9b3bd95a904e51801aa19bc923d9ddf87d3a1392da01a -->
 
 # Progressive media delivery
 
@@ -48,11 +48,10 @@ polling limits. Drive upload and visibility delays, shared throttling, and
 ordered delivery across frames can still create gaps. Compare browser segment
 timings, the reader's block waits, and actual Drive requests.
 
-## Experimental connection isolation
+## Connection isolation
 
-Set `XRAY_XDRIVE_ISOLATE_MEDIA_HEAD=1` on the reader before opening a session
-to try a separate connection pool for progressive primary GETs that are the
-ordered head after HTTP permit admission. A queued prefetch that becomes the
+The reader uses a separate connection pool by default for progressive primary
+GETs at the ordered head after HTTP permit admission. A queued prefetch that becomes the
 head can use this pool. Downloads already started continue on their original
 connection. The same GET streams the whole frame or its media suffix, with
 the existing request and permit limits. The existing backup GET still uses
@@ -60,7 +59,8 @@ the bulk pool.
 
 The isolated connection may need a fresh handshake. Slow request logs report
 `isolated-head` to distinguish pool selection from a frame promoted during
-the request. This option is off by default; it has not been benchmarked on
-live Drive playback.
+the request. Isolation is enabled by default, with no configuration needed.
+It has not been benchmarked on live Drive playback. Set `XRAY_XDRIVE_ISOLATE_MEDIA_HEAD=0`
+before startup to disable it.
 
 <!-- /coderabbit-ai-generated:v1 -->

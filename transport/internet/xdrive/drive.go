@@ -371,7 +371,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	for i := range st.mediaConns {
 		st.mediaConns[i] = newConnPool(config.Xmux, newMediaClient)
 	}
-	if os.Getenv("XRAY_XDRIVE_ISOLATE_MEDIA_HEAD") == "1" {
+	if os.Getenv("XRAY_XDRIVE_ISOLATE_MEDIA_HEAD") != "0" {
 		st.headMediaConns = newConnPool(config.Xmux, newMediaClient)
 	}
 	st.driveShared.keepWarmEvery = 4 * time.Minute
