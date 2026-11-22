@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"io"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,17 @@ var (
 	slotReadAheadPoll            = 40 * time.Millisecond
 	slotReadAheadBurst           = 500 * time.Millisecond
 )
+
+// slotBurstReadAhead is the near window while full inline frames arrive: the
+// rest of one inline wave after the head, so a split live segment is polled at
+// slotReadAheadPoll even past slotReadAhead. XRAY_XDRIVE_BURST_READ_AHEAD=0
+// keeps slotReadAhead.
+var slotBurstReadAhead = func() int64 {
+	if os.Getenv("XRAY_XDRIVE_BURST_READ_AHEAD") == "0" {
+		return slotReadAhead
+	}
+	return slotInlineWriteInflight - 1
+}()
 
 var slotWriteInflight = 12
 
@@ -402,6 +414,7 @@ type slotWriter struct {
 	uplink             latencyWindow      // bulk upload window steered by media put latency; guarded by mu
 	batch              *slotBatchWindow
 	singleWave         bool // XRAY_XDRIVE_INLINE_SINGLE_WAVE, fixed at construction
+	liveInline         bool // XRAY_XDRIVE_LIVE_INLINE, fixed at construction
 
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
@@ -426,6 +439,7 @@ func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p para
 		params:     p,
 		slots:      make(chan struct{}, min(len(table.Slots), slotPermitCap(singleWave))),
 		singleWave: singleWave,
+		liveInline: slotLiveInline,
 		flushDone:  make(chan struct{}),
 		flushStop:  make(chan struct{}),
 		available:  make(chan struct{}),
@@ -617,7 +631,19 @@ func (w *slotWriter) readyToFlush() bool {
 // writeWindow is called with mu held. Two full laps distinguish a sustained
 // transfer from a burst and finish lazy creation before widening the window.
 func (w *slotWriter) writeWindow() int {
-	return w.writeWindowFor(w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots)))
+	return w.writeWindowFor(w.inlineNextLocked())
+}
+
+// inlineNextLocked is called with mu held. A live-sized burst may stay inline
+// beside unrelated backlog, except during a sustained transfer (two full laps
+// of full-size media, the rule that also widens the bulk window) or quota
+// recovery, where the existing byte and request credits decide.
+func (w *slotWriter) inlineNextLocked() bool {
+	if w.batch == nil {
+		return false
+	}
+	w.batch.live = w.liveInline && w.bulkSegments < 2*len(w.table.Slots) && !w.quotaRecovery()
+	return w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots))
 }
 
 func (w *slotWriter) writeWindowFor(inline bool) int {
@@ -691,7 +717,7 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 	var permitWait time.Duration
 	bulk := false
 	for {
-		inline := w.batch != nil && w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots))
+		inline := w.inlineNextLocked()
 		// Returning upload permits does not make an already-backlogged burst
 		// fresh. Keep its bulk decision through this admission wait instead of
 		// renewing a two-wave inline plan as the old requests finish.
@@ -949,7 +975,12 @@ func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error
 			return nil
 		}
 	}
-	return w.store.setSlot(w.ctx, id, f.encode(), body)
+	ctx := w.ctx
+	if mode == slotInline {
+		// Drive may send a straggling inline update twice (see patchHedged).
+		ctx = context.WithValue(ctx, slotUploadHedgeKey{}, true)
+	}
+	return w.store.setSlot(ctx, id, f.encode(), body)
 }
 
 // drained reports whether the reader took what the slot of seq held a lap
@@ -1274,7 +1305,8 @@ type slotReader struct {
 	frontier        int64
 	frontierAt      time.Time // last advance of the observed description frontier
 	frontierChanged chan struct{}
-	directNext      int64 // next head eligible for a direct read after contiguous media
+	burstAt         time.Time // last discovery of a full inline frame
+	directNext      int64     // next head eligible for a direct read after contiguous media
 	err             error
 	stop            context.CancelFunc
 	reads           atomic.Int64
@@ -1430,6 +1462,7 @@ func (r *slotReader) run() {
 	for {
 		r.mu.Lock()
 		head, started, frontier := r.head, r.started, r.frontier
+		burst := time.Since(r.burstAt) <= slotReadAheadBurst
 		r.mu.Unlock()
 		r.bodies.advance(head)
 
@@ -1437,11 +1470,18 @@ func (r *slotReader) run() {
 		if started || frontier >= head {
 			window = min(max(int(frontier-head)+slotFetchAhead, slotFetchAhead), len(r.table.Slots))
 		}
+		near := slotReadAhead
+		if burst {
+			// A split live segment is arriving: poll the fetches that already
+			// exist for the rest of one inline wave at the near cadence. The
+			// window itself is unchanged, so no new slots are polled.
+			near = max(near, slotBurstReadAhead)
+		}
 		for i := range window {
 			seq := head + int64(i)
 			if fetches[seq] == nil {
 				fetches[seq] = &slotFetch{ready: make(chan struct{}), streamReady: make(chan struct{}), promoted: make(chan struct{}), near: make(chan struct{}), born: time.Now()}
-				if int64(i) <= slotReadAhead {
+				if int64(i) <= near {
 					fetches[seq].enter()
 				}
 				r.wg.Add(1)
@@ -1449,6 +1489,8 @@ func (r *slotReader) run() {
 					defer r.wg.Done()
 					r.fetch(ctx, seq, i, f)
 				}(fetches[seq])
+			} else if burst && int64(i) <= near {
+				fetches[seq].enter()
 			}
 		}
 
@@ -1698,6 +1740,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			// what follows it is asked for while its body comes
 			r.mu.Lock()
 			r.touch()
+			if frame.mode == slotInline && len(frame.data) == slotInlineLimit {
+				// Set before reach, whose wake makes run widen the near window.
+				r.burstAt = time.Now()
+			}
 			if r.lazy {
 				r.seen[int(seq%int64(len(r.table.Slots)))] = true
 			}

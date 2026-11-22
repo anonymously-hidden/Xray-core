@@ -94,7 +94,28 @@ type (
 	readProgressKey     struct{}
 	descriptionHedgeKey struct{}
 	readHedgeGateKey    struct{}
+
+	// slotUploadHedgeKey marks an inline slot write that setSlot may hedge;
+	// uploadHedgeAttemptKey marks the copy, which makes one attempt only;
+	// selectedConnKey carries an *atomic.Pointer[poolConn] that do fills with
+	// the connection each attempt was sent on.
+	slotUploadHedgeKey    struct{}
+	uploadHedgeAttemptKey struct{}
+	selectedConnKey       struct{}
 )
+
+// slotUploadHedgeMax bounds concurrent upload copies per session.
+const slotUploadHedgeMax = 4
+
+// slotUploadHedge is how long a metadata-only inline slot write may run after
+// dispatch before an identical copy goes out on another connection. Live logs
+// put a normal update near 690 ms; XRAY_XDRIVE_UPLOAD_HEDGE=0 disables it.
+var slotUploadHedge = func() time.Duration {
+	if os.Getenv("XRAY_XDRIVE_UPLOAD_HEDGE") == "0" {
+		return 0
+	}
+	return 1200 * time.Millisecond
+}()
 
 type readHedgeGate struct {
 	primary   *driveReadProgress
@@ -224,6 +245,8 @@ type driveStorage struct {
 	mediaHedgeChanged chan struct{} // guarded by readHedgeMu
 
 	mediaNext atomic.Uint32
+
+	uploadHedges chan struct{} // concurrent upload copies; nil disables them
 }
 
 type driveShared struct {
@@ -291,6 +314,11 @@ type driveShared struct {
 	keeperClosed   bool
 	keeperCancel   context.CancelFunc
 	keeperDone     chan struct{}
+
+	// slotTails holds, per slot id, a channel closed once both copies of a
+	// hedged write have finished; the next write to that slot waits for it.
+	slotTailMu sync.Mutex
+	slotTails  map[string]chan struct{}
 
 	workMu     sync.Mutex
 	workCtx    context.Context
@@ -363,6 +391,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		readHedge:        slotReadHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
+		uploadHedges:     make(chan struct{}, slotUploadHedgeMax),
 	}
 	st.driveShared.owner = st
 	newMediaClient := func(connCtx context.Context) *http.Client {
@@ -399,6 +428,7 @@ func (s *driveStorage) session() Storage {
 		readHedge:        s.readHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
+		uploadHedges:     make(chan struct{}, slotUploadHedgeMax),
 	}
 	transports := []*sessionTransport{transport, bulkTransport}
 	if s.priorityConns != nil {
@@ -800,7 +830,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	mediaTiming, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
 	readHedgeAttempt := descriptionHedge || method == http.MethodGet &&
 		(media != nil && media.rescue || ctx.Value(directProbeKey{}) != nil)
-	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
+	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil ||
+		ctx.Value(uploadHedgeAttemptKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
 		return 0, nil, errReadHedgeSkipped
 	}
@@ -1077,7 +1108,11 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			testDriveIO(method, target, body)
 		}
 		var selected atomic.Pointer[poolConn]
-		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, selected.Store))
+		noteConn := selected.Store
+		if track, ok := ctx.Value(selectedConnKey{}).(*atomic.Pointer[poolConn]); ok {
+			noteConn = func(c *poolConn) { selected.Store(c); track.Store(c) }
+		}
+		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, noteConn))
 		if failedConn != nil {
 			req = req.WithContext(context.WithValue(req.Context(), failedConnKey{}, failedConn))
 		}
@@ -2154,6 +2189,12 @@ func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error
 }
 
 func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
+	// A copy of the previous hedged write to this slot may still be running;
+	// it must not land after this one.
+	if err := s.awaitSlotTail(ctx, id); err != nil {
+		return err
+	}
+	hedge := body == nil && ctx.Value(slotUploadHedgeKey{}) != nil
 	if body == nil {
 		ctx = context.WithValue(ctx, attemptKey{}, driveSlotWrite)
 	} else {
@@ -2175,7 +2216,13 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 		metadata, contentType = multipartBody(metadata, body)
 	}
 
-	status, payload, err := s.do(ctx, http.MethodPatch, target, contentType, metadata)
+	var status int
+	var payload []byte
+	if hedge {
+		status, payload, err = s.patchHedged(ctx, id, target, contentType, metadata)
+	} else {
+		status, payload, err = s.do(ctx, http.MethodPatch, target, contentType, metadata)
+	}
 	switch {
 	case err != nil:
 		return err
@@ -2185,6 +2232,158 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 		return errors.New("Drive answered ", status, " for the update of ", id, ": ", string(payload))
 	}
 	return nil
+}
+
+// patchHedged sends a metadata-only slot update and, once it has run
+// slotUploadHedge since dispatch, an identical copy on another connection.
+// The first success wins. Neither request is cancelled, since Drive may still
+// apply it; the next write to id waits for both through the slot tail.
+func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType string, metadata []byte) (int, []byte, error) {
+	if slotUploadHedge <= 0 || s.uploadHedges == nil {
+		return s.do(ctx, http.MethodPatch, target, contentType, metadata)
+	}
+	type result struct {
+		status  int
+		payload []byte
+		err     error
+		hedge   bool
+	}
+	results := make(chan result, 2)
+	primary := &driveReadProgress{dispatched: make(chan struct{})}
+	var conn atomic.Pointer[poolConn]
+	primaryCtx := context.WithValue(context.WithValue(ctx, readProgressKey{}, primary), selectedConnKey{}, &conn)
+	primaryDone := make(chan struct{})
+	go func() {
+		defer close(primaryDone)
+		status, payload, err := s.do(primaryCtx, http.MethodPatch, target, contentType, metadata)
+		results <- result{status, payload, err, false}
+	}()
+
+	timer := time.NewTimer(slotUploadHedge)
+	defer timer.Stop()
+	for launch := false; !launch; {
+		select {
+		case r := <-results:
+			return r.status, r.payload, r.err
+		case <-ctx.Done():
+			return 0, nil, ctx.Err()
+		case <-timer.C:
+		}
+		remaining, pending := primary.remainingSinceDispatch(slotUploadHedge)
+		switch {
+		case !pending:
+			// Not dispatched yet, or backing off between attempts.
+			timer.Reset(min(slotUploadHedge, 100*time.Millisecond))
+		case remaining > 0:
+			timer.Reset(remaining)
+		case !s.descriptionHedgeAllowed() || !s.takeUploadHedge():
+			// Cooldown, a recent rate limit, or enough copies already out.
+			select {
+			case r := <-results:
+				return r.status, r.payload, r.err
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			}
+		default:
+			launch = true
+		}
+	}
+
+	hedgeCtx := context.WithValue(ctx, uploadHedgeAttemptKey{}, true)
+	if c := conn.Load(); c != nil {
+		hedgeCtx = context.WithValue(hedgeCtx, failedConnKey{}, c)
+	}
+	tail := make(chan struct{})
+	s.setSlotTail(id, tail)
+	hedgeDone := make(chan struct{})
+	go func() {
+		defer close(hedgeDone)
+		defer func() { <-s.uploadHedges }()
+		status, payload, err := s.do(hedgeCtx, http.MethodPatch, target, contentType, metadata)
+		results <- result{status, payload, err, true}
+	}()
+	go func() {
+		<-primaryDone
+		<-hedgeDone
+		s.clearSlotTail(id, tail)
+	}()
+	if s.timing != nil {
+		s.timing.noteHedge(kindSlotInline, false)
+	}
+	launchedAt := time.Now()
+	errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " after=", slotUploadHedge)
+
+	ok := func(r result) bool { return r.err == nil && r.status == http.StatusOK }
+	pick := func(r result) (int, []byte, error) {
+		won := r.hedge && ok(r)
+		if won && s.timing != nil {
+			s.timing.noteHedgeWin(kindSlotInline)
+		}
+		errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " won=", won,
+			" status=", r.status, " after-launch=", time.Since(launchedAt))
+		return r.status, r.payload, r.err
+	}
+	var first result
+	select {
+	case first = <-results:
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+	if ok(first) || isAuthError(first.err) {
+		return pick(first)
+	}
+	select {
+	case second := <-results:
+		// Prefer a success; otherwise report the primary, which retried.
+		if ok(second) || first.hedge {
+			return pick(second)
+		}
+		return pick(first)
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	}
+}
+
+func (s *driveStorage) takeUploadHedge() bool {
+	select {
+	case s.uploadHedges <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *driveStorage) awaitSlotTail(ctx context.Context, id string) error {
+	s.slotTailMu.Lock()
+	tail := s.slotTails[id]
+	s.slotTailMu.Unlock()
+	if tail == nil {
+		return nil
+	}
+	select {
+	case <-tail:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *driveStorage) setSlotTail(id string, tail chan struct{}) {
+	s.slotTailMu.Lock()
+	if s.slotTails == nil {
+		s.slotTails = make(map[string]chan struct{})
+	}
+	s.slotTails[id] = tail
+	s.slotTailMu.Unlock()
+}
+
+func (s *driveStorage) clearSlotTail(id string, tail chan struct{}) {
+	s.slotTailMu.Lock()
+	if s.slotTails[id] == tail {
+		delete(s.slotTails, id)
+	}
+	s.slotTailMu.Unlock()
+	close(tail)
 }
 
 func (s *driveStorage) noteDescriptionRead() {

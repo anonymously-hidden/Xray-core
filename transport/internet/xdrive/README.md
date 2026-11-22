@@ -812,6 +812,34 @@ This is a writer-side change: for downstream video, upgrade the server. Compare
 `upload-permit-wait`, the reader's `discover`/`blocked` timings and both peers'
 `rate-limits`.
 
+### Live segments beside other traffic (aparat 240p, November 22)
+
+Three default-on changes target ~200 KB, 2 s HLS segments published as 14-19
+inline frames. Each has an escape hatch read once at startup.
+
+- Writer (upgrade the server for downstream video): a buffered burst of at most
+  one inline wave (24 frames, 336 KiB) stays inline even while unrelated uploads
+  are outstanding. It still goes to media during a sustained transfer (two full
+  laps of full-size media frames, the rule that widens the bulk window) and
+  during Drive cooldown or within five seconds of a rate limit.
+  `XRAY_XDRIVE_LIVE_INLINE=0` restores the old rule.
+- Drive, both peers: a metadata-only inline frame update still running 1.2 s
+  after dispatch gets one identical copy, a single attempt on another pooled
+  connection when one is available. The first success completes the frame.
+  Neither request is cancelled, and the next write to the same slot waits until
+  both have finished, so a late copy cannot overwrite the next lap. At most four
+  copies per session at once. No copies are sent during cooldown or within a
+  minute of a rate limit, and never for media bodies, first-lap creates or
+  watermarks. Drive's handling of two concurrent identical updates to one file
+  has not yet been measured. `XRAY_XDRIVE_UPLOAD_HEDGE=0` disables the copies.
+  The per-minute `xdrive timing slot-write-inline` line counts them as
+  `hedges=` and `won=`.
+- Reader: after it discovers a full 14 KiB inline frame, already scheduled
+  fetches up to head+23 (one inline wave) use the near schedule, polling every
+  40 ms while the burst arrives (500 ms after the last hit) instead of the tail
+  pace beyond head+11. The fetch window is unchanged, so no new slots are
+  polled. `XRAY_XDRIVE_BURST_READ_AHEAD=0` restores head+11.
+
 ### Google Drive code layout
 
 The Drive backend, media recovery, streaming negotiation, and telemetry live in

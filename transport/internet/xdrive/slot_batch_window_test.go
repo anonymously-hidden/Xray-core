@@ -277,9 +277,13 @@ func TestSlotLiveSizedBurstDelivery(t *testing.T) {
 		ahead  int64
 	}{{"resume57", 16, 3}, {"upload_only", slotInlineWriteInflight, 3}, {"resume58", slotInlineWriteInflight, slotReadAhead}} {
 		t.Run(tc.name, func(t *testing.T) {
-			previous := slotReadAhead
+			previous, previousBurst := slotReadAhead, slotBurstReadAhead
 			slotReadAhead = tc.ahead
-			defer func() { slotReadAhead = previous }()
+			if tc.ahead < previous {
+				// resume57/upload_only model the older, narrower reader.
+				slotBurstReadAhead = tc.ahead
+			}
+			defer func() { slotReadAhead, slotBurstReadAhead = previous, previousBurst }()
 			synctest.Test(t, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				store := &batchTestSlots{

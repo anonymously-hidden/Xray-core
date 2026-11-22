@@ -8,6 +8,12 @@ import "os"
 // process start; XRAY_XDRIVE_INLINE_SINGLE_WAVE=0 restores the two-wave window.
 var slotInlineSingleWave = os.Getenv("XRAY_XDRIVE_INLINE_SINGLE_WAVE") != "0"
 
+// slotLiveInline keeps a live-sized burst (at most one inline wave, 336 KiB at
+// the default payload size) inline even while unrelated uploads are still
+// outstanding; the writer withholds it during sustained transfers and quota
+// recovery. On by default; XRAY_XDRIVE_LIVE_INLINE=0 restores the old rule.
+var slotLiveInline = os.Getenv("XRAY_XDRIVE_LIVE_INLINE") != "0"
+
 // slotPermitCap sizes the writer's permit channel. It must cover every window
 // writeWindowFor can return, or a flusher holding mu would block on the send.
 func slotPermitCap(singleWave bool) int {
@@ -30,6 +36,7 @@ type slotBatchWindow struct {
 	unit, window, budget int
 	burstBudget          int
 	planned              int
+	live                 bool // refreshed by the writer under its lock before each admission
 }
 
 func newSlotBatchWindow(size, depth int) *slotBatchWindow {
@@ -41,6 +48,11 @@ func newSlotBatchWindow(size, depth int) *slotBatchWindow {
 }
 
 func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
+	// A segment-sized burst is cheaper inline than as a media frame behind
+	// other traffic: the reader skips a media GET and the PUT queue.
+	if b.live && buffered <= b.budget {
+		return true
+	}
 	budget := b.budget
 	frames := b.window + b.window/2
 	// Spare upload capacity can cover a bounded second wave without a media GET.
