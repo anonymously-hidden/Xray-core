@@ -36,22 +36,26 @@ confined to `transport/internet/xdrive/**`.
    (32 KiB blocks delivered incrementally).
 
 3. **Drive timings are observations, not fixed limits.** Metadata GET ≈ 330 ms,
-   media PUT ≈ 1.36 s, media GET first block ≈ 0.88 ms. They can be overlapped,
+   media PUT ≈ 1.36 s, media GET first block ≈ 880 ms. They can be overlapped,
    parallelized, or retried — but naive overlap has measured costs:
    speculative metadata racing turns a hit into a **2.30 s miss** (vs 1.40 s
    today) and can spend an extra ~200 quota units, and a mandatory frontier
    adds a barrier (see Rejected E). So "hide the latency" must be done without
    adding a serial dependency.
 
-4. **The target is the tail, not the median.** Median body latency is
-   ~0.9–1.1 s. What makes the player buffer: **9.22 s** first-block waits,
+4. **The target is the tail, and there are two distinct stalls — do not conflate
+   them.** What makes the player buffer: **9.22 s** first-block waits,
    **18.44 s** ready frame behind bulk, **3.67 s** reuse waits, **4.58 s**
-   inline-burst publication, and a measured **5.36 s** gap between verified
-   blocks while media admission topped out at only **187 ms**. That last point
-   is the key signal: the head is stuck *behind queued prefetch in a shared
-   pool* (`drive.go` media pool shared with prefetch) and the progressive path
-   is forced through a single primary GET (`drive.go:3597`). This is a
-   scheduling problem, not a Drive-speed problem.
+   inline-burst publication. Two of these are the actionable ones and they live
+   at different layers:
+   - **Frame prefetch gate (~187 ms measured):** the head waits at the *frame*
+     prefetch gate, not for an exhausted HTTP pool. The head-priority patch
+     already protects the ordered head inside the existing 48-permit pool.
+   - **Within-frame block gap (~5.36 s measured):** this happened *after*
+     verified bytes had already arrived — it is a late/stalled block inside a
+     frame, not a download-permit wait. The current gap timer can miss a frame
+     that is still making progress but on pace to finish late.
+   The 187 ms and the 5.36 s are different problems with different fixes.
 
 5. **Cross-flow HOL is a mux-layer issue** (Twitch blocked behind browsing on
    the same Conn). Acknowledged out of scope by the user.
@@ -68,53 +72,71 @@ ordered handoff to player
 
 Critical path per segment ≈ `max(Twitch, upload) + metadata + body`, plus tail
 stalls. Body reads already overlap across frames (`slots.go:1393` starts
-successor fetches before delivery), so the remaining levers are: (a) stop the
-head queuing behind prefetch, (b) fetch a frame's blocks in parallel instead of
-one primary GET, (c) keep a read-ahead buffer full so per-frame latency hides
-behind playback.
+successor fetches before delivery). The remaining actionable levers are: (a) stop
+the head waiting at the *frame prefetch gate* (L), and (b) recover a frame whose
+blocks are arriving but on pace to finish late (bounded M). Read-ahead is already
+sufficient (see N below).
 
 ## Solution space (ranked)
 
-### Primary overhaul candidates — scheduling, wire-format-neutral
+### L. Keep reserved capacity; don't cancel active prefetch
 
-**L. Two-lane GET scheduler (reserved head lane, preemptible bulk).**
-Today the primary media GET shares its permit pool with prefetch. Split it:
-- **Head lane**: a small reserved set of permits prefetch can never occupy; the
-  head's description + first block always has a free permit.
-- **Bulk lane**: the existing `mediaRanges` pool for prefetch, free to saturate
-  without ever blocking the head.
-- Directly targets the measured **5.36 s** gap. No wire-format change, no extra
-  requests, no quota increase — same requests, different admission.
+The local head-priority patch (`drive.go` head lane within the existing
+48-permit pool) already protects the ordered head, and `slot_body_gate.go` gives
+queued earlier frames priority over later ones **without restarting requests
+already running** (README.md:519–544). Keep that.
 
-**M. Parallel block ranges in the progressive path.**
-The progressive path forces **one primary GET** per frame
-(`drive.go:3597`). One slow/stalled block then stalls the whole frame even when
-later blocks are fetchable. Issue **N concurrent ranged GETs** per frame (N from
-the existing head-range limit) and deliver blocks in seq order as each completes.
-- A stalled block no longer blocks successors from being *fetched*; they buffer
-  and deliver the instant the gap fills.
-- Most direct fix for "waits for the next missing block"; composes with L
-  (head block gets priority).
+- **Keep** the reserved head capacity and the head's two-successor byte
+  borrowing (`slot_body_gate.go`), so prefetched tails cannot deadlock the head.
+- **Do not** cancel an active prefetch to free a permit: that spends the GET and
+  may require another one. Cancel only helps if the download has *stopped
+  delivering*, which the existing suffix recovery already handles.
+- The measured **187 ms** at the frame prefetch gate is not evidence of an
+  exhausted HTTP pool; it is queueing at the gate. Prioritizing queued work (not
+  canceling running work) is the correct response.
 
-**N. Read-ahead pipeline (keep the buffer full).**
-If the reader-side stalls dominate (as the 5.36 s / 187 ms data suggests),
-stop being frame-synchronous. Reader maintains a **K-frame lookahead** and
-refills whenever the buffer drops below target, walking the deterministic seq
-order. Steady-state per-frame latency is then hidden behind the 2 s segment
-duration **as long as average throughput ≥ bitrate**; tail stalls drain the
-buffer instead of stalling the player instantly. Does not help if the *writer*
-upload tail is the bottleneck.
+### M (bounded). One optional suffix GET for a head frame on pace to finish late
 
-### Gating experiments (run before building L/M/N)
+Broad N-way parallel ranges are not the answer. A dispatch-to-last-block model
+(512 KiB frame, 880 ms to first block, 30 ms between blocks, optimistic
+independent lanes — *not* Twitch segment timings):
 
-- **B-saturated** — shared pool + queued prefetch + slow head: does the head
-  actually get stuck behind prefetch? If yes → build L. Wire-format-neutral,
-  quota-neutral.
+| Modeled case | One primary GET | Two primary ranges | Four primary ranges |
+|---|---:|---:|---:|
+| Healthy | 1.33 s | 1.09 s | 0.97 s |
+| Isolated stall after halfway | 3.08 s | 1.09 s | 0.97 s |
+| Isolated stall in the first few blocks | 3.08 s | 2.84 s | 2.72 s |
+
+Parallel ranges help **only when the stall is after halfway**; they barely help
+when the stall is in the first few blocks. And at 1.5 Drive frames/s, two and
+four primary ranges add **18,000** and **54,000 units/min** respectively, before
+retries. The capture does not establish which block stalled or whether another
+request would have escaped it.
+
+**Bounded proposal:** issue **one optional suffix GET** for a head frame that is
+**still making progress but on pace to finish late**, using the existing
+**one-rescue budget**. This targets the "stall after halfway" case the current
+gap timer can miss, without doubling GETs on healthy frames.
+
+### N. Dropped — read-ahead already works
+
+All **nine** slow progressive frames in the newer capture had successors ready
+before them; frame **2241** was ready about **8.7 s** before frame **2240**
+finished. A deeper window would fetch more bytes that still could not be
+delivered. Keep the existing adaptive byte budget and 20-frame lookahead
+(`slot_body_gate.go`, README.md:519–544). No change.
+
+### Gating experiments (run before building bounded M)
+
+- **B-saturated** — shared pool + queued prefetch + slow head: confirm the head
+  is stuck at the *frame prefetch gate* (queueing), not at an exhausted HTTP
+  pool. Decides whether any L change is needed beyond keeping the patch.
 - **D-narrowed** — 256 vs 512 KiB with **one primary GET**, measuring first
   byte, last byte, and quota together. (Changing the head-range setting alone
   won't exercise the progressive path — `drive.go:3597` forces one primary GET.)
-- **M-probe** — force N concurrent ranges on the progressive path: does it close
-  the 5.36 s block gap? If yes → M is the cheapest overhaul.
+- **M-probe (bounded)** — inject a late block after halfway and verify a single
+  optional suffix GET (within the one-rescue budget) escapes it; confirm no
+  extra GET is spent on healthy frames.
 
 ### Experiments only — not the live protocol
 
@@ -143,6 +165,9 @@ upload tail is the bottleneck.
   uploads held the first frame **295 ms at the median and up to 759 ms**, before
   any frontier write or polling. Leave the frontier and pointer chain out of the
   live protocol.
+- **Broad M (N-way parallel ranges)** — modeled to help only on after-halfway
+  stalls; costs **18,000–54,000 units/min**; does not help first-block stalls.
+  Superseded by the bounded single suffix GET above.
 - **A. Speculative metadata racing** — prototype only. Saved ~300 ms on a hit,
   but a miss took **2.30 s** vs **1.40 s** today, and racing can dispatch two
   media GETs (~extra 200 units). Not worth the serial miss penalty.
@@ -158,37 +183,41 @@ upload tail is the bottleneck.
    logs: `discover`, `body`, `head-wait`, `blocked`, `first-block-wait`,
    `missing-block-*`, `upload-permit-wait`, `buffer-episode-age`). Capture a
    matched Twitch client+server window; classify each stall as writer-upload vs
-   metadata vs body vs head-behind-prefetch vs missing-block.
-1. **Run the three gating experiments** (B-saturated, D-narrowed, M-probe).
-   These decide whether L and/or M are worth building and set the frame size.
-2. **Build L** (two-lane scheduler) if B-saturated shows the head stuck behind
-   prefetch; **build M** (parallel ranges) if M-probe closes the block gap.
-3. **Build N** (read-ahead) if reader-side stalls dominate after L/M.
+   metadata vs body vs frame-prefetch-gate vs within-frame-block-gap.
+1. **Run the three gating experiments** (B-saturated, D-narrowed, M-probe
+   bounded). These decide whether bounded M is worth building and set the frame
+   size.
+2. **Keep L as-is** (reserved capacity, no prefetch cancellation) unless
+   B-saturated shows the gate itself is the problem.
+3. **Build bounded M** if M-probe shows a single optional suffix GET escapes a
+   late-after-halfway stall without spending extra GETs on healthy frames.
 4. Keep A and C as prototypes; keep the advisory hint as an experiment.
 
 ## Implementation tasks (conditional on the gating experiments)
 
-1. `drive.go`: split media GET admission into a reserved head lane + bulk
-   prefetch lane; head may take the next free permit without waiting on the
-   bulk queue.
-2. `drive.go`: allow N concurrent ranged GETs per progressive frame (bounded by
-   the existing head-range limit), delivering blocks in seq order.
-3. `slots.go` reader: add a K-frame read-ahead window that refills below a
-   target buffer depth, preserving ordered delivery.
-4. `slots_test.go` / `drive_stream_test.go`: saturated-prefetch head-lane test;
-   concurrent-range block-gap test; read-ahead ordering + checksum preservation.
-5. A `testing/synctest` benchmark with a simulated Drive (metadata 330 ms, body
-   880 ms, one injected 5 s slow block) asserting the head first-block and the
-   block gap shrink under L/M/N.
-6. `README.md`: document the scheduling changes, the gating experiments, and
-   the rejected frontier/A/C options with their measured costs.
+1. `drive.go`: add a **single optional suffix GET** for a head frame that is
+   making progress but projected to finish late, bounded by the existing
+   one-rescue budget; do not add broad N-way parallel ranges.
+2. `slots.go` / `slot_body_gate.go`: confirm the head-priority patch and
+   head/successor byte borrowing are retained; ensure queued work is prioritized
+   without canceling in-flight prefetch.
+3. `slots_test.go` / `drive_stream_test.go`: late-after-halfway suffix-GET
+   test; healthy-frame no-extra-GET test; ordered-bytes and checksum
+   preservation; prefetch-not-canceled test.
+4. A `testing/synctest` benchmark with a simulated Drive (metadata 330 ms, body
+   880 ms, one injected late-after-halfway block) asserting the within-frame gap
+   shrinks by ~the suffix GET, with no extra GET on healthy frames.
+5. `README.md`: document the retained L behavior, the bounded M suffix GET, the
+   gating experiments, and the rejected frontier / broad-M / A / C options with
+   their measured costs.
 
 ## Validation
 - `go test ./transport/internet/xdrive/...` (focused, within the command
   timeout).
 - The `synctest` benchmark above.
 - Mixed-version test: new client + old server and vice versa still round-trip
-  on the legacy path (L/M/N must be negotiation-safe or purely local).
+  on the legacy path (L is local; bounded M must be negotiation-safe or purely
+  local).
 
 ## Out of scope / honest limits
 - Cross-flow HOL (mux) — needs mux-layer changes.
@@ -197,4 +226,4 @@ upload tail is the bottleneck.
 - Eliminating inter-frame HOL — `net.Conn` ordered-stream contract.
 - A hard 2 s deadline — Drive tail latency (9 s+ stalls observed) cannot be
   bounded by xdrive; the best xdrive can do is shrink the median, keep the
-  buffer full, and recover faster.
+  buffer full, and recover a late frame faster.
