@@ -17,12 +17,19 @@ import (
 // Measurement only: nothing here changes what is sent, when, or how often.
 
 const (
-	// slotBurstGap is how long one direction of a session stays idle before
-	// its burst is summarized. The frames of a live segment follow each other
-	// more closely than this, while the request leg between two segments
-	// fetched one at a time (an upload, a discovery and the origin fetch) is
-	// longer, so such a segment is one burst on each peer.
-	slotBurstGap = 1500 * time.Millisecond
+	// slotBurstGap is how long one direction of a session goes without a
+	// segment-sized frame before its burst is summarized. A live segment's
+	// frames are cut within milliseconds of each other and delivered with
+	// gaps that the reader's idle rule covers (see slotReader.run), while
+	// segments of a 2 s stream fetched one at a time leave about 1 s between
+	// them.
+	slotBurstGap = 600 * time.Millisecond
+	// slotBurstMinFrame is the smallest frame that opens a burst or keeps it
+	// open. Smaller frames (requests, acknowledgements, other mux streams)
+	// arrive every few hundred milliseconds on a busy session and would
+	// otherwise keep one burst open for minutes; an open burst still counts
+	// them in frames and bytes.
+	slotBurstMinFrame = 8 << 10
 	// slotBurstSamples bounds the upload durations a burst keeps for its
 	// percentiles; a sustained transfer reports its first ones.
 	slotBurstSamples = 256
@@ -153,11 +160,12 @@ func (d downloadRecord) log(ctx context.Context) {
 }
 
 // slotLink lets the writer and the reader of one Conn time each other. On a
-// client, a read burst ending some time after the write burst that carried
-// the request gives request-to-last-byte on one clock.
+// client, a read burst ending some time after the last frame written before
+// it was found gives a lower bound of request-to-last-byte on one clock: with
+// mux, that frame may belong to another stream sent after the request.
 type slotLink struct {
 	mu         sync.Mutex
-	writeStart time.Time // first buffered byte of the last write burst
+	writeStart time.Time // first buffered byte of the last frame written
 	readLast   time.Time // last frame the reader delivered
 }
 
@@ -223,24 +231,31 @@ type slotWriteBurst struct {
 // add counts a frame cut at now from bytes buffered since bufferedAt. It
 // returns the previous burst when that one had been idle for slotBurstGap
 // before these bytes came, so that it is reported before this one begins.
+// Only a frame of at least slotBurstMinFrame opens a burst or holds it open.
 func (b *slotWriteBurst) add(seq int64, size int, bufferedAt, now time.Time, permitWait time.Duration, link *slotLink) *slotWriteBurst {
 	start := bufferedAt
 	if start.IsZero() || start.After(now) {
 		start = now
 	}
+	big := size >= slotBurstMinFrame
 	var done *slotWriteBurst
-	if b.open && b.pending == 0 && start.Sub(b.doneAt) >= slotBurstGap {
+	if big && b.open && b.pending == 0 && start.Sub(b.doneAt) >= slotBurstGap {
 		done = b.take()
 	}
-	if !b.open {
+	if !b.open && big {
 		*b = slotWriteBurst{open: true, startAt: start, firstSeq: seq, afterRead: -1}
 		if read := link.lastRead(); !read.IsZero() && !read.After(start) {
 			b.afterRead = start.Sub(read)
 		}
-		link.noteWrite(start)
+	}
+	link.noteWrite(start)
+	if !b.open {
+		return done
 	}
 	b.frames++
-	b.pending++
+	if big {
+		b.pending++
+	}
 	b.bytes += int64(size)
 	b.lastSeq = seq
 	b.lastCutAt = now
@@ -248,13 +263,19 @@ func (b *slotWriteBurst) add(seq int64, size int, bufferedAt, now time.Time, per
 	return done
 }
 
-// finish records the end of the upload of a frame of the open burst.
-func (b *slotWriteBurst) finish(mode byte, putAt time.Time, put, await time.Duration, ok bool, now time.Time) {
-	if !b.open || b.pending == 0 {
+// finish records the end of the upload of frame seq of size bytes; frames
+// cut before the open burst began are not its own.
+func (b *slotWriteBurst) finish(seq int64, size int, mode byte, putAt time.Time, put, await time.Duration, ok bool, now time.Time) {
+	if !b.open || seq < b.firstSeq || seq > b.lastSeq {
 		return
 	}
-	b.pending--
-	b.doneAt = now
+	if size >= slotBurstMinFrame {
+		if b.pending == 0 {
+			return
+		}
+		b.pending--
+		b.doneAt = now
+	}
 	b.awaitMax = max(b.awaitMax, await)
 	switch {
 	case !ok:
@@ -326,9 +347,15 @@ type slotReadBurst struct {
 }
 
 // add counts a frame delivered at now; foundAt is when its description was
-// found. Only an idle check closes a burst, see slotReader.run.
+// found. Only a frame of at least slotBurstMinFrame opens a burst or moves its
+// idle clock; only an idle check closes it, see slotReader.run.
 func (b *slotReadBurst) add(seq int64, mode byte, size int, foundAt time.Time, headWait, firstBlock, body time.Duration, now time.Time, link *slotLink) {
+	defer link.noteRead(now)
+	big := size >= slotBurstMinFrame
 	if !b.open {
+		if !big {
+			return
+		}
 		start := foundAt
 		if start.IsZero() || start.After(now) {
 			start = now
@@ -338,8 +365,10 @@ func (b *slotReadBurst) add(seq int64, mode byte, size int, foundAt time.Time, h
 			b.writeAt = write
 		}
 	}
-	b.gapMax = max(b.gapMax, now.Sub(b.lastAt))
-	b.lastAt = now
+	if big {
+		b.gapMax = max(b.gapMax, now.Sub(b.lastAt))
+		b.lastAt = now
+	}
 	b.lastSeq = seq
 	b.frames++
 	if mode == slotInline {
@@ -354,7 +383,6 @@ func (b *slotReadBurst) add(seq int64, mode byte, size int, foundAt time.Time, h
 	b.headWaitMax = max(b.headWaitMax, headWait)
 	b.firstBlockMax = max(b.firstBlockMax, firstBlock)
 	b.bodyMax = max(b.bodyMax, body)
-	link.noteRead(now)
 }
 
 func (b *slotReadBurst) idle(now time.Time) bool {

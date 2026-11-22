@@ -846,10 +846,13 @@ Measurement only; nothing here changes requests, timing or the wire. Both peers
 log, so matched client and server lines can be compared without clock offsets.
 
 - `xdrive burst write <watermark>` (info): one line per write burst, that is,
-  frames cut while the writer never sat idle (no upload in flight and nothing
-  buffered) for 1.5 s. A segment fetched one at a time is one burst on each
-  peer, because the request leg between segments is longer than that gap; with
-  mux, other streams of the session can share a burst. Fields: `seqs`,
+  frames cut while the writer never went 600 ms without a segment-sized frame
+  (at least 8 KiB) being uploaded or buffered. Smaller frames (requests,
+  acknowledgements, other mux streams) neither open a burst nor hold it open,
+  but an open burst counts them; before, they arrived every few hundred
+  milliseconds on a live session and kept one burst open for minutes, so no
+  line was logged. A segment fetched one at a time, even of a 2 s stream, is one
+  burst on each peer. Fields: `seqs`,
   `frames`/`inline`/`media`/`failed`, `bytes`, `span` (first buffered byte to the
   last upload finishing), `first-put` (first byte to the first upload leaving),
   `last-cut` (first byte to the last frame being cut, which shows when the
@@ -858,14 +861,17 @@ log, so matched client and server lines can be compared without clock offsets.
   over span) and `after-read` (time from this Conn's last delivered read frame
   to the first buffered byte, -1 if none; on the server this is the request
   handling and origin time).
-- `xdrive burst read <watermark>` (info): one line per read burst, closed once
-  nothing was delivered for 1.5 s while no later frame had been found and no
-  media body was being read. Fields: `span` (first frame found to last frame
-  delivered), `first-delivery`, `last-found`, `delivery-gap-max`,
-  `head-wait-max`, `first-block-wait-max`, `body-max`, `mbps` and `after-write`
-  (time from this Conn's last write burst beginning to the last delivery, -1 if
-  that write began after the read burst; on the client this is request to last
-  byte of the segment on one clock).
+- `xdrive burst read <watermark>` (info): one line per read burst, opened by a
+  frame of at least 8 KiB and closed once no such frame was delivered for
+  600 ms while no later frame had been found and no media body was being read.
+  Fields: `span` (first frame found to last segment-sized frame delivered),
+  `first-delivery`, `last-found`, `delivery-gap-max`, `head-wait-max`,
+  `first-block-wait-max`, `body-max`, `mbps` and `after-write` (time from the
+  last frame this Conn wrote before the burst was found to its last delivery,
+  -1 if none). On the client it is a lower bound of request to last byte: with
+  mux, the last frame written may belong to another stream sent after the
+  request. Matching sequence numbers of both peers' per-frame debug lines gives
+  the exact value.
 - `xdrive download` (debug): one line per media GET that returned headers:
   `seq`, `range`, `status`, `attempt`, `bytes`, `ttfb` (request written to first
   byte), `body` (headers to end of body), `dispatch-to-eof`, `mbps` (bytes over
@@ -904,12 +910,18 @@ was about 4 s per segment. Each has an escape hatch read once at startup.
   now hold two connections instead of one. When a session moves off a closed
   connection it takes an established one before dialing. A connection that
   answered nothing for 1.5 s after a request of at most 64 KiB went out, while
-  another connection answered meanwhile, takes no new requests; with two such
-  requests waiting 2.5 s it is closed and they are retried elsewhere (the HTTP/2
-  keepalive takes up to 4 s). A lone straggler is never closed this way.
+  another connection answered meanwhile, is probed with a HEAD to the service
+  host on that connection (no API quota; the front end answers it, not Drive).
+  If the probe gets no answer within 1 s the connection is closed and its
+  waiting requests are retried elsewhere, 2.5 s after the request went out (the
+  HTTP/2 keepalive takes up to 4 s); if it answers, the connection is kept.
+  The first version retired a connection on silence alone, after 1.5 s: Drive
+  takes 2-3.5 s for every request at once several times a minute, and that
+  rule retired 14 healthy connections on the server and 7 on the client in
+  2.5 minutes, each followed by a new dial.
   `XRAY_XDRIVE_SPARE_CONN=0` and `XRAY_XDRIVE_FAST_DEAD_CONN=0` turn these off.
-  Logs: `xdrive spare connection <n> ready` and `xdrive connection <n> silent`
-  (debug), `xdrive connection <n> answered nothing ... closing it` (info).
+  Logs: `xdrive spare connection <n> ready` and `xdrive connection <n> slow but
+  alive` (debug), `xdrive connection <n> answered nothing ... closing it` (info).
 - Drive upload copies, both peers. The copy of a straggling inline update waits
   until the update has run longer than the p95 of the last 32 successful ones,
   at least 1.2 s and at most 2.4 s; with fewer than 12 samples it stays 1.2 s.

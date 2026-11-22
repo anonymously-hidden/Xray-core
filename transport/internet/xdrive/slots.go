@@ -944,7 +944,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 				w.batch.hybrid = false
 			}
 		}
-		w.burst.finish(burstMode, burstPutAt, burstPut, burstAwait, burstOK, time.Now())
+		w.burst.finish(seq, len(chunk), burstMode, burstPutAt, burstPut, burstAwait, burstOK, time.Now())
 		w.releaseSlotLocked()
 		w.mu.Unlock()
 	}()
@@ -1529,9 +1529,9 @@ func (r *slotReader) run() {
 		r.bodies.close()
 	}()
 
-	// summary is the open read burst. It is logged once nothing was
-	// delivered for slotBurstGap while no later frame was found and no media
-	// body is being read.
+	// summary is the open read burst. It is logged once no segment-sized
+	// frame was delivered for slotBurstGap while no later frame was found and
+	// no media body is being read.
 	var summary slotReadBurst
 	idle := time.NewTimer(slotBurstGap)
 	idle.Stop()
@@ -1653,7 +1653,11 @@ func (r *slotReader) run() {
 			" enqueue-wait=", f.delivery.enqueueTotal, " enqueue-max=", f.delivery.enqueueMax,
 			" completion-after-blocks=", f.delivery.completionWait(f.readyAt), " slot=", slotTag(r.slotID(head)), " inline-prefix-bytes=", f.prefixBytes)
 		summary.add(head, f.mode, size, f.visibleAt, max(0, f.readyAt.Sub(f.headAt)), firstBlockWait, f.bodyTime, time.Now(), r.link)
-		idle.Reset(slotBurstGap)
+		if summary.open {
+			// due slotBurstGap after the last segment-sized frame: small
+			// frames between segments must not keep the burst open
+			idle.Reset(max(0, time.Until(summary.lastAt.Add(slotBurstGap))))
+		}
 		if next := fetches[head+1]; next != nil {
 			close(next.promoted)
 			if nf := fetches[head+1+slotReadAhead]; nf != nil {

@@ -541,14 +541,19 @@ const (
 	sparePoolConnections = 2
 
 	// Requests with at most deadConnSmallBody of body normally answer within a
-	// second. A connection that answered nothing deadConnSuspect after such a
-	// request went out, while another connection answered meanwhile, takes no
-	// new requests; with two such requests waiting deadConnConfirm, it is
-	// closed and they are retried elsewhere. The HTTP/2 keepalive takes up to
+	// second, but Drive itself sometimes takes 2-3.5 s for all of them at
+	// once, so silence alone does not tell a dead connection from a slow
+	// service. A connection that answered nothing deadConnSuspect after such a
+	// request went out, while another connection answered meanwhile, is
+	// probed with a HEAD to the service host on that same connection (one
+	// round trip, no API quota, not served by Drive). Only when the probe gets
+	// no answer within deadConnProbe is the connection closed, which fails
+	// its waiting requests so that they are retried elsewhere; a connection
+	// that answers the probe is left alone. The HTTP/2 keepalive takes up to
 	// 4 s (1.5 s idle, then a 2.5 s ping timeout).
 	deadConnSmallBody = 64 << 10
 	deadConnSuspect   = 1500 * time.Millisecond
-	deadConnConfirm   = 2500 * time.Millisecond
+	deadConnProbe     = time.Second
 )
 
 // connHeardAny is when any pool connection last received a response byte, in
@@ -697,15 +702,21 @@ type poolConn struct {
 	heardAt time.Time // last response headers or body bytes
 	waits   map[*connWait]struct{}
 	warming bool
+	probing bool
 	dead    bool
 }
 
 // connWait is a small request sent on a connection and not answered yet.
 type connWait struct {
-	wroteAt time.Time
-	timers  [2]*time.Timer
-	done    bool
+	wroteAt      time.Time
+	timer        *time.Timer
+	done         bool
+	scheme, host string // where a liveness probe for it goes
 }
+
+// connProbeKey marks the liveness probe of a connection, which is not itself
+// watched.
+type connProbeKey struct{}
 
 func (c *poolConn) heard() {
 	now := time.Now()
@@ -766,10 +777,11 @@ func (c *poolConn) warm(scheme, host string) {
 // watch has a small request's answer timed once it is written; see
 // deadConnSuspect.
 func (c *poolConn) watch(ctx context.Context, r *http.Request) (context.Context, *connWait) {
-	if !connDeadFast.Load() || r.ContentLength < 0 || r.ContentLength > deadConnSmallBody {
+	if !connDeadFast.Load() || r.ContentLength < 0 || r.ContentLength > deadConnSmallBody ||
+		r.URL == nil || r.URL.Host == "" || ctx.Value(connProbeKey{}) != nil {
 		return ctx, nil
 	}
-	w := new(connWait)
+	w := &connWait{scheme: r.URL.Scheme, host: r.URL.Host}
 	return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
 		if info.Err == nil {
 			c.wrote(w)
@@ -784,18 +796,16 @@ func (c *poolConn) wrote(w *connWait) {
 		return
 	}
 	w.wroteAt = time.Now()
-	if w.timers[0] != nil {
+	if w.timer != nil {
 		// written again, after the transport retried it
-		w.timers[0].Reset(deadConnSuspect)
-		w.timers[1].Reset(deadConnConfirm)
+		w.timer.Reset(deadConnSuspect)
 		return
 	}
 	if c.waits == nil {
 		c.waits = make(map[*connWait]struct{})
 	}
 	c.waits[w] = struct{}{}
-	w.timers[0] = time.AfterFunc(deadConnSuspect, func() { c.checkDead(false) })
-	w.timers[1] = time.AfterFunc(deadConnConfirm, func() { c.checkDead(true) })
+	w.timer = time.AfterFunc(deadConnSuspect, c.checkDead)
 }
 
 func (c *poolConn) unwatch(w *connWait) {
@@ -806,45 +816,82 @@ func (c *poolConn) unwatch(w *connWait) {
 	defer c.mu.Unlock()
 	w.done = true
 	delete(c.waits, w)
-	for _, t := range w.timers {
-		if t != nil {
-			t.Stop()
-		}
+	if w.timer != nil {
+		w.timer.Stop()
 	}
 }
 
-// checkDead retires a connection that answered nothing since its oldest
-// waiting small request went out deadConnSuspect ago, while another connection
-// answered meanwhile, so the path itself works. With confirm, two such
-// requests and deadConnConfirm, it also closes it, which fails the requests on
-// it so that they are retried on another connection.
-func (c *poolConn) checkDead(confirm bool) {
+// checkDead probes a connection that answered nothing since its oldest waiting
+// small request went out deadConnSuspect ago, while another connection
+// answered meanwhile, so the path itself works. See deadConnProbe.
+func (c *poolConn) checkDead() {
 	now := time.Now()
 	c.mu.Lock()
-	var oldest time.Time
+	var oldest *connWait
 	for w := range c.waits {
-		if oldest.IsZero() || w.wroteAt.Before(oldest) {
-			oldest = w.wroteAt
+		if oldest == nil || w.wroteAt.Before(oldest.wroteAt) {
+			oldest = w
 		}
 	}
+	probe := oldest != nil && now.Sub(oldest.wroteAt) >= deadConnSuspect && !c.heardAt.After(oldest.wroteAt) &&
+		connHeardAny.Load() > oldest.wroteAt.UnixNano() && !c.closing && !c.probing && !c.dead
+	var since time.Time
+	var scheme, host string
+	if probe {
+		c.probing = true
+		since, scheme, host = oldest.wroteAt, oldest.scheme, oldest.host
+	}
+	c.mu.Unlock()
+	if probe {
+		go c.probe(since, scheme, host)
+	}
+}
+
+// probe sends a HEAD to the service host on the connection. If it gets no
+// answer within deadConnProbe while requests written at or after since are
+// still unanswered, the connection is closed, which fails them so that they
+// are retried on another connection.
+func (c *poolConn) probe(since time.Time, scheme, host string) {
+	defer func() {
+		c.mu.Lock()
+		c.probing = false
+		c.mu.Unlock()
+	}()
+	if !c.acquire() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithValue(c.ctx, connProbeKey{}, true), deadConnProbe)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, scheme+"://"+host+"/", nil)
+	if err != nil {
+		c.done()
+		return
+	}
+	began := time.Now()
+	resp, err := c.roundTrip(req)
+	if err == nil {
+		resp.Body.Close()
+		c.mu.Lock()
+		waiting := len(c.waits)
+		c.mu.Unlock()
+		errors.LogDebug(context.Background(), "xdrive connection ", c.id, " slow but alive: probe answered in ",
+			time.Since(began), " with ", waiting, " requests waiting for ", time.Since(since))
+		return
+	}
+	if c.ctx.Err() != nil {
+		return // closed meanwhile
+	}
+	c.mu.Lock()
 	waiting := len(c.waits)
-	silent := waiting > 0 && now.Sub(oldest) >= deadConnSuspect && !c.heardAt.After(oldest) &&
-		connHeardAny.Load() > oldest.UnixNano()
-	drain := silent && !c.closing
-	kill := silent && confirm && !c.dead && waiting >= 2 && now.Sub(oldest) >= deadConnConfirm
+	kill := !c.dead && waiting > 0 && !c.heardAt.After(since)
 	if kill {
 		c.dead = true
 	}
 	c.mu.Unlock()
-	switch {
-	case kill:
-		errors.LogInfo(context.Background(), "xdrive connection ", c.id, " answered nothing for ", now.Sub(oldest),
-			" with ", waiting, " requests waiting while others answered; closing it")
+	if kill {
+		errors.LogInfo(context.Background(), "xdrive connection ", c.id, " answered nothing for ", time.Since(since),
+			" with ", waiting, " requests waiting while others answered, nor a probe in ", time.Since(began), "; closing it")
 		c.forceClose()
-	case drain:
-		errors.LogDebug(context.Background(), "xdrive connection ", c.id, " silent for ", now.Sub(oldest),
-			" with ", waiting, " requests waiting; no new requests on it")
-		c.Close()
 	}
 }
 

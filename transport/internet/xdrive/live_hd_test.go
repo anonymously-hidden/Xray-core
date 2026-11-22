@@ -236,12 +236,14 @@ func enableConnRecovery(t *testing.T) {
 }
 
 // fakeConns makes the connections of a pool from fake transports: those
-// numbered in dead never answer, the others answer at once. heads counts the
-// HEAD requests each connection received.
+// numbered in dead never answer, those in slow answer only HEAD requests (a
+// live connection to a slow service), the others answer at once. heads counts
+// the HEAD requests each connection received.
 type fakeConns struct {
 	mu    sync.Mutex
 	made  int
 	dead  map[int]bool
+	slow  map[int]bool
 	heads map[int]int
 	gets  map[int]int
 }
@@ -256,7 +258,7 @@ func (f *fakeConns) newClient(context.Context) *http.Client {
 			trace.WroteRequest(httptrace.WroteRequestInfo{})
 		}
 		f.mu.Lock()
-		dead := f.dead[index]
+		dead := f.dead[index] || f.slow[index] && r.Method != http.MethodHead
 		if r.Method == http.MethodHead {
 			f.heads[index]++
 		} else {
@@ -285,7 +287,7 @@ func (f *fakeConns) count() (made int, heads, gets map[int]int) {
 }
 
 func newFakeConns(dead ...int) *fakeConns {
-	f := &fakeConns{dead: make(map[int]bool), heads: make(map[int]int), gets: make(map[int]int)}
+	f := &fakeConns{dead: make(map[int]bool), slow: make(map[int]bool), heads: make(map[int]int), gets: make(map[int]int)}
 	for _, i := range dead {
 		f.dead[i] = true
 	}
@@ -309,26 +311,37 @@ func getOn(c *poolConn) (*http.Response, error) {
 	return c.roundTrip(req)
 }
 
-// F3. Two small requests wait on a connection that went silent while another
-// connection answers: it takes no new requests after 1.5 s and is closed after
-// 2.5 s, which fails the waiting requests so that they are retried elsewhere.
-// Before, they waited for the HTTP/2 keepalive (up to 4 s) or the stall timer.
-func TestSilentConnectionRetiredWhileAnotherAnswers(t *testing.T) {
+// B2. Small requests wait on a connection that went silent while another
+// connection answers. The connection is probed with a HEAD after 1.5 s: a dead
+// one gets no answer within 1 s and is closed, which fails the waiting
+// requests so that they are retried elsewhere; a live one whose requests are
+// merely slow (Drive took 2-3.5 s for every request at once several times a
+// minute) answers and is kept. Before, silence alone took a connection out of
+// service after 1.5 s, which retired 14 healthy connections in 2.5 minutes.
+func TestSilentConnectionClosedOnlyWhenProbeFails(t *testing.T) {
 	enableConnRecovery(t)
 	for _, tc := range []struct {
-		name           string
-		waiting        int
-		othersAnswer   bool
-		drained, ended bool
+		name          string
+		slow          bool // the connection answers HEADs, not the requests
+		waiting       int
+		othersAnswer  bool
+		probes        int
+		closed, ended bool
 	}{
-		{"dead", 2, true, true, true},
-		{"one straggler", 1, true, true, false},
-		{"path down", 2, false, false, false},
+		{"dead", false, 2, true, 1, true, true},
+		{"one request on a dead connection", false, 1, true, 1, true, true},
+		{"slow but alive", true, 2, true, 1, false, false},
+		{"path down", false, 2, false, 0, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				connHeardAny.Store(0)
-				fakes := newFakeConns(1)
+				fakes := newFakeConns()
+				if tc.slow {
+					fakes.slow[1] = true
+				} else {
+					fakes.dead[1] = true
+				}
 				pool := newConnPool(xmuxWithConnections(nil, 2), fakes.newClient)
 				defer pool.Close()
 				silent, alive := poolConnFor(pool), poolConnFor(pool)
@@ -355,18 +368,25 @@ func TestSilentConnectionRetiredWhileAnotherAnswers(t *testing.T) {
 					resp.Body.Close()
 				}
 				time.Sleep(deadConnSuspect + 100*time.Millisecond - time.Since(began))
-				if got := silent.IsClosed(); got != tc.drained {
-					t.Fatalf("at %v: drained=%v, want %v", time.Since(began), got, tc.drained)
+				if silent.IsClosed() {
+					t.Fatalf("at %v: closed before the probe could answer", time.Since(began))
 				}
-				time.Sleep(deadConnConfirm + 100*time.Millisecond - time.Since(began))
+				time.Sleep(deadConnSuspect + deadConnProbe + 100*time.Millisecond - time.Since(began))
 				synctest.Wait()
+				if got := silent.IsClosed(); got != tc.closed {
+					t.Fatalf("at %v: closed=%v, want %v", time.Since(began), got, tc.closed)
+				}
+				if _, heads, _ := fakes.count(); heads[1] != tc.probes {
+					t.Fatalf("%d probes on the silent connection, want %d", heads[1], tc.probes)
+				}
 				done := len(ended)
 				if (done == tc.waiting) != tc.ended || done != 0 && done != tc.waiting {
 					t.Fatalf("at %v: %d of %d waiting requests ended", time.Since(began), done, tc.waiting)
 				}
+				want := deadConnSuspect + deadConnProbe
 				for range done {
-					if at := <-ended; at < deadConnConfirm || at > deadConnConfirm+100*time.Millisecond {
-						t.Fatalf("a waiting request ended at %v, want %v", at, deadConnConfirm)
+					if at := <-ended; at < want || at > want+100*time.Millisecond {
+						t.Fatalf("a waiting request ended at %v, want %v", at, want)
 					}
 				}
 				silent.forceClose()
