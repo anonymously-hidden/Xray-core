@@ -1601,7 +1601,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 	}()
 	backoff := r.huntFloor
-	tailMisses, absentMisses := 0, 0
+	quietMisses := 0
 	_, drive := r.store.(throttleStore)
 	var goneSince, warnedAt, visibleSince, missingSince, failedSince time.Time
 	for {
@@ -1616,24 +1616,19 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		frame, ok := decodeSlot(description)
 		missing := err != nil || !ok || frame.seq != seq
-		if missing {
-			tailMisses = min(tailMisses+1, 3)
-		} else {
-			tailMisses = 0
-		}
 		notWritten := false
 		if err == errNotFound && r.lazy {
 			r.mu.Lock()
 			notWritten = !r.seen[int(seq%int64(len(r.table.Slots)))]
 			r.mu.Unlock()
 		}
-		// Count only consecutive clean absence. A 404 for a previously seen
-		// slot, another HTTP error, or an invalid description must not earn the
-		// longer quiet backoff. Other stores retain their existing schedule.
-		if drive && (notWritten || err == nil && description == "") {
-			absentMisses = min(absentMisses+1, 3)
+		// Require consecutive clean misses. Invalid descriptions and errors,
+		// including a 404 on a previously seen slot, do not count.
+		cleanMiss := notWritten || err == nil && (description == "" || ok && frame.seq < seq)
+		if drive && cleanMiss {
+			quietMisses = min(quietMisses+1, 3)
 		} else {
-			absentMisses = 0
+			quietMisses = 0
 		}
 		r.mu.Lock()
 		progressPastHead := r.head == seq && r.frontier > seq
@@ -1876,19 +1871,13 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 			// Back these off instead of spending quota on the same old frame;
 			// promotion/near admission still interrupts the wait immediately.
 			r.mu.Lock()
-			distant := seq > max(r.head, r.frontier)+slotReadAhead
+			// The scheduling window extends up to frontier+slotReadAhead.
+			// Only back off beyond both the near window and known peer progress.
+			distant := seq > r.head+slotReadAhead && seq > r.frontier
 			quietFrontier := time.Since(r.frontierAt) > r.eagerWindow
 			r.mu.Unlock()
-			if distant && tailMisses > 1 {
-				ceiling := r.tailMax
-				if tailMisses >= 3 && quietFrontier && (err == nil && ok && frame.seq < seq || absentMisses >= 3) {
-					// Writes can keep a session eager even when the peer has no
-					// new frames. Valid older laps and repeated clean Drive
-					// absence slow down; errors/invalid frames do not qualify.
-					// Head/near promotion still interrupts this wait.
-					ceiling = max(ceiling, slotTailQuietMax)
-				}
-				wait = min(wait*time.Duration(1<<(tailMisses-1)), ceiling)
+			if distant && quietFrontier && quietMisses >= 3 {
+				wait = min(4*wait, max(r.tailMax, slotTailQuietMax))
 				extended = wait > r.tailMax
 			}
 			select {
@@ -1909,8 +1898,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		}
 		// If the miss has already returned, the same evidence can advance
 		// the scheduled retry. Keep the original deadline on unrelated wakes.
-		if drive && !head && !idle && b == nil && !hunt.frontierProbe &&
-			(notWritten || err == nil && (description == "" || ok && frame.seq < seq)) {
+		if drive && !head && !idle && b == nil && !hunt.frontierProbe && cleanMiss {
 			changed, gap := r.gapProgress(seq, hunt.lastLaunch)
 			if changed != nil {
 				timer := time.NewTimer(wait)

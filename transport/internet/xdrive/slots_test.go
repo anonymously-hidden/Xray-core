@@ -2013,6 +2013,75 @@ func TestDriveSlotCleanMissWakesWhenLaterFrameArrives(t *testing.T) {
 	})
 }
 
+func TestDriveSlotSpeculativeTailBacksOffUntilNear(t *testing.T) {
+	driveClock(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		base := newMemSlots()
+		p := paramsFromConfig(&Config{Concurrency: 32, EagerWindowMs: 400})
+		ring, err := makeRing(ctx, base, "quiet-tail", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frontier := 1 + slotReadAhead // furthest slot in the initial window
+		target := frontier + slotReadAhead
+		put := func(seq int64) {
+			t.Helper()
+			frame := newSlotFrame(seq, slotInline, []byte{byte(seq)})
+			if err := base.setSlot(ctx, ring.Up.Slots[seq], frame.encode(), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		put(frontier)
+		var nearReads, farReads atomic.Int32
+		store := &frontierTestSlots{controlledSlots: &controlledSlots{memSlots: base, desc: func(ctx context.Context, id string) (string, error) {
+			switch id {
+			case ring.Up.Slots[2]:
+				nearReads.Add(1)
+			case ring.Up.Slots[target]:
+				farReads.Add(1)
+			}
+			return base.readDescription(ctx, id)
+		}}}
+		r := newSlotReader(ctx, store, ring.Up, p, []byte{0})
+		defer func() { cancel(); r.wait() }()
+		<-r.chunks()
+		// The sender's local writes keep the reader eager, while only one
+		// out-of-order peer description has become visible. run, rather
+		// than the test, must discover it and create the outer window.
+		for range 14 {
+			r.Wake()
+			time.Sleep(100 * time.Millisecond)
+		}
+		synctest.Wait()
+		if n := farReads.Load(); n != 3 || r.quietTailBackoffs.Load() == 0 || nearReads.Load() <= n {
+			t.Fatalf("quiet speculative reads=%d, near reads=%d, extended waits=%d",
+				n, nearReads.Load(), r.quietTailBackoffs.Load())
+		}
+
+		// Release the gap while the target is still sleeping. Entering
+		// the near window must interrupt the long wait and preserve order.
+		began := time.Now()
+		for seq := int64(1); seq <= target; seq++ {
+			put(seq)
+		}
+		r.Wake()
+		for seq := int64(1); seq <= target; seq++ {
+			select {
+			case got := <-r.chunks():
+				if !bytes.Equal(got, []byte{byte(seq)}) {
+					t.Fatalf("segment %d: got %v: %v", seq, got, r.Err())
+				}
+			case <-time.After(350 * time.Millisecond):
+				t.Fatalf("segment %d slept through promotion", seq)
+			}
+		}
+		if elapsed := time.Since(began); elapsed >= slotTailMax {
+			t.Fatalf("ordered delivery waited out the speculative tail delay: %v", elapsed)
+		}
+	})
+}
+
 type pressureAckStore struct {
 	*memSlots
 	inCooldown bool
