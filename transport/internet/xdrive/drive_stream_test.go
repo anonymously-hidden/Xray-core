@@ -3,6 +3,7 @@ package xdrive
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -831,6 +833,290 @@ func TestDriveStreamRetriesUnavailableSuffix(t *testing.T) {
 		})
 		if err != nil || calls != 3 || !bytes.Equal(delivered, data) {
 			t.Fatalf("suffix did not recover in order: %d requests, %d bytes, err=%v", calls, len(delivered), err)
+		}
+	})
+}
+
+// Only the experiment uses an envelope. Mode 5/6 bodies in production remain
+// raw payloads so existing peers and their range offsets are unchanged.
+func readDiscoveryExperimentHeader(body io.Reader, seq int64) (slotFrame, int, error) {
+	var header [slotHeaderLen]byte
+	if _, err := io.ReadFull(body, header[:]); err != nil {
+		return slotFrame{}, 0, err
+	}
+	size := binary.BigEndian.Uint32(header[17:21])
+	if size == 0 || size > slotDirectMediaMax || header[16] != slotStream ||
+		binary.BigEndian.Uint64(header[8:16]) != uint64(seq) {
+		return slotFrame{}, 0, fmt.Errorf("unexpected discovery envelope for sequence %d", seq)
+	}
+	raw := append(header[:], make([]byte, 4*((int(size)-1)/slotStreamBlockBytes+1))...)
+	if _, err := io.ReadFull(body, raw[slotHeaderLen:]); err != nil {
+		return slotFrame{}, 0, err
+	}
+	frame, ok := decodeSlotBytes(raw)
+	if !ok {
+		return slotFrame{}, 0, fmt.Errorf("invalid discovery envelope")
+	}
+	return frame, len(raw), nil
+}
+
+type discoveryExperimentBody struct{ *bytes.Reader }
+
+func (b discoveryExperimentBody) Read(p []byte) (int, error) {
+	if len(p) == driveStreamBlockBytes {
+		time.Sleep(12_500 * time.Microsecond)
+	}
+	return b.Reader.Read(p)
+}
+
+func TestDriveSingleGetDiscoveryExperiment(t *testing.T) {
+	const metadataRTT, mediaStartup = 300 * time.Millisecond, 900 * time.Millisecond
+	for _, tc := range []struct {
+		name            string
+		metadata, media int
+		first, full     time.Duration
+	}{
+		{"current", 1, 1, 1212500 * time.Microsecond, 1400 * time.Millisecond},
+		{"hit", 0, 1, 912500 * time.Microsecond, 1100 * time.Millisecond},
+		{"absent", 1, 2, 2112500 * time.Microsecond, 2300 * time.Millisecond},
+		{"stale", 1, 2, 2112500 * time.Microsecond, 2300 * time.Millisecond},
+		{"bad-table", 1, 2, 2112500 * time.Microsecond, 2300 * time.Millisecond},
+		{"interrupted", 0, 2, 912500 * time.Microsecond, 2012500 * time.Microsecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				data := driveStreamTestData(slotDirectMediaMax)
+				frame := driveStreamTestFrame(data)
+				envelope := appendStreamChecksums(frame.header(), frame.blocks)
+				wire := append(bytes.Clone(envelope), data...)
+				var metadata, media int
+				s := memoryDrive(roundTrip(func(req *http.Request) (*http.Response, error) {
+					if req.URL.Query().Get("alt") != "media" {
+						metadata++
+						time.Sleep(metadataRTT)
+						answer, err := json.Marshal(map[string]string{"description": frame.encode()})
+						if err != nil {
+							return nil, err
+						}
+						return memoryResponse(http.StatusOK, string(answer)), nil
+					}
+					media++
+					time.Sleep(mediaStartup)
+					status, contentRange := http.StatusOK, ""
+					payload, length := wire, len(wire)
+					switch {
+					case tc.name == "current":
+						payload, length = data, len(data)
+					case media == 1 && tc.name == "absent":
+						return memoryResponse(http.StatusNotFound, ""), nil
+					case media == 1 && tc.name == "stale":
+						payload = bytes.Clone(wire)
+						binary.BigEndian.PutUint64(payload[8:16], uint64(frame.seq-1))
+					case media == 1 && tc.name == "bad-table":
+						payload = bytes.Clone(wire)
+						payload[slotHeaderLen] ^= 1
+					case media == 1 && tc.name == "interrupted":
+						payload = wire[:len(envelope)+driveStreamBlockBytes]
+					case tc.name == "interrupted":
+						start := len(envelope) + driveStreamBlockBytes
+						mediaTestCheckRequest(t, req, start, len(wire))
+						status, contentRange = http.StatusPartialContent, fmt.Sprintf("bytes %d-%d/%d", start, len(wire)-1, len(wire))
+						payload, length = wire[start:], len(wire)-start
+					}
+					return driveStreamTestResponse(req, status, contentRange, int64(length),
+						io.NopCloser(discoveryExperimentBody{bytes.NewReader(payload)})), nil
+				}))
+				defer s.closeWork()
+
+				ctx := context.Background()
+				target := s.filesURL + "/item?alt=media&supportsAllDrives=true"
+				getMedia := func(byteRange string) (*http.Response, error) {
+					req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+					if err != nil {
+						return nil, err
+					}
+					req.Header.Set("Accept-Encoding", "identity")
+					if byteRange != "" {
+						req.Header.Set("Range", byteRange)
+					}
+					return s.client.Do(req)
+				}
+				started := time.Now()
+				var first time.Duration
+				var output []byte
+				emit := func(index int, block []byte) error {
+					if index*driveStreamBlockBytes != len(output) {
+						return fmt.Errorf("duplicate or out-of-order block %d", index)
+					}
+					if len(output) == 0 {
+						first = time.Since(started)
+					}
+					output = append(output, block...)
+					return nil
+				}
+				discover := func() slotFrame {
+					desc, err := s.readDescription(ctx, "item")
+					f, ok := decodeSlot(desc)
+					if err != nil || !ok || f.seq != frame.seq {
+						t.Fatalf("description: frame %v, error %v", ok, err)
+					}
+					return f
+				}
+				readEnvelope := func(response *http.Response, expected *slotFrame) (slotFrame, int, error) {
+					defer response.Body.Close()
+					if response.StatusCode != http.StatusOK {
+						return slotFrame{}, 0, fmt.Errorf("status %d", response.StatusCode)
+					}
+					f, length, err := readDiscoveryExperimentHeader(response.Body, frame.seq)
+					if err != nil {
+						return slotFrame{}, 0, err
+					}
+					if expected != nil && (f.size != expected.size || f.crc != expected.crc || !slices.Equal(f.blocks, expected.blocks)) ||
+						response.ContentLength != int64(length+f.size) {
+						return slotFrame{}, 0, fmt.Errorf("unexpected envelope length or checksum")
+					}
+					stream := &driveRangeStream{frame: f, emit: emit}
+					_, err = stream.read(driveMediaRequest{end: f.size, size: f.size},
+						http.StatusOK, "", int64(f.size), response.Body)
+					return f, length, err
+				}
+				if tc.name == "current" {
+					if err := s.readFrameStream(context.WithValue(ctx, progressiveMediaKey{}, true), "item", discover(), emit); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					response, err := getMedia("")
+					if err != nil {
+						t.Fatal(err)
+					}
+					f, header, err := readEnvelope(response, nil)
+					if err != nil && header == 0 {
+						if len(output) != 0 {
+							t.Fatal("unidentified bytes escaped discovery")
+						}
+						expected := discover()
+						response, err = getMedia("")
+						if err != nil {
+							t.Fatal(err)
+						}
+						_, _, err = readEnvelope(response, &expected)
+					} else if err != nil {
+						// Continue at the first unverified block. The HTTP range
+						// refers to the whole object; the stream validator
+						// refers to the payload after the envelope.
+						offset := len(output)
+						rescue, reqErr := getMedia(fmt.Sprintf("bytes=%d-%d", header+offset, header+f.size-1))
+						if reqErr != nil {
+							t.Fatal(reqErr)
+						}
+						defer rescue.Body.Close()
+						if rescue.StatusCode != http.StatusPartialContent ||
+							rescue.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", header+offset, header+f.size-1, header+f.size) {
+							t.Fatal("suffix refers to the wrong object range")
+						}
+						stream := &driveRangeStream{frame: f, emit: emit}
+						_, err = stream.read(driveMediaRequest{start: offset, end: f.size, size: f.size},
+							rescue.StatusCode, fmt.Sprintf("bytes %d-%d/%d", offset, f.size-1, f.size), rescue.ContentLength, rescue.Body)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				full := time.Since(started)
+				units := metadata*driveQuotaCost(kindHeadRead) + media*driveQuotaCost(kindBodyRead)
+				t.Logf("first=%s full=%s metadata=%d media=%d estimated-units=%d", first, full, metadata, media, units)
+				if !bytes.Equal(output, data) || metadata != tc.metadata || media != tc.media || first != tc.first || full != tc.full {
+					t.Fatal("unexpected bytes, cost or latency in the synthetic model")
+				}
+			})
+		})
+	}
+}
+
+func TestDriveProgressiveSupersededQueuedRescueCanRecoverNextGap(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		data := driveStreamTestData(3 * driveStreamBlockBytes)
+		frame := driveStreamTestFrame(data)
+		stream := newSlotStreamBuffer(frame)
+		ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+		ctx = context.WithValue(ctx, progressiveMediaKey{}, true)
+		ctx = context.WithValue(ctx, mediaDeliveryKey{}, stream.deliveryState)
+		releaseSecond := make(chan struct{})
+		var primary, rescue atomic.Int32
+		rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+			media := req.Context().Value(driveMediaKey{}).(*driveMediaRequest)
+			var body io.ReadCloser
+			if media.rescue {
+				rescue.Add(1)
+				mediaTestCheckRequest(t, req, 2*driveStreamBlockBytes, len(data))
+				body = io.NopCloser(bytes.NewReader(data[media.start:]))
+			} else {
+				primary.Add(1)
+				second := &driveStreamTestGatedBody{
+					ctx: req.Context(), data: data[driveStreamBlockBytes : 2*driveStreamBlockBytes],
+					release: releaseSecond, closed: make(chan struct{}),
+				}
+				last := &driveStreamTestGatedBody{
+					ctx: req.Context(), data: data[2*driveStreamBlockBytes:],
+					release: make(chan struct{}), closed: make(chan struct{}),
+				}
+				body = io.NopCloser(io.MultiReader(bytes.NewReader(data[:driveStreamBlockBytes]), second, last))
+			}
+			return driveStreamTestResponse(req, http.StatusPartialContent,
+				fmt.Sprintf("bytes %d-%d/%d", media.start, media.end-1, len(data)),
+				int64(media.end-media.start), body), nil
+		})
+		s := memoryDrive(rt)
+		s.mediaClients = []*http.Client{s.client}
+		s.bulkClient = &http.Client{Transport: rt}
+		s.mediaRescue = make(chan struct{}, 1)
+		s.mediaRescue <- struct{}{}
+		s.mediaHedgeTokens = 1
+		for range rangeLatencyMin {
+			s.mediaLatency[rangeClass(driveMediaRequest{end: len(data)})].note(500 * time.Millisecond)
+		}
+		done := make(chan error, 1)
+		go func() { done <- s.readFrameStream(ctx, "item", frame, stream.offer) }()
+		take := func(index int) {
+			for {
+				if block, _ := stream.take(); block != nil {
+					if !bytes.Equal(block, data[index*driveStreamBlockBytes:(index+1)*driveStreamBlockBytes]) {
+						t.Fatalf("incorrect ordered data for block %d", index)
+					}
+					return
+				}
+				select {
+				case <-stream.updates:
+				case <-time.After(3 * time.Second):
+					t.Fatalf("timed out waiting for block %d", index)
+				}
+			}
+		}
+		take(0)
+		stream.take() // Register the ordered wait on the second block.
+		synctest.Wait()
+		time.Sleep(mediaHedgeFloor)
+		synctest.Wait()
+		if rescue.Load() != 0 || s.mediaHedgeTokens != 0 {
+			t.Fatal("rescue did not wait for an occupied permit")
+		}
+		close(releaseSecond)
+		take(1)
+		stream.take() // Register the new ordered wait on the third block.
+		synctest.Wait()
+		<-s.mediaRescue
+		synctest.Wait()
+		if rescue.Load() != 0 || s.mediaHedgeTokens != 1 {
+			t.Fatal("superseded rescue dispatched or lost its token")
+		}
+		take(2)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if primary.Load() != 1 || rescue.Load() != 1 || s.mediaHedgeTokens != 0 {
+			t.Fatal("next gap did not recover with exactly one dispatched rescue")
 		}
 	})
 }

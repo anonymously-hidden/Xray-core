@@ -405,13 +405,13 @@ type slotWriter struct {
 	ackRetry     time.Duration
 	watermarkTTL time.Duration
 
-	// ackMu guards acked/ackedAt/progress/reading only; the watermark GET runs
-	// without the lock, single-flight, so other uploads never block on it.
-	ackMu    sync.Mutex
-	acked    int64
-	ackedAt  time.Time
-	progress time.Time
-	reading  bool
+	// The watermark GET runs without ackMu and is single-flight.
+	ackMu       sync.Mutex
+	acked       int64
+	ackedAt     time.Time
+	ackAdvanced chan struct{} // closed on an advance while reuse workers are waiting
+	progress    time.Time
+	reading     bool
 }
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
@@ -840,7 +840,8 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	prefetchAt := time.Now()
 	w.prefetchWatermark(seq)
 	began := time.Now()
-	if err := w.awaitPrevious(seq, prev); err != nil {
+	var reuse slotReuseWait
+	if err := w.awaitReuse(seq, prev, &reuse); err != nil {
 		result.err = err
 		w.fail(errors.New("failed to store segment ", seq).Base(err))
 		return
@@ -877,6 +878,7 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	}
 	errors.LogDebug(w.ctx, "xdrive write ", slotTag(w.table.Watermark), " seq=", seq, " bytes=", len(chunk),
 		" mode=", mode, " await=", awaited, " put=", put,
+		" await-previous-write=", reuse.previousWrite, " await-watermark=", reuse.watermark,
 		" buffer-episode-age=", bufferEpisodeAge, " upload-permit-wait=", permitWait,
 		" upload-queue=", queueWait, " prefetch-setup=", prefetchSetup,
 		" local-outstanding-bytes=", localOutstandingBytes, " buffer-bytes=", bufferBytes,
@@ -924,8 +926,8 @@ func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error
 
 // drained reports whether the reader took what the slot of seq held a lap
 // before. The watermark GET runs without ackMu and single-flight: only the
-// upload that triggers a read waits for it; the others use the cached value and
-// return false, and await() re-checks every slotAckRetry.
+// upload that triggers a read waits for it; other uploads use the cached value.
+// Waiters wake on an advance or recheck when the retry timer expires.
 func (w *slotWriter) drained(seq int64) (bool, error) {
 	before := seq - int64(len(w.table.Slots))
 	w.ackMu.Lock()
@@ -960,6 +962,10 @@ func (w *slotWriter) fetchWatermark() (int64, error) {
 	w.ackedAt = time.Now()
 	if err == nil && acked > w.acked {
 		w.acked, w.progress = acked, w.ackedAt
+		if w.ackAdvanced != nil {
+			close(w.ackAdvanced)
+			w.ackAdvanced = nil
+		}
 	}
 	w.ackMu.Unlock()
 	return acked, err
@@ -997,11 +1003,23 @@ func (w *slotWriter) await(seq int64) error {
 	return w.awaitPrevious(seq, prev)
 }
 
+func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
+	return w.awaitReuse(seq, prev, nil)
+}
+
+// Time until the worker observes each gate open, from the start of reuse
+// waiting. The two times overlap and must not be added together.
+type slotReuseWait struct {
+	previousWrite time.Duration
+	watermark     time.Duration
+}
+
 // Reuse needs both cumulative acknowledgement and completion of the previous
 // physical write, including when the acknowledgement arrives first.
-func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
+func (w *slotWriter) awaitReuse(seq int64, prev *slotWriteResult, timing *slotReuseWait) error {
 	start := time.Now()
 	wait := w.ackRetry
+	var observedWrite, observedAck bool
 	for {
 		w.mu.Lock()
 		failure, failed := w.err, w.failed
@@ -1012,6 +1030,7 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		if err := w.ctx.Err(); err != nil {
 			return err
 		}
+		var previousDone <-chan struct{}
 		completed := prev == nil
 		if prev != nil {
 			select {
@@ -1021,9 +1040,16 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 				}
 				completed = true
 			default:
+				previousDone = prev.done
 			}
 		}
+		if completed && timing != nil && !observedWrite {
+			timing.previousWrite, observedWrite = time.Since(start), true
+		}
 		ok, err := w.drained(seq)
+		if ok && timing != nil && !observedAck {
+			timing.watermark, observedAck = time.Since(start), true
+		}
 		if ok && completed {
 			return nil
 		}
@@ -1049,6 +1075,19 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		w.mu.Unlock()
 		w.ackMu.Lock()
 		still := time.Since(w.progress)
+		var ackAdvanced <-chan struct{}
+		if !ok && err == nil {
+			// Check again under the notification lock: a background GET may
+			// have advanced the watermark since drained returned.
+			if w.acked >= seq-int64(len(w.table.Slots)) {
+				w.ackMu.Unlock()
+				continue
+			}
+			if w.ackAdvanced == nil {
+				w.ackAdvanced = make(chan struct{})
+			}
+			ackAdvanced = w.ackAdvanced
+		}
 		w.ackMu.Unlock()
 		if !closed && !completed && time.Since(start) >= slotStallTimeout {
 			return errors.New("the previous write to slot ", w.slotID(seq), " did not complete").Base(err)
@@ -1066,6 +1105,8 @@ func (w *slotWriter) awaitPrevious(seq int64, prev *slotWriteResult) error {
 		case <-w.ctx.Done():
 			return w.ctx.Err()
 		case <-failed:
+		case <-previousDone:
+		case <-ackAdvanced:
 		case <-time.After(wait):
 		}
 	}
@@ -1966,14 +2007,19 @@ func (r *slotReader) headOverlapDelay() time.Duration {
 	return min(max(delay, max(4*r.huntCeiling, 100*time.Millisecond)), time.Second)
 }
 
+func (r *slotReader) quotaRecovery() bool {
+	s, ok := r.store.(interface {
+		cooling() bool
+		lastRateLimitAt() time.Time
+	})
+	return ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second)
+}
+
 // Drive already hedges individual slow metadata requests. During quota
 // recovery, overlapping three hunts multiplies attempts without helping
 // visibility; leave existing requests alone but admit only one new read.
 func (r *slotReader) descriptionBudget() int {
-	if s, ok := r.store.(interface {
-		cooling() bool
-		lastRateLimitAt() time.Time
-	}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
+	if r.quotaRecovery() {
 		return 1
 	}
 	return 3
@@ -2325,12 +2371,13 @@ func (r *slotReader) hold(ctx context.Context, d time.Duration, a, b <-chan stru
 	return true
 }
 
-// ackLoop writes the watermark when the head moves, the last head only if it
-// moved more than once meanwhile
+// ackLoop batches safe reuse credit, with an early flush if a Drive ring has
+// filled and there is already credit to return.
 func (r *slotReader) ackLoop() {
 	acked := int64(-1)
-	var oldest, failedSince, warnedAt time.Time
+	var oldest, failedSince, warnedAt, lastPressure time.Time
 	depth := int64(len(r.table.Slots))
+	_, drive := r.store.(throttleStore)
 	// Writes run one at a time and each takes most of a second: a larger
 	// batch holds back the writer's credit, a smaller one only keeps writes
 	// back to back and makes uploads, and so body reads, come in bursts.
@@ -2368,6 +2415,7 @@ func (r *slotReader) ackLoop() {
 		r.mu.Lock()
 		want := r.head - 1
 		idle := time.Since(r.activeAt) > r.eagerWindow
+		frontier, frontierChanged := r.frontier, r.frontierChanged
 		r.mu.Unlock()
 		if want > acked && oldest.IsZero() {
 			oldest = time.Now()
@@ -2375,8 +2423,20 @@ func (r *slotReader) ackLoop() {
 		if want <= acked {
 			oldest = time.Time{}
 		}
-		if want > acked && (want-acked >= batch || (!oldest.IsZero() && time.Since(oldest) >= r.ackDelay) || idle) {
+		ordinary := want > acked && (want-acked >= batch || time.Since(oldest) >= r.ackDelay || idle)
+		// Seeing the far end of the ring is evidence the sender may need
+		// credit. The acknowledged value is still head-1, never the frontier.
+		canAccelerate := drive && want > acked && !ordinary &&
+			time.Since(lastPressure) >= r.ackDelay && !r.quotaRecovery()
+		pressure := canAccelerate && frontier-acked >= depth
+		if ordinary || pressure {
+			if pressure {
+				lastPressure = time.Now()
+			}
 			if err := writeWM(want); err == nil {
+				if pressure {
+					errors.LogDebug(r.ctx, "xdrive pressure ack ", slotTag(r.table.Watermark), " previous=", acked, " through=", want, " frontier=", frontier)
+				}
 				acked, wait, oldest, failedSince = want, r.ackRetry, time.Time{}, time.Time{}
 			} else {
 				if r.ctx.Err() != nil {
@@ -2419,6 +2479,9 @@ func (r *slotReader) ackLoop() {
 			}
 		}
 		timer.Reset(next)
+		if !canAccelerate || pressure {
+			frontierChanged = nil
+		}
 		select {
 		case <-r.ctx.Done():
 			if want > acked {
@@ -2426,6 +2489,7 @@ func (r *slotReader) ackLoop() {
 			}
 			return
 		case <-r.acks:
+		case <-frontierChanged:
 		case <-timer.C:
 		}
 	}

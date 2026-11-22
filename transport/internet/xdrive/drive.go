@@ -3233,14 +3233,16 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 		}
 	}
 	type result struct {
-		body  []byte
-		err   error
-		hedge bool
+		body        []byte
+		err         error
+		hedge       bool
+		rearmRescue bool
 	}
 	results := make(chan result, 2)
 	launch := func(hedge bool) {
 		request := r
 		requestCtx := ctx
+		var outdated atomic.Bool
 		if hedge {
 			if r.progressive {
 				// Prefix blocks have already been verified and offered. The
@@ -3251,14 +3253,25 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			request.rescue = true
 			request.rescueSettled = new(atomic.Bool)
 			request.progress = nil
-			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, gate)
+			rescueGate := gate
+			if tracked && r.progressive {
+				rescueGate.remaining = func() (time.Duration, bool) {
+					remaining, eligible := gate.remaining()
+					if !eligible || remaining > 0 {
+						outdated.Store(true)
+					}
+					return remaining, eligible
+				}
+			}
+			requestCtx = context.WithValue(requestCtx, readHedgeGateKey{}, rescueGate)
 		} else {
 			requestCtx = context.WithValue(requestCtx, readProgressKey{}, primary)
 			requestCtx = context.WithValue(requestCtx, bodyProgressKey{}, primary.progress)
 		}
 		go func() {
 			status, body, err := s.do(context.WithValue(requestCtx, driveMediaKey{}, &request), http.MethodGet, target, "", nil)
-			if hedge && !request.rescueSettled.Swap(true) {
+			undispatched := hedge && !request.rescueSettled.Swap(true)
+			if undispatched {
 				s.returnMediaHedgeToken()
 			}
 			if err == nil {
@@ -3270,7 +3283,7 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 					err = errors.New("Drive media range answered ", status)
 				}
 			}
-			results <- result{body, err, hedge}
+			results <- result{body: body, err: err, hedge: hedge, rearmRescue: undispatched && outdated.Load()}
 		}()
 	}
 	launch(false)
@@ -3334,6 +3347,13 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 			}
 			if pending == 0 || isAuthError(res.err) {
 				return nil, res.err
+			}
+			if res.rearmRescue {
+				// The ordered reader no longer needed this queued rescue.
+				// Re-evaluate the current gap; only a dispatched rescue uses
+				// the frame's one recovery attempt.
+				hedged = false
+				armTracked()
 			}
 		case <-dispatched:
 			dispatched = nil

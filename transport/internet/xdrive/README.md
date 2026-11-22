@@ -155,8 +155,31 @@ its age is an upper bound, not exact per-byte residence time. Permit waits inclu
 reacquiring the writer mutex after a full upload window. Queue time measures
 assignment to worker entry; prefetch setup covers the synchronous preparation
 before reuse waiting starts, not the background watermark HTTP request duration.
+<!-- coderabbit-ai-generated:v1 -->
+
+<!-- coderabbit-ai-generated-section:v1:5d9aa8de359f722b1affdea01157cde9f4d34e286b8b2d8e3d10731a88815987 -->
+
 These durations can overlap and must not simply be
 added to infer end-to-end latency. They are logged only for successful writes.
+
+### Reuse when the ring fills
+
+The reuse fence still requires the previous write to finish and the reader to
+acknowledge that frame. Workers now wake when either condition changes, rather
+than waiting for the next local poll. The watermark GET cache and single-flight
+limit still apply.
+
+On Drive, seeing a full ring can flush already earned credit before the usual
+ACK batch or timer. The reader acknowledges through its completed delivery head,
+never through the furthest frame it has discovered. Pressure can trigger at most
+one early flush per ACK interval, and this path is skipped during quota recovery.
+
+Successful write logs include `await-previous-write` and `await-watermark`.
+Both are measured from the start of the worker's reuse wait to its observation
+of that gate opening. They can overlap. The pressure ACK log shows the previous
+watermark, the sequence it acknowledged through, and the discovery frontier.
+
+<!-- /coderabbit-ai-generated:v1 -->
 
 `local-outstanding-bytes` snapshots buffered plus assigned/incomplete upload bytes
 at assignment, including the selected frame. It is not remote unacknowledged data

@@ -2012,3 +2012,126 @@ func TestDriveSlotCleanMissWakesWhenLaterFrameArrives(t *testing.T) {
 		r.wait()
 	})
 }
+
+type pressureAckStore struct {
+	*memSlots
+	inCooldown bool
+}
+
+func (s pressureAckStore) throttled() int64           { return 0 }
+func (s pressureAckStore) cooling() bool              { return s.inCooldown }
+func (s pressureAckStore) lastRateLimitAt() time.Time { return time.Time{} }
+
+func TestSlotReaderPublishesSafeCreditWhenRingFills(t *testing.T) {
+	for _, cooldown := range []bool{false, true} {
+		t.Run(strconv.FormatBool(cooldown), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const depth = 64
+				ctx, cancel := context.WithCancel(context.Background())
+				store := pressureAckStore{newMemSlots(), cooldown}
+				wm, err := store.makeSlot(ctx, "wm")
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := &slotReader{
+					ctx: ctx, store: store, table: slotTable{Slots: make([]string, depth), Watermark: wm},
+					params: params{eagerWindow: 10 * time.Second}, head: 1, frontier: -1,
+					activeAt: time.Now(), frontierChanged: make(chan struct{}), acks: make(chan struct{}, 1),
+					ackRetry: slotAckRetry, ackDelay: ackDelay,
+				}
+				stopped := make(chan struct{})
+				go func() { defer close(stopped); r.ackLoop() }()
+				defer func() { cancel(); <-stopped }()
+				assertWM := func(want string) {
+					t.Helper()
+					synctest.Wait()
+					if got, err := store.readDescription(ctx, wm); err != nil || got != want {
+						t.Fatalf("watermark=%q, want %q (err=%v)", got, want, err)
+					}
+				}
+				r.reach(depth - 2)
+				assertWM("")
+				time.Sleep(100 * time.Millisecond)
+				r.reach(depth - 1)
+				if cooldown {
+					assertWM("")
+					time.Sleep(ackDelay - 100*time.Millisecond)
+					assertWM("0")
+					return
+				}
+				assertWM("0")
+
+				// Another lap position is visible but the same pressure episode must
+				// not cause one early ACK per frame. Only safe credit can be returned.
+				r.mu.Lock()
+				r.head++
+				r.mu.Unlock()
+				r.acks <- struct{}{}
+				r.reach(depth)
+				assertWM("0")
+				time.Sleep(ackDelay)
+				assertWM("1")
+			})
+		})
+	}
+}
+
+func TestSlotWriterWakesOnLastReuseGate(t *testing.T) {
+	for _, last := range []string{"previous upload", "watermark"} {
+		t.Run(last, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				store := &controlledSlots{memSlots: newMemSlots(), desc: func(context.Context, string) (string, error) { return "0", nil }}
+				w := &slotWriter{
+					ctx: ctx, store: store, table: slotTable{Slots: []string{"slot"}, Watermark: "wm"},
+					acked: -1, progress: time.Now(), ackRetry: time.Second,
+					reading: true, // an existing single-flight refresh
+				}
+				prev := &slotWriteResult{done: make(chan struct{})}
+				fetch := func() {
+					t.Helper()
+					if _, err := w.fetchWatermark(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if last == "watermark" {
+					close(prev.done)
+				} else {
+					fetch()
+				}
+				done := make(chan error, 1)
+				var timing slotReuseWait
+				go func() { done <- w.awaitReuse(1, prev, &timing) }()
+				time.Sleep(100 * time.Millisecond)
+				synctest.Wait()
+				select {
+				case <-done:
+					t.Fatal("reuse began before both gates opened")
+				default:
+				}
+				if last == "watermark" {
+					fetch()
+				} else {
+					close(prev.done)
+				}
+				synctest.Wait()
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				default:
+					t.Fatal("reuse slept until the polling timer after both gates opened")
+				}
+				want := slotReuseWait{previousWrite: 100 * time.Millisecond}
+				if last == "watermark" {
+					want = slotReuseWait{watermark: 100 * time.Millisecond}
+				}
+				if timing != want {
+					t.Fatalf("wrong observed reuse timing: %+v, want %+v", timing, want)
+				}
+			})
+		})
+	}
+}
