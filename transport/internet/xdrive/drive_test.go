@@ -2205,6 +2205,102 @@ func TestDriveMediaRangePoolLeavesSlotPermitsFree(t *testing.T) {
 	})
 }
 
+func TestDriveMediaPrefetchLeavesRoomForOrderedHead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		releaseHead := make(chan struct{})
+		const tailLimit = driveMediaInflight - driveMediaLanes
+		const promotedSeq = int64(driveMediaInflight)
+		const canceledSeq = promotedSeq + 1
+		dispatched := make(chan int64, driveMediaInflight+2)
+		s := memoryDrive(roundTrip(func(r *http.Request) (*http.Response, error) {
+			seq := r.Context().Value(driveMediaKey{}).(*driveMediaRequest).seq
+			dispatched <- seq
+			if seq == tailLimit {
+				select {
+				case <-releaseHead:
+					return memoryResponse(http.StatusOK, "x"), nil
+				case <-r.Context().Done():
+				}
+			} else {
+				<-r.Context().Done()
+			}
+			return nil, r.Context().Err()
+		}))
+		defer s.closeWork()
+		s.mediaRanges = make(chan struct{}, driveMediaInflight)
+		s.mediaPrefetch = make(chan struct{}, tailLimit)
+		start := func(ctx context.Context, seq int64) <-chan error {
+			done := make(chan error, 1)
+			go func() {
+				ctx = context.WithValue(ctx, driveMediaKey{}, &driveMediaRequest{start: 0, end: 1, size: 1, seq: seq})
+				_, _, err := s.do(ctx, http.MethodGet, s.filesURL+"?alt=media", "", nil)
+				done <- err
+			}()
+			return done
+		}
+		for seq := range int64(tailLimit) {
+			start(ctx, seq)
+		}
+		synctest.Wait()
+		if len(dispatched) != tailLimit {
+			t.Fatalf("normal prefetch dispatched %d requests, want %d", len(dispatched), tailLimit)
+		}
+		for range tailLimit {
+			<-dispatched
+		}
+		promoted := make(chan struct{})
+		start(context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(promoted)), promotedSeq)
+		tailCtx, cancelTail := context.WithCancel(ctx)
+		defer cancelTail()
+		canceled := start(tailCtx, canceledSeq)
+		synctest.Wait()
+		if len(dispatched) != 0 {
+			t.Fatal("more prefetch dispatched while the head's capacity was reserved")
+		}
+
+		head := context.WithValue(ctx, mediaHeadKey{}, true)
+		for seq := int64(tailLimit); seq < driveMediaInflight; seq++ {
+			start(head, seq)
+		}
+		synctest.Wait()
+		if len(dispatched) != driveMediaLanes || len(s.mediaRanges) != driveMediaInflight {
+			t.Fatal("head ranges failed to fill the existing pool despite queued prefetch")
+		}
+		for range driveMediaLanes {
+			if seq := <-dispatched; seq < tailLimit || seq >= driveMediaInflight {
+				t.Fatalf("queued prefetch dispatched instead of head range, seq=%d", seq)
+			}
+		}
+		close(promoted)
+		synctest.Wait()
+		if len(dispatched) != 0 {
+			t.Fatal("promotion bypassed the shared limit")
+		}
+		close(releaseHead)
+		synctest.Wait()
+		select {
+		case seq := <-dispatched:
+			if seq != promotedSeq {
+				t.Fatalf("next permit went to seq=%d, want promoted seq=%d", seq, promotedSeq)
+			}
+		default:
+			t.Fatal("promoted request still waited on prefetch after a shared permit opened")
+		}
+
+		cancelTail()
+		if err := <-canceled; err != context.Canceled {
+			t.Fatalf("canceling queued prefetch returned %v", err)
+		}
+		cancel()
+		synctest.Wait()
+		if len(s.mediaRanges) != 0 || len(s.mediaPrefetch) != 0 || len(dispatched) != 0 {
+			t.Fatal("shutdown leaked a permit or dispatched the canceled prefetch")
+		}
+	})
+}
+
 // Media range tests.
 
 type mediaTestResult struct {

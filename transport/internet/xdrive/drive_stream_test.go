@@ -1120,3 +1120,84 @@ func TestDriveProgressiveSupersededQueuedRescueCanRecoverNextGap(t *testing.T) {
 		}
 	})
 }
+
+func TestProgressivePaceRescue(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		period, history time.Duration
+		wantRescue      bool
+	}{
+		{"slow", 160 * time.Millisecond, time.Second, true},
+		{"healthy", 60 * time.Millisecond, time.Second, false},
+		{"cold", 160 * time.Millisecond, 0, false},
+		{"no likely gain", 160 * time.Millisecond, 1800 * time.Millisecond, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				data := driveStreamTestData(slotDirectMediaMax)
+				frame := driveStreamTestFrame(data)
+				stream := newSlotStreamBuffer(frame)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ctx = context.WithValue(ctx, mediaHeadKey{}, true)
+				ctx = context.WithValue(ctx, progressiveMediaKey{}, true)
+				ctx = context.WithValue(ctx, mediaDeliveryKey{}, stream.deliveryState)
+				var primary, rescue atomic.Int32
+				rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+					m := req.Context().Value(driveMediaKey{}).(*driveMediaRequest)
+					part := bytes.NewReader(data[m.start:m.end])
+					var body io.Reader = part
+					if m.rescue {
+						rescue.Add(1)
+						mediaTestCheckRequest(t, req, 4*driveStreamBlockBytes, len(data))
+						if err := batchTestWait(req.Context(), time.Second); err != nil {
+							return nil, err
+						}
+					} else {
+						primary.Add(1)
+						body = cadenceBody{req.Context(), part, tc.period}
+					}
+					return driveStreamTestResponse(req, http.StatusPartialContent,
+						fmt.Sprintf("bytes %d-%d/%d", m.start, m.end-1, m.size), int64(m.end-m.start), io.NopCloser(body)), nil
+				})
+				s := memoryDrive(rt)
+				s.mediaClients = []*http.Client{s.client}
+				s.bulkClient = &http.Client{Transport: rt}
+				s.mediaHedgeTokens = 1
+				if tc.history != 0 {
+					for range rangeLatencyMin {
+						s.observeMediaLatency(&driveMediaRequest{end: len(data), size: len(data), progressive: true}, timingSample{hasDispatch: true, dispatch: tc.history}, http.StatusPartialContent, 0, false, nil)
+					}
+				}
+				begin := time.Now()
+				done := make(chan error, 1)
+				go func() { done <- s.readFrameStream(ctx, "item", frame, stream.offer) }()
+				var out []byte
+				for len(out) < len(data) {
+					b, _ := stream.take()
+					if b != nil {
+						out = append(out, b...)
+						continue
+					}
+					select {
+					case <-stream.updates:
+					case <-time.After(4 * time.Second):
+						t.Fatal("missing block")
+					}
+				}
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+				wantTime := time.Duration(len(frame.blocks)) * tc.period
+				wantGets := int32(0)
+				if tc.wantRescue {
+					wantGets = 1
+					wantTime = 4*tc.period + time.Second
+				}
+				if !bytes.Equal(out, data) || primary.Load() != 1 || rescue.Load() != wantGets || time.Since(begin) != wantTime {
+					t.Fatalf("bytes=%d primary=%d rescue=%d elapsed=%v want=%v", len(out), primary.Load(), rescue.Load(), time.Since(begin), wantTime)
+				}
+			})
+		})
+	}
+}

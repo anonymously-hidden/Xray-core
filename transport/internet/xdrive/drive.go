@@ -197,6 +197,7 @@ type driveStorage struct {
 	*driveShared
 	streamCaps       atomic.Pointer[driveStreamCaps]
 	streamHeadRanges int
+	progressiveFull  rangeLatency // comparable clean near-512 KiB GET durations in this session
 	// Clients and permits are session-local.
 	client         *http.Client
 	priorityClient *http.Client
@@ -207,6 +208,7 @@ type driveStorage struct {
 	readRescue     chan struct{}
 	mediaRescue    chan struct{}
 	mediaRanges    chan struct{}
+	mediaPrefetch  chan struct{}
 	release        func()
 
 	readHedge       time.Duration
@@ -353,6 +355,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		readRescue:       make(chan struct{}, 1),
 		mediaRescue:      make(chan struct{}, driveMediaLanes),
 		mediaRanges:      make(chan struct{}, driveMediaInflight),
+		mediaPrefetch:    make(chan struct{}, driveMediaInflight-driveMediaLanes),
 		readHedge:        slotReadHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
@@ -384,6 +387,7 @@ func (s *driveStorage) session() Storage {
 		readRescue:       make(chan struct{}, 1),
 		mediaRescue:      make(chan struct{}, driveMediaLanes),
 		mediaRanges:      make(chan struct{}, driveMediaInflight),
+		mediaPrefetch:    make(chan struct{}, driveMediaInflight-driveMediaLanes),
 		readHedge:        s.readHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
@@ -857,19 +861,38 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 				return 0, nil, ctx.Err()
 			}
 		}
-		select {
-		case pool <- struct{}{}:
-		case <-ctx.Done():
+		var prefetchPermit chan struct{}
+		releaseAdmission := func() {
+			if prefetchPermit != nil {
+				<-prefetchPermit
+			}
 			if cleanupPool != nil {
 				<-cleanupPool
 			}
+		}
+		// Keep enough space for every range of the ordered head. Prefetch
+		// still uses the shared pool, and a promoted waiter can enter it
+		// without waiting for an unrelated prefetch to finish.
+		if media != nil && !media.rescue && s.mediaPrefetch != nil && !mediaHead(ctx) {
+			promoted, _ := ctx.Value(mediaPromotionKey{}).(<-chan struct{})
+			select {
+			case s.mediaPrefetch <- struct{}{}:
+				prefetchPermit = s.mediaPrefetch
+			case <-promoted:
+			case <-ctx.Done():
+				releaseAdmission()
+				return 0, nil, ctx.Err()
+			}
+		}
+		select {
+		case pool <- struct{}{}:
+		case <-ctx.Done():
+			releaseAdmission()
 			return 0, nil, ctx.Err()
 		}
 		releasePermit := func() {
 			<-pool
-			if cleanupPool != nil {
-				<-cleanupPool
-			}
+			releaseAdmission()
 		}
 		waitPoolDur := time.Since(poolStart)
 		coolStart = time.Now()
@@ -3045,17 +3068,21 @@ type driveMediaRequest struct {
 }
 
 type driveRangeProgress struct {
-	mu         sync.Mutex
-	next       int
-	verifiedAt time.Time
-	previousAt time.Time
-	firstAt    time.Time
+	mu                 sync.Mutex
+	next               int
+	verifiedAt         time.Time
+	previousAt         time.Time
+	twoBack, threeBack time.Time
+	paceEnd            int
+	paceCost           time.Duration
+	firstAt            time.Time
 }
 
 func (p *driveRangeProgress) verified(start, end int) {
 	p.mu.Lock()
 	if start == p.next {
 		p.next = end
+		p.threeBack, p.twoBack = p.twoBack, p.previousAt
 		p.previousAt, p.verifiedAt = p.verifiedAt, time.Now()
 		if p.firstAt.IsZero() {
 			p.firstAt = p.verifiedAt
@@ -3074,7 +3101,7 @@ func (p *driveRangeProgress) firstBlockLatency(dispatchAt time.Time) time.Durati
 }
 
 // Startup, first inter-block wait, and steady delivery have separate clocks.
-func (p *driveRangeProgress) remaining(primary *driveReadProgress, startup, delay time.Duration) (time.Duration, bool) {
+func (p *driveRangeProgress) remaining(primary *driveReadProgress, startup, delay time.Duration, required int) (time.Duration, bool) {
 	primary.mu.Lock()
 	defer primary.mu.Unlock()
 	p.mu.Lock()
@@ -3087,6 +3114,17 @@ func (p *driveRangeProgress) remaining(primary *driveReadProgress, startup, dela
 	}
 	if !p.previousAt.IsZero() && !p.previousAt.Before(primary.dispatchAt) {
 		delay = min(delay, max(mediaHedgeFloor, 2*min(p.verifiedAt.Sub(p.previousAt), delay)))
+	}
+	// Use the fastest of three verified intervals from this dispatch: one
+	// late block alone is not evidence of sustained slow delivery. Compare
+	// the remaining work to a whole alternate GET, including its startup.
+	if p.paceCost > 0 && required == p.next && p.next < p.paceEnd && !p.threeBack.Before(primary.dispatchAt) {
+		blocks := (p.paceEnd - p.next + driveStreamBlockBytes - 1) / driveStreamBlockBytes
+		step := min(p.verifiedAt.Sub(p.previousAt), p.previousAt.Sub(p.twoBack), p.twoBack.Sub(p.threeBack))
+		left := time.Duration(blocks) * step
+		if left > p.paceCost && p.verifiedAt.Sub(primary.dispatchAt)+left > 2*time.Second {
+			return 0, true
+		}
 	}
 	return delay - time.Since(p.verifiedAt), true
 }
@@ -3191,8 +3229,8 @@ func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r d
 	}
 	if r.progressive {
 		// A healthy paced download may outlive its initial dispatch threshold.
-		// Rescue only after verified data, not just wire activity, stops.
-		remaining, active := r.progress.remaining(primary, startup, delay)
+		// Evaluate stalls and sustained slow progress using verified blocks.
+		remaining, active := r.progress.remaining(primary, startup, delay, next)
 		return remaining, active, changed
 	}
 	remaining, active := primary.remainingSinceDispatch(delay)
@@ -3210,6 +3248,12 @@ func (s *driveStorage) readMediaRange(ctx context.Context, target string, r driv
 	primary := &driveReadProgress{dispatched: make(chan struct{})}
 	delivery, tracked := ctx.Value(mediaDeliveryKey{}).(func() (int, <-chan struct{}, time.Time))
 	tracked = tracked && delivery != nil && r.stream != nil && r.stream.frame.mode == slotStream
+	if tracked && comparableProgressive(r) {
+		if median, warm := s.progressiveFull.median(); warm && median <= 2*time.Second {
+			r.progress.paceEnd = r.end
+			r.progress.paceCost = max(mediaHedgeFloor, median+median/2)
+		}
+	}
 	if tracked && r.progressive {
 		primary.retrying = make(chan struct{}, 1)
 	}
@@ -3856,6 +3900,11 @@ func mediaDelayFromMedian(median time.Duration) time.Duration {
 	return min(max(median*13/10, mediaHedgeFloor), slotBodyHedge)
 }
 
+func comparableProgressive(r driveMediaRequest) bool {
+	return r.progressive && r.start == 0 && r.end == r.size &&
+		r.size >= slotDirectMediaMax-slotStreamPrefixBytes && r.size <= slotDirectMediaMax
+}
+
 func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSample, status, attempt int, replayed bool, err error) {
 	if r == nil || r.rescue || attempt != 0 || replayed || err != nil || !sample.hasDispatch ||
 		(status != http.StatusOK && status != http.StatusPartialContent) {
@@ -3865,6 +3914,9 @@ func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSa
 	s.mediaLatency[class].note(sample.dispatch)
 	if r.progressive {
 		s.mediaStartup[class].note(sample.firstVerified)
+		if comparableProgressive(*r) {
+			s.progressiveFull.note(sample.dispatch)
+		}
 	}
 }
 

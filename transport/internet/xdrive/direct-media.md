@@ -1,6 +1,6 @@
 <!-- coderabbit-ai-generated:v1 -->
 
-<!-- coderabbit-ai-generated-section:v1:20d3834609de25508b5de0342545450bee5e6b23460cc27c576a939bbace114d -->
+<!-- coderabbit-ai-generated-section:v1:18f71d044da84f58fe4ec61626e7003ff44bfc7c1605b80e3387b79c34e47daf -->
 
 # Progressive media delivery
 
@@ -25,6 +25,15 @@ budget. Waiting for dispatch or retry backoff does not start a recovery clock.
 The slot still cannot be reused until the transfer
 passes the response length and EOF checks and all verified data is queued.
 
+For frames near 512 KiB the ordered reader also checks for sustained slow
+delivery. After four verified blocks on one dispatch, it projects the remaining
+time using the fastest of the last three block intervals. The same single
+alternate GET is eligible if the projected finish is past two seconds from
+dispatch and the remaining work exceeds both 900 ms and 1.5 times the session's
+median full download time for comparable frames. This needs at least 12 timing
+samples and a median no greater than two seconds. It is a local scheduling
+decision, not a browser segment deadline.
+
 Both peers need the new version and a fresh connection for the new default.
 A release that only understands direct media continues to use mode 7 with a
 new peer. Mode 7 still verifies the complete object before delivering it and
@@ -38,6 +47,5 @@ frame. It does not change the measured cadence of completed frames or the
 polling limits. Drive upload and visibility delays, shared throttling, and
 ordered delivery across frames can still create gaps. Compare browser segment
 timings, the reader's block waits, and actual Drive requests.
-
 
 <!-- /coderabbit-ai-generated:v1 -->
