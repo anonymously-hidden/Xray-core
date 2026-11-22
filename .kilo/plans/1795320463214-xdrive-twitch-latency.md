@@ -1,229 +1,179 @@
-# XDrive Twitch segment latency — honest assessment + plan
+# XDrive Twitch segment latency — exhaustive overhaul revalidation
 
 ## Goal
 Deliver a Twitch HLS segment (~2 s of video) through xdrive-over-Google-Drive
-without adding head-of-line blocking or per-request latency. Everything below is
+without exceeding the player's per-segment buffer budget. Everything below is
 confined to `transport/internet/xdrive/**`.
 
 ## Scope
-- In scope: `transport/internet/xdrive/**` only (transport, slots, streaming,
-  drive backend, batching/latency windows, tests).
-- Out of scope (confirmed with user): Xray mux/carrier flow isolation, routing,
-  any config or code outside the xdrive folder.
+- In scope: `transport/internet/xdrive/**` only.
+- Out of scope: Xray mux/carrier flow isolation, routing, any code outside the
+  xdrive folder. Cross-flow HOL cannot be fixed here.
 
-## Honest verdict (read this first)
+## Method
+Read every non-test Go file in the package line-by-line (`slots.go`,
+`slot_stream.go`, `slot_stream_reader.go`, `slot_body_gate.go`,
+`slot_batch_window.go`, `slot_latency_window.go`, `drive.go`, `client.go`,
+`xdrive.go`, `conn.go`, `storage.go`, `params.go`) plus `README.md`. Built the
+full candidate list first, then revalidated each item against the code. Every
+verdict below cites the code that decides it.
 
-1. **There is no "uniform packet method" that both avoids HOL and minimizes
-   latency.** The inline/media split is Pareto-optimal:
-   - **All-inline** — impossible past the 14 KiB inline cap. A 512 KiB burst
-     becomes ~37 frames; the package's own Twitch capture shows nine ~512 KiB
-     inline bursts occupying **332 ring slots**, with reuse waits up to
-     **3.67 s** and a **4.58 s** publication. More inline packets = *more* HOL
-     and quota, not less.
-   - **All-media** — every tiny control frame pays the full ~2.2 s media
-     round-trip instead of ~330 ms; browsing/control latency collapses.
-   - **Uniform small frames** — request-count and ring-occupancy explosion;
-     the ~880 ms media first-block cost is latency-bound, not size-bound, so
-     per-frame latency does not drop.
-   Uniformity only trades one latency for another. The current adaptive
-   inline/stream split is the local optimum.
+## What the code actually bounds (steady state)
+- Writer: one multipart create/PATCH per frame; upload ≈ 1.36 s per 512 KiB.
+- Reader: `readDescription` (metadata GET ≈ 330 ms) + `readFrameStream` (body
+  GET ≈ 880 ms to first block). Description reads are prefetched
+  `slotReadAhead = 11` frames ahead (`slots.go:73`, `1410–1418`) and the head's
+  description is overlapped (`slots.go:310`, `2080`).
+- Per-frame steady state = `max(1.36 s, ~1.21 s) = 1.36 s`; the reader is
+  **writer-bound**. The metadata read is hidden inside the upload.
+- Therefore no reader-side or wire-format change reduces the steady-state
+  floor. The only remaining levers are the **tail**: first-block wait and
+  within-frame block gap.
 
-2. **The ordered byte stream is a hard contract.** Frame `N+1` cannot be
-   delivered before frame `N` (`slotReader.run()` delivers `head` then
-   increments; `Conn.Read` is an ordered `net.Conn`). Inter-frame HOL is
-   structural and cannot be removed inside xdrive without breaking the
-   transport contract. Intra-frame HOL is already solved by mode 5/6 streaming
-   (32 KiB blocks delivered incrementally).
+## Exhaustive candidate list and revalidation
 
-3. **Drive timings are observations, not fixed limits.** Metadata GET ≈ 330 ms,
-   media PUT ≈ 1.36 s, media GET first block ≈ 880 ms. They can be overlapped,
-   parallelized, or retried — but naive overlap has measured costs:
-   speculative metadata racing turns a hit into a **2.30 s miss** (vs 1.40 s
-   today) and can spend an extra ~200 quota units, and a mandatory frontier
-   adds a barrier (see Rejected E). So "hide the latency" must be done without
-   adding a serial dependency.
+| # | Candidate | Verdict | Code evidence |
+|---|---|---|---|
+| A1 | Compress payload before upload | **Invalid** | Writer sends raw bytes (`slots.go:900–907`); payload is already TLS/VLESS ciphertext. |
+| A2 | Raise upload concurrency / media lanes | **Invalid (already adaptive)** | `slotWriteInflight=12`, warmed 24, steered by `latencyWindow` (`slots.go:616–638`, `slot_latency_window.go`); README: beyond BDP extra concurrency only queues. |
+| A3 | Parallel resumable upload of one frame | **Invalid** | Drive resumable advances from server-acknowledged offset; no parallel chunks. |
+| A4 | Reduce `segmentBytes` (frame size) | **Not a floor fix** | Default 512 KiB (`params.go:6`). Total HLS bytes unchanged, so total time is uplink-bound; only granularity changes. Helps LL-HLS/partial delivery, not standard HLS. |
+| A5 | Expand inline/metadata prefix | **Already implemented** | Mode 6, `slotStreamPrefixBytes=11 KiB` (`slot_stream.go:12–14`), `useInlinePrefix` (`slots.go:798`). |
+| A6 | Idempotent create-by-ID | **Already implemented** | `createSlot` sets `metadata["id"]` and falls back to `setSlot` on 4xx (`drive.go:2759–2794`). |
+| A7 | Reduce per-frame CRC/encode work | **Negligible** | 4 bytes per 32 KiB block (`slot_stream.go:56–60`); CRC32 over 512 KiB is microseconds. |
+| A8 | Raise inline burst budget/limit | **Already implemented** | `slotInlineBurstFrames=32`, two-wave rule (`slot_batch_window.go:7`, `slots.go:450–458`). |
+| A9 | Multipart metadata+body in one request | **Already implemented** | `setSlot`/`createWithID` build multipart when body != nil (`drive.go:2126–2129`, `2735–2738`). |
+| A10 | Avoid reuse/watermark wait | **Not a steady-state lever** | Ring is not full in steady state; reuse waits are µs (README resume.47/48). `prefetchWatermark` already hides the GET (`slots.go:978`). |
+| B1 | Remove per-frame metadata read (self-describing body) | **Rejected (see B10)** | Reader already uses `slotID(seq)` directly as the Drive ID (`slots.go:817`, `1357`, `1591`); no `files.list` in slot path. Metadata is prefetched/hidden. |
+| B2 | Increase read-ahead / fetch-ahead | **Invalid** | `slotReadAhead=11`, `slotFetchAhead=12`, `slotBodyAhead=20` (`slots.go:73`, `62`, `42`). Writer-bound; more prefetch only adds memory/quota. |
+| B3 | Remove ordered body gate | **Invalid/risky** | `slot_body_gate.go` returns byte credit only on ordered handoff; removing it lets later frames burn credit while an earlier frame is missing. |
+| B4 | Prioritize head body GET | **Already implemented** | `mediaHeadKey`, `mediaPromotionKey`, `priorityClient` for description; body gate admits head first (`slots.go:1714`, `drive.go:1019`, `slot_body_gate.go:127–137`). |
+| B5 | Earlier head body hedge | **Already adaptive** | `mediaHedgeDelay` = 1.3×p50 clamped 900 ms–2 s (`drive.go:3844–3857`); progressive startup uses `mediaStartup` median (`drive.go:3218–3221`). |
+| B6 | Overlap N+1 description with N body | **Already implemented** | Prefetch window (`slots.go:1410–1418`). |
+| B7 | More head ranges (smaller `partSize`) | **Rejected** | `driveMediaLanes=4`, `driveMediaPart=128 KiB`, `streamHeadRangeLimit=4` (`drive.go:3004–3005`, `3741–3746`). Progressive forces `parts=1` (`drive.go:3594–3597`); more ranges multiply the 200-unit media GET. |
+| B8 | Smaller stream block size | **Rejected** | `slotStreamBlockBytes=32 KiB` (`slot_stream.go:15`). First-block wait is HTTP/TTFB-bound, not block-size-bound; smaller blocks add CRC/dedup work. |
+| B9 | More media hedge tokens / faster refill | **VALID (conditional)** | `mediaHedgeTokens` starts 3 (`drive.go:358`, `388`), cap `maxReadHedgeTokens=6` (`drive.go:2200`), accrues every 20 media ranges (`drive.go:2156–2164`, `2202–2210`), spent in tracked head rescue (`drive.go:3417–3425`), waited on in `takeMediaHedgeTokenOrWait` (`drive.go:2188`). Targets the 5.36 s gap **if** it is budget-limited. |
+| B10 | Self-describing progressive body / body-first protocol | **Rejected** | Mode 5 body is raw data (`slots.go:903–904`); description carries header+CRC (`slots.go:121–143`). The description GET is the **cheap discovery** (5 units); body GETs cost 200. Body-first polling is quota-prohibitive, and the description is already prefetched/hidden. No critical-path round-trip is removed. |
+| B11 | Larger connection/stream pools | **Invalid** | h2 one connection (`client.go:359`), `defaultPoolConnections=4` (`client.go:666`), 4 media pools (`drive.go:361–365`); README: local permit/connection waits negligible. |
+| C1 | Adaptive frame size for live | **Not a floor fix** | Same as A4; `segmentBytes` is already configurable and `inlineRampSegments` grows it adaptively (`slots.go:450–458`). |
+| C2 | Reduce `flushInterval` / coalescing | **Invalid** | 20 ms (`params.go:7`); small stable suffixes already flush after 2 ticks (20–30 ms) (`slots.go:583–598`). |
+| D1 | Reserved media lane for head body GET | **VALID but low value (measure)** | `readFrameStream` does not set `laneKey{}` (`drive.go:3576`), so head and prefetch share `mediaRanges` (48 permits, `drive.go:844–845`). But body gate caps inflight at 20 (`slot_body_gate.go:129`), so the 48-permit pool is not saturated. |
+| D2 | Let inline frames bypass ordering | **Invalid** | Would reorder the `net.Conn` byte stream; `run()` must deliver `head` in order (`slots.go:1427–1475`). |
+| D3 | Separate rings per flow class | **Out of scope** | Needs mux-layer knowledge of sessions. |
+| D4 | Cap prefetch to starve head less | **Invalid** | Body gate already bounds and prioritizes; README shows admission ≈ 0. |
+| E1 | More h2 connections / pools | **Invalid** | See B11. |
+| E2 | Default media to HTTP/3 | **EXPERIMENTAL** | h3 is opt-in (`client.go:361`). Avoids TCP HOL but is UDP, network-dependent, and may be blocked. |
+| E3 | Tune h2 ping/idle | **Already tuned** | `h2Idle=1500 ms`, `h2PingWait=2500 ms` (`client.go:243`); detects dead conns without penalizing bulk. |
+| E4 | Tune HTTP/2 buffers/concurrency | **VALID to measure** | Only `SendPingTimeout`/`PingTimeout` are set (`client.go:355`); `MaxReceiveBufferPer*` / `MaxConcurrentStreams` are left at defaults. If a window is below the frame size, throughput is capped. |
+| F1 | Quota-aware prefetch reduction | **Already implemented** | `quotaRecovery()` (`slots.go:2010`), cooldown suppression (`drive.go:3595`), 5 s post-rate-limit rule. |
+| G1 | Lower `driveTimeout` / stall detection | **Invalid** | `driveTimeout=60 s` (`drive.go:47`) is the last resort; media hedge fires at 0.9–2 s. Lowering kills slow-but-moving transfers. |
+| G2 | More rescue attempts per range | **VALID but costly (part of B9)** | One rescue per range (`drive.go:3202`, `3445–3450`); each is a 200-unit media GET. Only justified under measured budget starvation. |
+| H1 | Move CRC table into body header | **Same as B10 — rejected** | Adds bytes; does not remove the description round-trip unless discovery also moves to body polling (quota-prohibitive). |
+| H2 | Compress CRC table | **Negligible** | 64 bytes for 512 KiB. |
+| I1 | Reduce announce latency | **Not per-segment** | 25 ms one-time (`xdrive.go:563`); first frame is already included in the announce (`xdrive.go:568–575`). |
+| J1 | Deliver later blocks before earlier | **Invalid** | Violates ordered `net.Conn`. |
+| J2 | Split a prefetched single-range frame on promotion | **Rejected** | Progressive is deliberately one range (`drive.go:3594–3597`); promotion only defers recovery. Splitting cancels a partial GET and adds ranges; the existing suffix rescue already covers a stalled range. |
+| K1 | Speculative head body GET | **Same as B10 — rejected** | Needs a self-describing body; otherwise the size/CRC are unknown and the GET is wasted. |
+| L1 | Reduce writer's `awaitReuse` fence | **Invalid** | Correctness fence (previous write + watermark); reuse waits are µs in steady state. |
+| M1 | Redundant upload to two files / race two GETs | **Rejected** | Doubles upload quota (50/frame) and storage; the stall is network-wide, so both copies stall. |
+| N1 | Larger delivery channel buffer | **Invalid** | `ch` buffer = concurrency (`slots.go:1296`); enqueue p95 ≈ 2 ms (README resume.48). |
+| O1 | Faster CRC verification | **Negligible** | CRC32 is already microseconds. |
+| P1 | Increase `maxSegmentBytes` | **Not a floor fix** | 16 MiB cap (`params.go:15`); larger frames reduce request count but not total bytes. |
 
-4. **The target is the tail, and there are two distinct stalls — do not conflate
-   them.** What makes the player buffer: **9.22 s** first-block waits,
-   **18.44 s** ready frame behind bulk, **3.67 s** reuse waits, **4.58 s**
-   inline-burst publication. Two of these are the actionable ones and they live
-   at different layers:
-   - **Frame prefetch gate (~187 ms measured):** the head waits at the *frame*
-     prefetch gate, not for an exhausted HTTP pool. The head-priority patch
-     already protects the ordered head inside the existing 48-permit pool.
-   - **Within-frame block gap (~5.36 s measured):** this happened *after*
-     verified bytes had already arrived — it is a late/stalled block inside a
-     frame, not a download-permit wait. The current gap timer can miss a frame
-     that is still making progress but on pace to finish late.
-   The 187 ms and the 5.36 s are different problems with different fixes.
+## Corrected shortlist (survivors only)
 
-5. **Cross-flow HOL is a mux-layer issue** (Twitch blocked behind browsing on
-   the same Conn). Acknowledged out of scope by the user.
+### S1 (primary). Media hedge token budget and refill for head-block recovery
+**Why it survives:** the 5.36 s within-frame gap is post-verification. The
+tracked head rescue fires after `mediaHedgeDelay` since the last verified block
+(`drive.go:3405–3426`), but it needs a token from a pool that starts at 3 and
+refills only every 20 completed media ranges (`drive.go:358`, `2156–2164`,
+`2200–2210`). With one range per progressive frame, a token arrives every ~20
+frames; several concurrent stalls can exhaust the pool and leave later head
+blocks waiting.
 
-## Where the time actually goes (one media/stream segment)
+**Change (bounded):**
+- Raise the initial `mediaHedgeTokens` and/or the cap, and accrue faster (e.g.
+  every 10 ranges instead of 20) — optionally give media its own cap instead of
+  sharing `maxReadHedgeTokens` with description hedges.
+- Keep the one-rescue-per-range and cooldown/rate-limit fences unchanged.
 
-```
-writer receives segment from proxy  ── overlaps with Twitch download
-writer PUT to Drive                 ── ~1.36 s per 512 KiB, atomic visibility
-reader metadata GET (discover)      ── ~330 ms
-reader media GET (body)             ── ~880 ms to first verified block, then streams
-ordered handoff to player
-```
+**Cost:** up to +1 media GET (200 units) per additional rescue, only under
+stall. No change on healthy frames.
 
-Critical path per segment ≈ `max(Twitch, upload) + metadata + body`, plus tail
-stalls. Body reads already overlap across frames (`slots.go:1393` starts
-successor fetches before delivery). The remaining actionable levers are: (a) stop
-the head waiting at the *frame prefetch gate* (L), and (b) recover a frame whose
-blocks are arriving but on pace to finish late (bounded M). Read-ahead is already
-sufficient (see N below).
+**Validation:** instrument tokens-at-stall; compare `missing-block-max`,
+`hedges`, `won`, and units on a matched Twitch window. If the stall is
+network-wide (both copies stall), the extra rescue will not help — measure
+before keeping.
 
-## Solution space (ranked)
+### S2 (measure first). Reserved media lane for the head body GET
+`readFrameStream` (`drive.go:3576`) does not set `laneKey{}`, so the head body
+GET shares the 48-permit `mediaRanges` pool with prefetch. Expected value is
+low because the body gate caps inflight at 20 (`slot_body_gate.go:129`), but if
+logs show head `wait-pool`/`wait-conn` > 0 while prefetch is active, give the
+head a small reserved media permit pool (mirroring `reserved` for descriptions,
+`drive.go:838–839`).
 
-### L. Keep reserved capacity; don't cancel active prefetch
+### S3 (measure first). HTTP/2 buffer/concurrency tuning
+Only pings are configured (`client.go:355`). If `MaxReceiveBufferPerConnection`
+or `MaxReceiveBufferPerStream` defaults below the frame size, or
+`MaxConcurrentStreams` below the writer window, throughput is capped. Measure
+`body` p50/p95 and `send` p50/p95 first; raise only the field the data
+implicates.
 
-The local head-priority patch (`drive.go` head lane within the existing
-48-permit pool) already protects the ordered head, and `slot_body_gate.go` gives
-queued earlier frames priority over later ones **without restarting requests
-already running** (README.md:519–544). Keep that.
+### S4 (experiment only). HTTP/3 for media
+h3 is opt-in (`client.go:361`). It avoids TCP-level HOL on packet loss, which
+could reduce tail latency, but it is UDP and may be blocked. Keep as an A/B
+experiment, not a default.
 
-- **Keep** the reserved head capacity and the head's two-successor byte
-  borrowing (`slot_body_gate.go`), so prefetched tails cannot deadlock the head.
-- **Do not** cancel an active prefetch to free a permit: that spends the GET and
-  may require another one. Cancel only helps if the download has *stopped
-  delivering*, which the existing suffix recovery already handles.
-- The measured **187 ms** at the frame prefetch gate is not evidence of an
-  exhausted HTTP pool; it is queueing at the gate. Prioritizing queued work (not
-  canceling running work) is the correct response.
+### S5 (not a floor fix). Frame size / aggregation policy
+`segmentBytes` is configurable (`params.go:6`) and `inlineRampSegments` already
+grows it adaptively (`slots.go:450–458`). Changing it alters granularity, not
+the uplink-bound total. Only relevant for LL-HLS or partial delivery.
 
-### M (bounded). One optional suffix GET for a head frame on pace to finish late
+## Rejected and why (compact)
+- **B1/B10/K1/H1 self-describing body / body-first:** description is the cheap
+  discovery (5 units) and is already prefetched; body GETs are 200 units, so
+  body-first polling is quota-prohibitive. No critical-path round-trip removed.
+- **B7 more ranges / J2 split-on-promotion:** progressive is deliberately one
+  range; more ranges multiply quota and cancel partial GETs. Existing suffix
+  rescue already covers a stalled range.
+- **A4/C1/P1 frame size:** total bytes unchanged; uplink-bound.
+- **A2/B2/B11/E1 more concurrency/pools:** writer/uplink-bound; connection
+  waits negligible.
+- **B3 remove body gate / D2 reorder / J1 out-of-order:** violate ordering or
+  byte-credit invariants.
+- **M1 redundant upload:** doubles quota; network-wide stalls affect both.
+- **E4/G1 timeout changes:** 60 s is the last resort; the 0.9–2 s hedge is the
+  real recovery path.
 
-Broad N-way parallel ranges are not the answer. A dispatch-to-last-block model
-(512 KiB frame, 880 ms to first block, 30 ms between blocks, optimistic
-independent lanes — *not* Twitch segment timings):
-
-| Modeled case | One primary GET | Two primary ranges | Four primary ranges |
-|---|---:|---:|---:|
-| Healthy | 1.33 s | 1.09 s | 0.97 s |
-| Isolated stall after halfway | 3.08 s | 1.09 s | 0.97 s |
-| Isolated stall in the first few blocks | 3.08 s | 2.84 s | 2.72 s |
-
-Parallel ranges help **only when the stall is after halfway**; they barely help
-when the stall is in the first few blocks. And at 1.5 Drive frames/s, two and
-four primary ranges add **18,000** and **54,000 units/min** respectively, before
-retries. The capture does not establish which block stalled or whether another
-request would have escaped it.
-
-**Bounded proposal:** issue **one optional suffix GET** for a head frame that is
-**still making progress but on pace to finish late**, using the existing
-**one-rescue budget**. This targets the "stall after halfway" case the current
-gap timer can miss, without doubling GETs on healthy frames.
-
-### N. Dropped — read-ahead already works
-
-All **nine** slow progressive frames in the newer capture had successors ready
-before them; frame **2241** was ready about **8.7 s** before frame **2240**
-finished. A deeper window would fetch more bytes that still could not be
-delivered. Keep the existing adaptive byte budget and 20-frame lookahead
-(`slot_body_gate.go`, README.md:519–544). No change.
-
-### Gating experiments (run before building bounded M)
-
-- **B-saturated** — shared pool + queued prefetch + slow head: confirm the head
-  is stuck at the *frame prefetch gate* (queueing), not at an exhausted HTTP
-  pool. Decides whether any L change is needed beyond keeping the patch.
-- **D-narrowed** — 256 vs 512 KiB with **one primary GET**, measuring first
-  byte, last byte, and quota together. (Changing the head-range setting alone
-  won't exercise the progressive path — `drive.go:3597` forces one primary GET.)
-- **M-probe (bounded)** — inject a late block after halfway and verify a single
-  optional suffix GET (within the one-rescue budget) escapes it; confirm no
-  extra GET is spent on healthy frames.
-
-### Experiments only — not the live protocol
-
-- **Advisory publication hint** — an in-flight fetch carries proof that the
-  exact next frame was published, so the reader can start its verified media GET
-  sooner; if the hint is absent the existing path continues immediately, with no
-  barrier. Replay found only **2 of 78** matched frames where such a hint could
-  arrive first, and **none of the nine slow frames**. Keep as an experiment;
-  do not make it load-bearing.
-
-### Rejected / deprioritized
-
-- **E. Group frontier + pointer chain** — rejected as the primary fix. A
-  frontier reduces repeated discovery reads but adds a barrier: the fastest
-  chunk waits for the slowest upload and then for another Drive write, which
-  works against getting live bytes moving sooner. Measured quota (one media GET
-  per chunk): current ring with one successful description read per frame =
-  **2,040** units; group frontier (one frontier write + one read) = **2,055**;
-  frontier plus one extra delete per immutable chunk = **2,455**. The eight
-  expensive media GETs remain either way, and batching cleanup does not turn
-  multiple deletes into one quota request. Also: the ring already hands the
-  reader the next slot ID, and deterministic names do **not** avoid lookups
-  (`files.get` needs a real ID; names need not be unique), so a next-chunk
-  pointer alone does not fix discovery. Body reads already overlap
-  (`slots.go:1393`); in seven overlapping eight-frame windows, waiting for all
-  uploads held the first frame **295 ms at the median and up to 759 ms**, before
-  any frontier write or polling. Leave the frontier and pointer chain out of the
-  live protocol.
-- **Broad M (N-way parallel ranges)** — modeled to help only on after-halfway
-  stalls; costs **18,000–54,000 units/min**; does not help first-block stalls.
-  Superseded by the bounded single suffix GET above.
-- **A. Speculative metadata racing** — prototype only. Saved ~300 ms on a hit,
-  but a miss took **2.30 s** vs **1.40 s** today, and racing can dispatch two
-  media GETs (~extra 200 units). Not worth the serial miss penalty.
-- **C. Split the first uploads throughout playback** — rejected beyond startup.
-  Smaller writes can move first bytes sooner, but each extra frame adds a write,
-  discovery, and media read; only **one of the nine** slow progressive frames had
-  a matching upload that itself took over two seconds. At most a startup-only
-  connection-ramp tweak.
-
-## Recommended path (ordered)
-
-0. **Measure first.** Existing instrumentation (`xdrive read` / `xdrive write`
-   logs: `discover`, `body`, `head-wait`, `blocked`, `first-block-wait`,
-   `missing-block-*`, `upload-permit-wait`, `buffer-episode-age`). Capture a
-   matched Twitch client+server window; classify each stall as writer-upload vs
-   metadata vs body vs frame-prefetch-gate vs within-frame-block-gap.
-1. **Run the three gating experiments** (B-saturated, D-narrowed, M-probe
-   bounded). These decide whether bounded M is worth building and set the frame
-   size.
-2. **Keep L as-is** (reserved capacity, no prefetch cancellation) unless
-   B-saturated shows the gate itself is the problem.
-3. **Build bounded M** if M-probe shows a single optional suffix GET escapes a
-   late-after-halfway stall without spending extra GETs on healthy frames.
-4. Keep A and C as prototypes; keep the advisory hint as an experiment.
-
-## Implementation tasks (conditional on the gating experiments)
-
-1. `drive.go`: add a **single optional suffix GET** for a head frame that is
-   making progress but projected to finish late, bounded by the existing
-   one-rescue budget; do not add broad N-way parallel ranges.
-2. `slots.go` / `slot_body_gate.go`: confirm the head-priority patch and
-   head/successor byte borrowing are retained; ensure queued work is prioritized
-   without canceling in-flight prefetch.
-3. `slots_test.go` / `drive_stream_test.go`: late-after-halfway suffix-GET
-   test; healthy-frame no-extra-GET test; ordered-bytes and checksum
-   preservation; prefetch-not-canceled test.
-4. A `testing/synctest` benchmark with a simulated Drive (metadata 330 ms, body
-   880 ms, one injected late-after-halfway block) asserting the within-frame gap
-   shrinks by ~the suffix GET, with no extra GET on healthy frames.
-5. `README.md`: document the retained L behavior, the bounded M suffix GET, the
-   gating experiments, and the rejected frontier / broad-M / A / C options with
-   their measured costs.
+## Ordered tasks
+1. **Measure** a matched Twitch client+server window with existing logs
+   (`xdrive read`/`xdrive write`: `discover`, `body`, `head-wait`, `blocked`,
+   `first-block-wait`, `missing-block-*`, `upload-permit-wait`,
+   `wait-pool`, `wait-conn`, `hedges`, `won`). Classify each stall as
+   writer-upload vs metadata vs body vs head-gate vs within-frame gap.
+2. **If** head-block rescues are token-starved (S1): implement the bounded
+   token/refill change and add a test that a stalled head block gets a rescue
+   while a healthy stream spends none.
+3. **If** logs show head `wait-pool`/`wait-conn` > 0 with prefetch active:
+   implement S2 (reserved media permits for the head) and measure.
+4. **If** body/send p95 scales with frame size: test S3 (HTTP/2 buffers) as an
+   A/B.
+5. Keep S4 as an optional h3 experiment; keep S5 as a config note only.
+6. Do **not** build B1/B10, B7/J2, A4/C1, A2/B2/B11/E1, B3/D2/J1, or M1.
 
 ## Validation
-- `go test ./transport/internet/xdrive/...` (focused, within the command
-  timeout).
-- The `synctest` benchmark above.
-- Mixed-version test: new client + old server and vice versa still round-trip
-  on the legacy path (L is local; bounded M must be negotiation-safe or purely
-  local).
+- `go test ./transport/internet/xdrive/...` (focused).
+- `synctest` model: metadata 330 ms, body 880 ms, injected late-after-halfway
+  block; assert the within-frame gap shrinks by the suffix rescue and no extra
+  GET on healthy frames.
+- Mixed-version: new client + old server and vice versa on the legacy path.
 
 ## Out of scope / honest limits
 - Cross-flow HOL (mux) — needs mux-layer changes.
-- Reducing Drive's per-request latency — Google-side; xdrive can only overlap,
-  parallelize, and retry.
+- Reducing Drive's per-request latency — Google-side.
 - Eliminating inter-frame HOL — `net.Conn` ordered-stream contract.
-- A hard 2 s deadline — Drive tail latency (9 s+ stalls observed) cannot be
-  bounded by xdrive; the best xdrive can do is shrink the median, keep the
-  buffer full, and recover a late frame faster.
+- A hard 2 s deadline — if the uplink is the bottleneck, total bytes / uplink
+  rate is the floor and no xdrive change can beat it. The code is already
+  near-optimal in steady state; only bounded tail recovery (S1) and
+  measure-gated transport tuning (S2–S4) remain.
