@@ -114,37 +114,10 @@ No wire-version or configuration change is required. The improved reader works
 with existing v48 streaming peers; for downstream browsing, upgrade the client
 reader. Updating the server also applies the server-side batching improvements.
 
-## Optional two-range streaming-head experiment
+## Streaming-head ranges
 
-The production default remains four media ranges for a large initially headed
-streaming frame. An explicit process environment setting can cap those MODE5
-head plans at two ranges for an A/B experiment:
-
-```powershell
-$env:XRAY_XDRIVE_STREAM_HEAD_RANGES = "2"
-# Start the core with your existing configuration.
-```
-
-Use `"4"` or remove the setting to return to the default, and restart the core
-between runs. Only `2` and `4` are accepted; invalid values warn and retain four.
-The setting is captured when the Drive storage owner is created and copied into
-its sessions, not re-read during traffic. For downstream browsing, change the
-client reader's environment. No configuration-schema or dependency change is needed.
-
-This affects only initially head-marked MODE5 primary range planning. Legacy
-MODE2, nonhead planning, connection pools, promotion, polling floors, permit limits,
-hedge policy, and checksum/EOF/ACK requirements are unchanged. A prefetched
-single-range request is not split or relaunched when it later becomes the head.
-Two ranges may save quota but can worsen later block gaps, completion time, or
-connection-diversity recovery. Fewer completed ranges also replenish the existing
-hedge-token budget more slowly; no compensation is applied during this experiment.
-It is not a claimed fix for slow first-byte responses or a new production default.
-
-Match direction, frame size, load and connection warmth when comparing 4 versus
-2. Compare actual `requests`/`units`, throughput, first-block waits, subsequent
-missing-block gaps, completion and recovery—not only planned range counts. The
-owner startup log and split plan's `head-limit` show the effective setting. Read
-logs append the physical `slot` tag so plans and slow requests can be correlated.
+A large initially headed streaming frame is fetched in at most four media
+ranges; the split plan's `head-limit` shows it.
 
 ## Queue and streaming-gap observations
 
@@ -806,39 +779,34 @@ return. Fresh plans are still admitted under the ordinary 24-upload window, and
 Drive cooldown or a rate limit in the last five seconds restores that window.
 The warmed bulk media window stays at 24. Request counts and frame boundaries are
 unchanged; only peak concurrent PATCHes rise from 24 to 32, and their throttling
-behavior on live Drive has not yet been measured. Setting
-`XRAY_XDRIVE_INLINE_SINGLE_WAVE=0` before startup restores the two-wave window.
-This is a writer-side change: for downstream video, upgrade the server. Compare
+behavior on live Drive has not yet been measured. This is a writer-side change: for downstream video, upgrade the server. Compare
 `upload-permit-wait`, the reader's `discover`/`blocked` timings and both peers'
 `rate-limits`.
 
 ### Live segments beside other traffic (aparat 240p, November 22)
 
-Three default-on changes target ~200 KB, 2 s HLS segments published as 14-19
-inline frames. Each has an escape hatch read once at startup.
+Two changes target ~200 KB HLS segments published as 14-19 inline frames.
 
 - Writer (upgrade the server for downstream video): a buffered burst of at most
   one inline wave (24 frames, 336 KiB) stays inline even while unrelated uploads
   are outstanding. It still goes to media during a sustained transfer (two full
   laps of full-size media frames, the rule that widens the bulk window) and
   during Drive cooldown or within five seconds of a rate limit.
-  `XRAY_XDRIVE_LIVE_INLINE=0` restores the old rule.
-- Drive, both peers: a metadata-only inline frame update still running 1.2 s
-  after dispatch gets one identical copy, a single attempt on another pooled
-  connection when one is available. The first success completes the frame.
-  Neither request is cancelled, and the next write to the same slot waits until
-  both have finished, so a late copy cannot overwrite the next lap. At most four
-  copies per session at once. No copies are sent during cooldown or within a
-  minute of a rate limit, and never for media bodies, first-lap creates or
-  watermarks. Drive's handling of two concurrent identical updates to one file
-  has not yet been measured. `XRAY_XDRIVE_UPLOAD_HEDGE=0` disables the copies.
-  The per-minute `xdrive timing slot-write-inline` line counts them as
-  `hedges=` and `won=`.
 - Reader: after it discovers a full 14 KiB inline frame, already scheduled
   fetches up to head+23 (one inline wave) use the near schedule, polling every
   40 ms while the burst arrives (500 ms after the last hit) instead of the tail
   pace beyond head+11. The fetch window is unchanged, so no new slots are
-  polled. `XRAY_XDRIVE_BURST_READ_AHEAD=0` restores head+11.
+  polled.
+
+An earlier version also sent a copy of an inline update still running after
+1.2 s on another connection. Across the live runs the copies almost never
+finished first (0 of 49 and 0 of 30 on the server, 2 of 26 on the client), so
+they were removed.
+
+Two-second live segments are out of reach: a request and its answer take two
+Drive writes and two discoveries, about 2.0-2.35 s for a segment that fits in
+one inline wave and about 4.3 s once a media frame is needed. Segments of six
+seconds or more fit; the fetch takes about 4.0-4.5 s plus 0.3 s per MB.
 
 ### Per-segment and per-download logs
 
@@ -883,10 +851,10 @@ log, so matched client and server lines can be compared without clock offsets.
   falling as `overlap-max` rises while their sum stays flat; a per-connection
   cap shows as the sum rising with overlap.
 
-### HD live segments: split bursts, spare connections, adaptive upload copies
+### HD live segments: split bursts and spare connections
 
-Three default-on changes for ~6 s live segments of 1.4-5.1 MB, whose fixed cost
-was about 4 s per segment. Each has an escape hatch read once at startup.
+Two changes for ~6 s live segments of 1.4-5.1 MB, whose fixed cost was about
+4 s per segment.
 
 - Writer, split bursts (upgrade the server for downstream video). A live burst
   larger than one inline wave (336 KiB) now sends its first 24 frames inline and
@@ -901,8 +869,7 @@ was about 4 s per segment. Each has an escape hatch read once at startup.
   updates per segment (1,200 units, ~12,000 units/minute at 6 s segments) on
   the writer and 24 more metadata reads (120 units) on the reader, minus at most
   one media upload and download. A straggling inline update in the wave now
-  delays its segment; the upload copies below bound it.
-  `XRAY_XDRIVE_LIVE_HYBRID=0` restores all-media bursts and the old media window.
+  delays its segment.
 - Connections, both peers. Every pool that carries requests keeps one
   established idle connection, warmed with a HEAD to the service host (no
   authorization, no API quota) and probed again when unused for 30 s. Pools
@@ -919,16 +886,18 @@ was about 4 s per segment. Each has an escape hatch read once at startup.
   takes 2-3.5 s for every request at once several times a minute, and that
   rule retired 14 healthy connections on the server and 7 on the client in
   2.5 minutes, each followed by a new dial.
-  `XRAY_XDRIVE_SPARE_CONN=0` and `XRAY_XDRIVE_FAST_DEAD_CONN=0` turn these off.
   Logs: `xdrive spare connection <n> ready` and `xdrive connection <n> slow but
   alive` (debug), `xdrive connection <n> answered nothing ... closing it` (info).
-- Drive upload copies, both peers. The copy of a straggling inline update waits
-  until the update has run longer than the p95 of the last 32 successful ones,
-  at least 1.2 s and at most 2.4 s; with fewer than 12 samples it stays 1.2 s.
-  The `xdrive upload hedge ... after=` line shows the delay used.
+
+On a server the inbound's `streamSettings` set up its Drive connections the
+same way as on a client: `tlsSettings` (including `alpn` and `fingerprint`),
+`sockopt`, `finalmask`, `xdriveSettings.xmux`, and `address`/`port`, which
+the Drive connections dial instead of the service host. On a client
+`streamSettings.address` takes priority over the outbound's address, which is
+used only when it is not set; a server has only `streamSettings.address`.
 
 ### Google Drive code layout
 
 The Drive backend, media recovery, streaming negotiation, and telemetry live in
-`drive.go`; their regression tests live in `drive_test.go`. Shared slot and
-transport code remains separate because other storage backends also use it.
+`drive.go`. Shared slot and transport code remains separate because other
+storage backends also use it.

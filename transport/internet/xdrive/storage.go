@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sync"
-	"sync/atomic"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -16,9 +15,6 @@ import (
 )
 
 var errNotFound = errors.New("object not found")
-
-// errDuplicateID is returned by test stores that reject a repeated create.
-var errDuplicateID = errors.New("duplicate id")
 
 type Entry struct {
 	Name   string
@@ -35,21 +31,11 @@ type Storage interface {
 	Close() error
 }
 
-// testStorageFactory lets tests substitute a backend for newStorage; nil in
-// production so behaviour is unchanged.
-var testStorageFactory atomic.Pointer[func(config *Config) (Storage, error)]
-
 func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
 	config, err := streamConfig(streamSettings)
 	if err != nil {
 		return nil, err
 	}
-	if f := testStorageFactory.Load(); f != nil {
-		return sharedStorage(streamSettings, config, func() (Storage, error) {
-			return (*f)(config)
-		})
-	}
-
 	switch config.Service {
 	case "local":
 		storage, err := newLocalStorage(config.RemoteFolder)
@@ -72,15 +58,6 @@ func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
 	default:
 		return nil, errors.New("unsupported service: ", config.Service)
 	}
-}
-
-// sessionStorage clones a session lease without consuming its parent.
-func sessionStorage(storage Storage) Storage {
-	session, err := acquireSessionStorage(storage)
-	if err != nil {
-		return nil
-	}
-	return session
 }
 
 func rawSessionStorage(storage Storage) Storage {
@@ -133,20 +110,6 @@ func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) strin
 	h := sha256.New()
 	common.Must(json.NewEncoder(h).Encode(profile))
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-func resetSharedStorage() {
-	stopAllSpares()
-	sharedMu.Lock()
-	old := shared
-	shared = make(map[string]*storageOwner)
-	for _, owner := range old {
-		owner.closed = true
-	}
-	sharedMu.Unlock()
-	for _, owner := range old {
-		owner.close()
-	}
 }
 
 func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, build func() (Storage, error)) (Storage, error) {

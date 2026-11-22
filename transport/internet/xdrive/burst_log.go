@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -35,15 +34,7 @@ const (
 	slotBurstSamples = 256
 )
 
-// testSummaryLog, when a test sets it, receives the burst and download lines
-// instead of the log.
-var testSummaryLog atomic.Pointer[func(line string)]
-
 func logSummary(ctx context.Context, severity log.Severity, parts ...interface{}) {
-	if hook := testSummaryLog.Load(); hook != nil {
-		(*hook)(serial.Concat(parts...))
-		return
-	}
 	if log.GetSeverity() < severity {
 		return
 	}

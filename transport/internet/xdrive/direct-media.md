@@ -39,8 +39,7 @@ A release that only understands direct media continues to use mode 7 with a
 new peer. Mode 7 still verifies the complete object before delivering it and
 can race a speculative GET against discovery. Progressive delivery keeps the
 mode 5/6 metadata dependency to verify blocks, so a slow slot description can
-still delay the first byte. Setting `XRAY_XDRIVE_DIRECT_MEDIA=0` on the client
-continues to disable the newer media preferences.
+still delay the first byte.
 
 Each verified handoff keeps successor discovery active even during a long
 frame. It does not change the measured cadence of completed frames or the
@@ -59,8 +58,6 @@ the bulk pool.
 
 The isolated connection may need a fresh handshake. Slow request logs report
 `isolated-head` to distinguish pool selection from a frame promoted during
-the request. Isolation is enabled by default, with no configuration needed.
-It has not been benchmarked on live Drive playback. Set `XRAY_XDRIVE_ISOLATE_MEDIA_HEAD=0`
-before startup to disable it.
+the request. Isolation is always on, with no configuration needed.
 
 <!-- /coderabbit-ai-generated:v1 -->

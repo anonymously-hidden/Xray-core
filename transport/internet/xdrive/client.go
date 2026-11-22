@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptrace"
-	"os"
 	"reflect"
 	"runtime"
 	"slices"
@@ -28,9 +27,6 @@ import (
 )
 
 var errStalled = errors.New("the request made no progress")
-
-// Nil in production; tests reject external targets before resolution or dialing.
-var testServiceDial func(net.Destination) error
 
 type serviceTransport struct {
 	plain  http.RoundTripper
@@ -286,11 +282,6 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 				target.Port = fronting.Port
 			}
 		}
-		if testServiceDial != nil {
-			if err := testServiceDial(target); err != nil {
-				return nil, host, err
-			}
-		}
 
 		var conn net.Conn
 		switch {
@@ -516,17 +507,9 @@ type connPool struct {
 	maxConns int          // connections XMUX surely opens; 0 when it opens one
 }
 
-// Both are on by default and read once at startup: connSpare keeps an
-// established idle connection in each pool that carries requests, and
-// connDeadFast retires a connection that went silent under waiting requests
-// before the HTTP/2 keepalive does. XRAY_XDRIVE_SPARE_CONN=0 and
-// XRAY_XDRIVE_FAST_DEAD_CONN=0 turn them off.
-var connSpare, connDeadFast atomic.Bool
-
-func init() {
-	connSpare.Store(os.Getenv("XRAY_XDRIVE_SPARE_CONN") != "0")
-	connDeadFast.Store(os.Getenv("XRAY_XDRIVE_FAST_DEAD_CONN") != "0")
-}
+// Every pool that carries requests keeps an established idle connection, and
+// a connection that goes silent under waiting requests is probed and, if it
+// stays silent, closed before the HTTP/2 keepalive would find it.
 
 const (
 	// A spare is checked for at most this often per pool, and an idle
@@ -571,9 +554,6 @@ func noteHeardAny(now time.Time) {
 
 // spareXmux gives a pool without maxConnections room for a spare.
 func spareXmux(c *splithttp.XmuxConfig) *splithttp.XmuxConfig {
-	if !connSpare.Load() {
-		return c
-	}
 	return xmuxWithConnections(c, sparePoolConnections)
 }
 
@@ -581,7 +561,7 @@ func spareXmux(c *splithttp.XmuxConfig) *splithttp.XmuxConfig {
 // requests has an established connection that none of them uses, so that the
 // requests of a connection that dies move without waiting for a dial.
 func (p *connPool) keepSpare(r *http.Request) {
-	if !connSpare.Load() || r.URL == nil || r.URL.Host == "" || r.Context().Value(keeperProbeKey{}) != nil {
+	if r.URL == nil || r.URL.Host == "" || r.Context().Value(keeperProbeKey{}) != nil {
 		return
 	}
 	now := time.Now()
@@ -723,9 +703,7 @@ func (c *poolConn) heard() {
 	c.mu.Lock()
 	c.heardAt = now
 	c.mu.Unlock()
-	if connDeadFast.Load() {
-		noteHeardAny(now)
-	}
+	noteHeardAny(now)
 }
 
 // unused reports a connection that never carried a request.
@@ -777,7 +755,7 @@ func (c *poolConn) warm(scheme, host string) {
 // watch has a small request's answer timed once it is written; see
 // deadConnSuspect.
 func (c *poolConn) watch(ctx context.Context, r *http.Request) (context.Context, *connWait) {
-	if !connDeadFast.Load() || r.ContentLength < 0 || r.ContentLength > deadConnSmallBody ||
+	if r.ContentLength < 0 || r.ContentLength > deadConnSmallBody ||
 		r.URL == nil || r.URL.Host == "" || ctx.Value(connProbeKey{}) != nil {
 		return ctx, nil
 	}
@@ -1174,7 +1152,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			return nil, errSessionClosed
 		}
 		var next *splithttp.XmuxClient
-		if client != nil && connSpare.Load() {
+		if client != nil {
 			// Moving off a connection: an established one, such as the
 			// spare, takes the requests without a dial.
 			if c := t.pool.xmux.GetExistingXmuxClient(r.Context()); c != nil && c != client && c.XmuxConn.(*poolConn).ready(time.Now()) {

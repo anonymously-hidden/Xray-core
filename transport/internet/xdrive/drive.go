@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
-	"os"
 	"slices"
 	"sort"
 	"strconv"
@@ -30,8 +29,6 @@ import (
 )
 
 // Google Drive storage.
-
-var testDriveIO func(method, target string, body []byte)
 
 const (
 	flatSeparator = "~"
@@ -94,40 +91,7 @@ type (
 	readProgressKey     struct{}
 	descriptionHedgeKey struct{}
 	readHedgeGateKey    struct{}
-
-	// slotUploadHedgeKey marks an inline slot write that setSlot may hedge;
-	// uploadHedgeAttemptKey marks the copy, which makes one attempt only;
-	// selectedConnKey carries an *atomic.Pointer[poolConn] that do fills with
-	// the connection each attempt was sent on.
-	slotUploadHedgeKey    struct{}
-	uploadHedgeAttemptKey struct{}
-	selectedConnKey       struct{}
 )
-
-// slotUploadHedgeMax bounds concurrent upload copies per session.
-const slotUploadHedgeMax = 4
-
-// slotUploadHedge is how long a metadata-only inline slot write may run after
-// dispatch before an identical copy goes out on another connection. Live logs
-// put a normal update near 690 ms; XRAY_XDRIVE_UPLOAD_HEDGE=0 disables it.
-var slotUploadHedge = func() time.Duration {
-	if os.Getenv("XRAY_XDRIVE_UPLOAD_HEDGE") == "0" {
-		return 0
-	}
-	return 1200 * time.Millisecond
-}()
-
-// uploadHedgeDelay is when a straggling inline update gets its copy: once it
-// has run longer than all but the slowest of the recent successful updates
-// (their p95), never sooner than slotUploadHedge and never later than twice
-// that. Without enough history it is slotUploadHedge.
-func (s *driveStorage) uploadHedgeDelay() time.Duration {
-	q, ok := s.inlineUpdates.quantile(.95)
-	if !ok {
-		return slotUploadHedge
-	}
-	return min(max(q, slotUploadHedge), 2*slotUploadHedge)
-}
 
 type readHedgeGate struct {
 	primary   *driveReadProgress
@@ -176,16 +140,6 @@ func (p *driveReadProgress) progress() {
 	if p.pending {
 		p.progressAt = time.Now()
 	}
-}
-
-// sinceDispatch is the time since the latest dispatch, false before any.
-func (p *driveReadProgress) sinceDispatch() (time.Duration, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dispatchAt.IsZero() {
-		return 0, false
-	}
-	return time.Since(p.dispatchAt), true
 }
 
 func (p *driveReadProgress) finish() {
@@ -238,9 +192,8 @@ func isCleanupRateLimited(err error) bool {
 
 type driveStorage struct {
 	*driveShared
-	streamCaps       atomic.Pointer[driveStreamCaps]
-	streamHeadRanges int
-	progressiveFull  rangeLatency // comparable clean near-512 KiB GET durations in this session
+	streamCaps      atomic.Pointer[driveStreamCaps]
+	progressiveFull rangeLatency // comparable clean near-512 KiB GET durations in this session
 	// Clients and permits are session-local.
 	client         *http.Client
 	priorityClient *http.Client
@@ -267,8 +220,6 @@ type driveStorage struct {
 	mediaHedgeChanged chan struct{} // guarded by readHedgeMu
 
 	mediaNext atomic.Uint32
-
-	uploadHedges chan struct{} // concurrent upload copies; nil disables them
 }
 
 type driveShared struct {
@@ -312,7 +263,6 @@ type driveShared struct {
 	throttle      atomic.Int64
 	mediaLatency  [2]rangeLatency // shared, per requested-size class
 	mediaStartup  [2]rangeLatency // dispatch to first verified block for progressive media
-	inlineUpdates rangeLatency    // dispatch to answer of successful hedgeable inline updates
 	sessionGuard  driveSessionGuard
 	timing        *timingAggregator
 	// downloads counts the media downloads whose bodies are being read.
@@ -340,11 +290,6 @@ type driveShared struct {
 	keeperCancel   context.CancelFunc
 	keeperDone     chan struct{}
 
-	// slotTails holds, per slot id, a channel closed once both copies of a
-	// hedged write have finished; the next write to that slot waits for it.
-	slotTailMu sync.Mutex
-	slotTails  map[string]chan struct{}
-
 	workMu     sync.Mutex
 	workCtx    context.Context
 	workCancel context.CancelFunc
@@ -365,14 +310,8 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			return nil, errors.New("Google Drive secret ", i, " is empty")
 		}
 	}
-	headRanges, validHeadRanges := parseStreamHeadRanges(os.Getenv(streamHeadRangesEnv))
-
 	h1Hosts := new(sync.Map)
 	workCtx, workCancel := context.WithCancel(context.Background())
-	if !validHeadRanges {
-		errors.LogWarning(workCtx, "invalid ", streamHeadRangesEnv, "; retaining default head range limit 4")
-	}
-	errors.LogInfo(workCtx, "xdrive streamed head range limit=", headRanges, " (2 is experimental; default 4)")
 	client := newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveMaxInflight)
 	st := &driveStorage{
 		driveShared: &driveShared{
@@ -405,7 +344,6 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 			cleanupMaxRetries: cleanupMaxRetries,
 		},
 		client:           client,
-		streamHeadRanges: headRanges,
 		priorityClient:   newServiceClient(workCtx, h1Hosts, streamSettings, driveTimeout, driveReservedInflight),
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),
@@ -416,7 +354,6 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 		readHedge:        slotReadHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
-		uploadHedges:     make(chan struct{}, slotUploadHedgeMax),
 	}
 	st.driveShared.owner = st
 	newMediaClient := func(connCtx context.Context) *http.Client {
@@ -425,9 +362,7 @@ func newDriveStorage(streamSettings *internet.MemoryStreamConfig, config *Config
 	for i := range st.mediaConns {
 		st.mediaConns[i] = newConnPool(spareXmux(config.Xmux), newMediaClient)
 	}
-	if os.Getenv("XRAY_XDRIVE_ISOLATE_MEDIA_HEAD") != "0" {
-		st.headMediaConns = newConnPool(spareXmux(config.Xmux), newMediaClient)
-	}
+	st.headMediaConns = newConnPool(spareXmux(config.Xmux), newMediaClient)
 	st.driveShared.keepWarmEvery = 4 * time.Minute
 	st.driveShared.keepWarmWindow = 3 * time.Hour
 	st.driveShared.poolRing = 2 * (max(paramsForStorage(config, st).concurrency, 2) + 1)
@@ -442,7 +377,6 @@ func (s *driveStorage) session() Storage {
 	st := &driveStorage{
 		driveShared:      s.driveShared,
 		client:           &http.Client{Transport: transport},
-		streamHeadRanges: s.streamHeadRanges,
 		bulkClient:       &http.Client{Transport: bulkTransport},
 		inflight:         make(chan struct{}, driveMaxInflight),
 		reserved:         make(chan struct{}, driveReservedInflight),
@@ -453,7 +387,6 @@ func (s *driveStorage) session() Storage {
 		readHedge:        s.readHedge,
 		readHedgeTokens:  3,
 		mediaHedgeTokens: 3,
-		uploadHedges:     make(chan struct{}, slotUploadHedgeMax),
 	}
 	transports := []*sessionTransport{transport, bulkTransport}
 	if s.priorityConns != nil {
@@ -855,8 +788,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	mediaTiming, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
 	readHedgeAttempt := descriptionHedge || method == http.MethodGet &&
 		(media != nil && media.rescue || ctx.Value(directProbeKey{}) != nil)
-	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil ||
-		ctx.Value(uploadHedgeAttemptKey{}) != nil
+	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
 		return 0, nil, errReadHedgeSkipped
 	}
@@ -1129,15 +1061,8 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 			releasePermit()
 			return 0, nil, err
 		}
-		if testDriveIO != nil {
-			testDriveIO(method, target, body)
-		}
 		var selected atomic.Pointer[poolConn]
-		noteConn := selected.Store
-		if track, ok := ctx.Value(selectedConnKey{}).(*atomic.Pointer[poolConn]); ok {
-			noteConn = func(c *poolConn) { selected.Store(c); track.Store(c) }
-		}
-		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, noteConn))
+		req = req.WithContext(context.WithValue(req.Context(), poolConnKey{}, selected.Store))
 		if failedConn != nil {
 			req = req.WithContext(context.WithValue(req.Context(), failedConnKey{}, failedConn))
 		}
@@ -1458,12 +1383,6 @@ func (s *driveStorage) cooling() bool {
 	return time.Now().Before(s.coolUntil)
 }
 
-func (s *driveStorage) lastThrottleAt() time.Time {
-	s.coolMu.Lock()
-	defer s.coolMu.Unlock()
-	return s.lastThrottle
-}
-
 func (s *driveStorage) lastRateLimitAt() time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
@@ -1558,15 +1477,6 @@ func (s *driveStorage) rememberIDLocked(name, id string, extra []string) {
 		s.knownIDs = make(map[string]map[string]struct{})
 	}
 	s.knownIDs[name] = seen
-}
-
-func (s *driveStorage) forgetID(name string) {
-	s.idMu.Lock()
-	delete(s.ids, name)
-	delete(s.dupIDs, name)
-	delete(s.knownIDs, name)
-	delete(s.missingIDs, name)
-	s.idMu.Unlock()
 }
 
 func (s *driveStorage) markMissingID(name, id string) {
@@ -2236,12 +2146,6 @@ func (s *driveStorage) makeSlot(ctx context.Context, name string) (string, error
 }
 
 func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
-	// A copy of the previous hedged write to this slot may still be running;
-	// it must not land after this one.
-	if err := s.awaitSlotTail(ctx, id); err != nil {
-		return err
-	}
-	hedge := body == nil && ctx.Value(slotUploadHedgeKey{}) != nil
 	if body == nil {
 		ctx = context.WithValue(ctx, attemptKey{}, driveSlotWrite)
 	} else {
@@ -2263,13 +2167,7 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 		metadata, contentType = multipartBody(metadata, body)
 	}
 
-	var status int
-	var payload []byte
-	if hedge {
-		status, payload, err = s.patchHedged(ctx, id, target, contentType, metadata)
-	} else {
-		status, payload, err = s.do(ctx, http.MethodPatch, target, contentType, metadata)
-	}
+	status, payload, err := s.do(ctx, http.MethodPatch, target, contentType, metadata)
 	switch {
 	case err != nil:
 		return err
@@ -2279,164 +2177,6 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 		return errors.New("Drive answered ", status, " for the update of ", id, ": ", string(payload))
 	}
 	return nil
-}
-
-// patchHedged sends a metadata-only slot update and, once it has run
-// uploadHedgeDelay since dispatch, an identical copy on another connection.
-// The first success wins. Neither request is cancelled, since Drive may still
-// apply it; the next write to id waits for both through the slot tail.
-func (s *driveStorage) patchHedged(ctx context.Context, id, target, contentType string, metadata []byte) (int, []byte, error) {
-	if slotUploadHedge <= 0 || s.uploadHedges == nil {
-		return s.do(ctx, http.MethodPatch, target, contentType, metadata)
-	}
-	delay := s.uploadHedgeDelay()
-	type result struct {
-		status  int
-		payload []byte
-		err     error
-		hedge   bool
-	}
-	results := make(chan result, 2)
-	primary := &driveReadProgress{dispatched: make(chan struct{})}
-	var conn atomic.Pointer[poolConn]
-	primaryCtx := context.WithValue(context.WithValue(ctx, readProgressKey{}, primary), selectedConnKey{}, &conn)
-	primaryDone := make(chan struct{})
-	go func() {
-		defer close(primaryDone)
-		status, payload, err := s.do(primaryCtx, http.MethodPatch, target, contentType, metadata)
-		if err == nil && status == http.StatusOK {
-			if d, ok := primary.sinceDispatch(); ok {
-				s.inlineUpdates.note(d)
-			}
-		}
-		results <- result{status, payload, err, false}
-	}()
-
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	for launch := false; !launch; {
-		select {
-		case r := <-results:
-			return r.status, r.payload, r.err
-		case <-ctx.Done():
-			return 0, nil, ctx.Err()
-		case <-timer.C:
-		}
-		remaining, pending := primary.remainingSinceDispatch(delay)
-		switch {
-		case !pending:
-			// Not dispatched yet, or backing off between attempts.
-			timer.Reset(min(delay, 100*time.Millisecond))
-		case remaining > 0:
-			timer.Reset(remaining)
-		case !s.descriptionHedgeAllowed() || !s.takeUploadHedge():
-			// Cooldown, a recent rate limit, or enough copies already out.
-			select {
-			case r := <-results:
-				return r.status, r.payload, r.err
-			case <-ctx.Done():
-				return 0, nil, ctx.Err()
-			}
-		default:
-			launch = true
-		}
-	}
-
-	hedgeCtx := context.WithValue(ctx, uploadHedgeAttemptKey{}, true)
-	if c := conn.Load(); c != nil {
-		hedgeCtx = context.WithValue(hedgeCtx, failedConnKey{}, c)
-	}
-	tail := make(chan struct{})
-	s.setSlotTail(id, tail)
-	hedgeDone := make(chan struct{})
-	go func() {
-		defer close(hedgeDone)
-		defer func() { <-s.uploadHedges }()
-		status, payload, err := s.do(hedgeCtx, http.MethodPatch, target, contentType, metadata)
-		results <- result{status, payload, err, true}
-	}()
-	go func() {
-		<-primaryDone
-		<-hedgeDone
-		s.clearSlotTail(id, tail)
-	}()
-	if s.timing != nil {
-		s.timing.noteHedge(kindSlotInline, false)
-	}
-	launchedAt := time.Now()
-	errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " after=", delay)
-
-	ok := func(r result) bool { return r.err == nil && r.status == http.StatusOK }
-	pick := func(r result) (int, []byte, error) {
-		won := r.hedge && ok(r)
-		if won && s.timing != nil {
-			s.timing.noteHedgeWin(kindSlotInline)
-		}
-		errors.LogDebug(ctx, "xdrive upload hedge slot=", slotTag(id), " won=", won,
-			" status=", r.status, " after-launch=", time.Since(launchedAt))
-		return r.status, r.payload, r.err
-	}
-	var first result
-	select {
-	case first = <-results:
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
-	}
-	if ok(first) || isAuthError(first.err) {
-		return pick(first)
-	}
-	select {
-	case second := <-results:
-		// Prefer a success; otherwise report the primary, which retried.
-		if ok(second) || first.hedge {
-			return pick(second)
-		}
-		return pick(first)
-	case <-ctx.Done():
-		return 0, nil, ctx.Err()
-	}
-}
-
-func (s *driveStorage) takeUploadHedge() bool {
-	select {
-	case s.uploadHedges <- struct{}{}:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *driveStorage) awaitSlotTail(ctx context.Context, id string) error {
-	s.slotTailMu.Lock()
-	tail := s.slotTails[id]
-	s.slotTailMu.Unlock()
-	if tail == nil {
-		return nil
-	}
-	select {
-	case <-tail:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (s *driveStorage) setSlotTail(id string, tail chan struct{}) {
-	s.slotTailMu.Lock()
-	if s.slotTails == nil {
-		s.slotTails = make(map[string]chan struct{})
-	}
-	s.slotTails[id] = tail
-	s.slotTailMu.Unlock()
-}
-
-func (s *driveStorage) clearSlotTail(id string, tail chan struct{}) {
-	s.slotTailMu.Lock()
-	if s.slotTails[id] == tail {
-		delete(s.slotTails, id)
-	}
-	s.slotTailMu.Unlock()
-	close(tail)
 }
 
 func (s *driveStorage) noteDescriptionRead() {
@@ -3908,7 +3648,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 	}
 	parts := max(1, min((frame.size+partSize-1)/partSize, lanes))
 	if ctx.Value(mediaHeadKey{}) != nil {
-		parts = min(parts, s.streamHeadRangeLimit())
+		parts = min(parts, driveStreamHeadRanges)
 	}
 	progressive := ctx.Value(progressiveMediaKey{}) != nil
 	if progressive || s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
@@ -3917,7 +3657,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 	if parts > 1 {
 		errors.LogDebug(ctx, "xdrive stream plan slot=", slotTag(id), " seq=", frame.seq,
 			" bytes=", frame.size, " parts=", parts, " head=", ctx.Value(mediaHeadKey{}) != nil,
-			" head-limit=", s.streamHeadRangeLimit())
+			" head-limit=", driveStreamHeadRanges)
 	}
 	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
 	stream := &driveRangeStream{frame: frame, emit: emit}
@@ -4042,27 +3782,8 @@ func (s *driveStorage) streamingFields() string {
 	return "description"
 }
 
-// Head-range experiment.
-
-const streamHeadRangesEnv = "XRAY_XDRIVE_STREAM_HEAD_RANGES"
-
-func parseStreamHeadRanges(raw string) (int, bool) {
-	switch strings.TrimSpace(raw) {
-	case "", "4":
-		return 4, true
-	case "2":
-		return 2, true
-	default:
-		return 4, false
-	}
-}
-
-func (s *driveStorage) streamHeadRangeLimit() int {
-	if s.streamHeadRanges == 2 {
-		return 2
-	}
-	return 4
-}
+// driveStreamHeadRanges bounds the ranges of a streamed head frame.
+const driveStreamHeadRanges = 4
 
 // Latency and request telemetry.
 

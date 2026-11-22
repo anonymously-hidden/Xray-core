@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -271,24 +270,6 @@ func (box *spareBox) close() {
 	box.signal()
 }
 
-func stopSpares(config *Config) {
-	spareBoxes.Range(func(key, value any) bool {
-		if key.(spareKey).config == config && spareBoxes.CompareAndDelete(key, value) {
-			value.(*spareBox).close()
-		}
-		return true
-	})
-}
-
-func stopAllSpares() {
-	spareBoxes.Range(func(key, value any) bool {
-		if spareBoxes.CompareAndDelete(key, value) {
-			value.(*spareBox).close()
-		}
-		return true
-	})
-}
-
 func takeSpare(config *Config, p params, settings ...*internet.MemoryStreamConfig) (spareRing, bool) {
 	var streamSettings *internet.MemoryStreamConfig
 	if len(settings) > 0 {
@@ -533,7 +514,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		if streams {
 			r.StreamVersion = 1
 			r.StreamPrefix, r.Down.streamPrefix = true, true
-			r.DirectMedia = os.Getenv("XRAY_XDRIVE_DIRECT_MEDIA") != "0"
+			r.DirectMedia = true
 			r.Down.directMedia = r.DirectMedia
 			r.ProgressiveMedia, r.Down.progressiveMedia = r.DirectMedia, r.DirectMedia
 		}
@@ -618,8 +599,7 @@ type Listener struct {
 	closeOnce      sync.Once
 	closeErr       error
 
-	// collectPause spaces the deletion of two collected sessions; set in Serve,
-	// zero for listeners built directly by tests.
+	// collectPause spaces the deletion of two collected sessions.
 	collectPause time.Duration
 }
 

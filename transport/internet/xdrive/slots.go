@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"io"
-	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -66,7 +65,6 @@ var (
 	slotWatermarkTTL = 100 * time.Millisecond
 	ackDelay         = 1500 * time.Millisecond
 	slotStallTimeout = 60 * time.Second
-	slotCloseGrace   = 10 * time.Second
 	slotGoneTimeout  = 60 * time.Second
 	slotBodyHedge    = 2 * time.Second
 
@@ -74,18 +72,12 @@ var (
 	slotReadAhead          int64 = 11
 	slotReadAheadPoll            = 40 * time.Millisecond
 	slotReadAheadBurst           = 500 * time.Millisecond
-)
 
-// slotBurstReadAhead is the near window while full inline frames arrive: the
-// rest of one inline wave after the head, so a split live segment is polled at
-// slotReadAheadPoll even past slotReadAhead. XRAY_XDRIVE_BURST_READ_AHEAD=0
-// keeps slotReadAhead.
-var slotBurstReadAhead = func() int64 {
-	if os.Getenv("XRAY_XDRIVE_BURST_READ_AHEAD") == "0" {
-		return slotReadAhead
-	}
-	return slotInlineWriteInflight - 1
-}()
+	// slotBurstReadAhead is the near window while full inline frames arrive:
+	// the rest of one inline wave after the head, so a split live segment is
+	// polled at slotReadAheadPoll even past slotReadAhead.
+	slotBurstReadAhead int64 = slotInlineWriteInflight - 1
+)
 
 var slotWriteInflight = 12
 
@@ -413,10 +405,7 @@ type slotWriter struct {
 	gates              []*slotWriteResult // completion and result of the last assigned physical write
 	uplink             latencyWindow      // bulk upload window steered by media put latency; guarded by mu
 	batch              *slotBatchWindow
-	singleWave         bool // XRAY_XDRIVE_INLINE_SINGLE_WAVE, fixed at construction
-	liveInline         bool // XRAY_XDRIVE_LIVE_INLINE, fixed at construction
-	liveHybrid         bool // XRAY_XDRIVE_LIVE_HYBRID, fixed at construction
-	inlineInflight     int  // assigned inline uploads not yet finished; guarded by mu
+	inlineInflight     int // assigned inline uploads not yet finished; guarded by mu
 
 	// burst is the open write burst and burstDone the finished ones not yet
 	// logged; both are guarded by mu.
@@ -437,26 +426,22 @@ type slotWriter struct {
 
 func newSlotWriter(ctx context.Context, store slotStore, table slotTable, p params) *slotWriter {
 	ctx, cancel := context.WithCancel(ctx)
-	singleWave := slotInlineSingleWave
 	w := &slotWriter{
-		ctx:        ctx,
-		cancel:     cancel,
-		store:      store,
-		table:      table,
-		params:     p,
-		slots:      make(chan struct{}, min(len(table.Slots), slotPermitCap(singleWave))),
-		singleWave: singleWave,
-		liveInline: slotLiveInline,
-		liveHybrid: slotLiveHybrid,
-		flushDone:  make(chan struct{}),
-		flushStop:  make(chan struct{}),
-		available:  make(chan struct{}),
-		failed:     make(chan struct{}),
-		size:       min(slotInlineLimit, p.segmentBytes),
-		acked:      -1,
-		progress:   time.Now(),
-		lazy:       table.lazy,
-		gates:      make([]*slotWriteResult, len(table.Slots)),
+		ctx:       ctx,
+		cancel:    cancel,
+		store:     store,
+		table:     table,
+		params:    p,
+		slots:     make(chan struct{}, min(len(table.Slots), slotPermitCap())),
+		flushDone: make(chan struct{}),
+		flushStop: make(chan struct{}),
+		available: make(chan struct{}),
+		failed:    make(chan struct{}),
+		size:      min(slotInlineLimit, p.segmentBytes),
+		acked:     -1,
+		progress:  time.Now(),
+		lazy:      table.lazy,
+		gates:     make([]*slotWriteResult, len(table.Slots)),
 
 		ackRetry:     slotAckRetry,
 		watermarkTTL: slotWatermarkTTL,
@@ -659,12 +644,6 @@ func (w *slotWriter) readyToFlush() bool {
 	return true
 }
 
-// writeWindow is called with mu held. Two full laps distinguish a sustained
-// transfer from a burst and finish lazy creation before widening the window.
-func (w *slotWriter) writeWindow() int {
-	return w.writeWindowFor(w.inlineNextLocked())
-}
-
 // inlineNextLocked is called with mu held. A live-sized burst may stay inline
 // beside unrelated backlog, except during a sustained transfer (two full laps
 // of full-size media, the rule that also widens the bulk window) or quota
@@ -673,15 +652,15 @@ func (w *slotWriter) inlineNextLocked() bool {
 	if w.batch == nil {
 		return false
 	}
-	w.batch.live = w.liveInline && w.bulkSegments < 2*len(w.table.Slots) && !w.quotaRecovery()
-	w.batch.hybridOn, w.batch.planCap = w.liveHybrid, w.planCapLocked()
+	w.batch.live = w.bulkSegments < 2*len(w.table.Slots) && !w.quotaRecovery()
+	w.batch.planCap = w.planCapLocked()
 	return w.batch.inlineNext(len(w.buf), w.pendingUploadBytes, len(w.slots))
 }
 
 // planCapLocked is called with mu held: the uploads a committed inline plan
 // may have in flight, see inlineWindowLocked.
 func (w *slotWriter) planCapLocked() int {
-	if w.singleWave && !w.quotaRecovery() {
+	if !w.quotaRecovery() {
 		return max(w.batch.window, min(cap(w.slots), slotInlineBurstFrames))
 	}
 	return w.batch.window
@@ -694,7 +673,7 @@ func (w *slotWriter) writeWindowFor(inline bool) int {
 		return w.inlineWindowLocked()
 	}
 	if depth < slotBulkDepth || w.bulkSegments < 2*depth || w.bulkLimited {
-		if w.liveHybrid && w.batch != nil && w.batch.live {
+		if w.batch != nil && w.batch.live {
 			// Live media goes up beside inline uploads, not behind them.
 			return min(cap(w.slots), base+w.inlineInflight)
 		}
@@ -717,12 +696,12 @@ func (w *slotWriter) bulkCeiling() int {
 	return min(cap(w.slots), slotBulkInflight)
 }
 
-// inlineWindowLocked is called with mu held. With the single-wave opt-in, a
-// committed inline plan may use every permit up to slotInlineBurstFrames, so
-// its last frame does not wait for a second upload wave. Fresh plans are still
-// admitted under the ordinary inline window, and quota recovery restores it.
+// inlineWindowLocked is called with mu held. A committed inline plan may use
+// every permit up to slotInlineBurstFrames, so its last frame does not wait
+// for a second upload wave. Fresh plans are still admitted under the ordinary
+// inline window, and quota recovery restores it.
 func (w *slotWriter) inlineWindowLocked() int {
-	if w.singleWave && w.batch.planned > 0 && !w.quotaRecovery() {
+	if w.batch.planned > 0 && !w.quotaRecovery() {
 		return max(w.batch.window, min(cap(w.slots), slotInlineBurstFrames))
 	}
 	return w.batch.window
@@ -1042,12 +1021,7 @@ func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error
 			return nil
 		}
 	}
-	ctx := w.ctx
-	if mode == slotInline {
-		// Drive may send a straggling inline update twice (see patchHedged).
-		ctx = context.WithValue(ctx, slotUploadHedgeKey{}, true)
-	}
-	return w.store.setSlot(ctx, id, f.encode(), body)
+	return w.store.setSlot(w.ctx, id, f.encode(), body)
 }
 
 // drained reports whether the reader took what the slot of seq held a lap
@@ -2156,13 +2130,6 @@ func (r *slotReader) readMediaBody(ctx context.Context, id string, seq int64, fr
 		err = errors.New("slot body does not match the segment checksum")
 	}
 	return body, err
-}
-
-func (r *slotReader) readSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}) (string, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
-	return r.huntSlotDescription(ctx, id, seq, promoted, &hunt)
 }
 
 func (r *slotReader) headOverlapDelay() time.Duration {

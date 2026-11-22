@@ -1,37 +1,16 @@
 package xdrive
 
-import "os"
-
-// slotInlineSingleWave lets a committed inline plan (at most
-// slotInlineBurstFrames frames) publish in one wave instead of waiting for a
-// second slotInlineWriteInflight wave. It is on by default and read once at
-// process start; XRAY_XDRIVE_INLINE_SINGLE_WAVE=0 restores the two-wave window.
-var slotInlineSingleWave = os.Getenv("XRAY_XDRIVE_INLINE_SINGLE_WAVE") != "0"
-
-// slotLiveInline keeps a live-sized burst (at most one inline wave, 336 KiB at
-// the default payload size) inline even while unrelated uploads are still
-// outstanding; the writer withholds it during sustained transfers and quota
-// recovery. On by default; XRAY_XDRIVE_LIVE_INLINE=0 restores the old rule.
-var slotLiveInline = os.Getenv("XRAY_XDRIVE_LIVE_INLINE") != "0"
-
-// slotLiveHybrid splits a live burst larger than one inline wave: its first
-// wave goes inline and the rest as media, uploaded alongside, and while live
-// traffic is inline, outstanding inline uploads do not count against the media
-// window. On by default; XRAY_XDRIVE_LIVE_HYBRID=0 turns both off.
-var slotLiveHybrid = os.Getenv("XRAY_XDRIVE_LIVE_HYBRID") != "0"
+// A committed inline plan (at most slotInlineBurstFrames frames) publishes in
+// one wave. A live-sized burst (at most one inline wave, 336 KiB at the
+// default payload size) stays inline beside unrelated uploads, except during
+// sustained transfers and quota recovery. A live burst larger than one wave
+// sends that wave inline and the rest as media alongside it.
 
 // slotPermitCap sizes the writer's permit channel. It must cover every window
-// writeWindowFor can return, or a flusher holding mu would block on the send.
-func slotPermitCap(singleWave bool) int {
-	n := max(slotWriteInflight, slotBulkInflight)
-	if singleWave {
-		n = max(n, slotInlineBurstFrames)
-	}
-	if slotLiveHybrid {
-		// A hybrid head wave plus the ordinary media window.
-		n = max(n, slotInlineWriteInflight+slotWriteInflight)
-	}
-	return n
+// writeWindowFor can return, or a flusher holding mu would block on the send:
+// a single-wave plan, and a split burst's inline wave beside the media window.
+func slotPermitCap() int {
+	return max(slotWriteInflight, slotBulkInflight, slotInlineBurstFrames, slotInlineWriteInflight+slotWriteInflight)
 }
 
 const (
@@ -48,14 +27,12 @@ type slotBatchWindow struct {
 	planned              int
 	live                 bool // refreshed by the writer under its lock before each admission
 
-	// hybridOn and planCap are refreshed with live: whether a live burst may
-	// be split, and how many uploads a committed inline plan may have in
-	// flight. hybrid is set when a split burst's inline wave is planned and
-	// kept until the writer has no inline upload in flight and nothing
-	// buffered, so the rest of that burst goes to media.
-	hybridOn bool
-	planCap  int
-	hybrid   bool
+	// planCap is refreshed with live: how many uploads a committed inline
+	// plan may have in flight. hybrid is set when a split burst's inline wave
+	// is planned and kept until the writer has no inline upload in flight and
+	// nothing buffered, so the rest of that burst goes to media.
+	planCap int
+	hybrid  bool
 }
 
 func newSlotBatchWindow(size, depth int) *slotBatchWindow {
@@ -89,7 +66,7 @@ func (b *slotBatchWindow) fits(buffered, outstanding, active int) bool {
 // send a full wave inline now, with the rest as media. The wave must be able
 // to go out at once beside what is already in flight.
 func (b *slotBatchWindow) splits(buffered, active int) bool {
-	return b.live && b.hybridOn && !b.hybrid && b.planned == 0 && b.window >= slotInlineWriteInflight &&
+	return b.live && !b.hybrid && b.planned == 0 && b.window >= slotInlineWriteInflight &&
 		buffered > b.budget && active+b.window <= b.planCap
 }
 
