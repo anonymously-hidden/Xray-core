@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"maps"
 	"net/http"
@@ -39,16 +40,16 @@ const (
 )
 
 type (
-	maxBodyKey   struct{}
-	cleanupKey   struct{}
-	namesOnlyKey struct{}
+	listedDriveIDKey struct{}
+	maxBodyKey       struct{}
+	cleanupKey       struct{}
+	namesOnlyKey     struct{}
 )
 
 type driveLane int
 
 const (
 	metadataLane driveLane = iota
-	priorityLane
 	mediaLane
 	laneCount
 )
@@ -95,7 +96,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
-	for i, limit := range [laneCount]int{48, 8, 24} {
+	for i, limit := range [laneCount]int{48, 24} {
 		s.pools[i] = newConnPool(config.Xmux, client)
 		s.permits[i] = make(chan struct{}, limit)
 	}
@@ -213,7 +214,7 @@ func (s *driveStorage) fetchToken(ctx context.Context) (string, time.Duration, e
 		return "", 0, tokenRetry{errors.New("failed to refresh the access token").Base(err)}
 	}
 	defer resp.Body.Close()
-	if retryableStatus(resp.StatusCode) || resp.StatusCode == http.StatusRequestTimeout {
+	if retryableStatus(resp.StatusCode) {
 		s.delayRequests(resp.Header) // Honor Retry-After even when the error body is truncated.
 		return "", 0, tokenRetry{errors.New("the token endpoint answered ", resp.StatusCode)}
 	}
@@ -282,7 +283,7 @@ func rateLimited(payload []byte) bool {
 }
 
 func retryableStatus(status int) bool {
-	return status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
 		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
 }
 
@@ -374,10 +375,12 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func (s *driveStorage) cooling() bool {
+func (s *driveStorage) cooling() bool { return s.cooldown() > 0 }
+
+func (s *driveStorage) cooldown() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return time.Now().Before(s.coolUntil)
+	return time.Until(s.coolUntil)
 }
 
 var errDriveSize = errors.New("Drive response exceeds size limit")
@@ -392,10 +395,9 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 
 // request owns the response through consume, including the HTTP permit. Only
 // an explicit rejection permits replaying a mutation: a lost reply is ambiguous.
-func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, byteRange string, buffered bool, consume func(*http.Response) error) error {
-	var last error
+func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, consume func(*http.Response) error) error {
 	refreshed := false
-	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			if err := sleepContext(ctx, jitter(min(driveMaxBackoff, driveInitialBackoff<<uint(attempt-1)))); err != nil {
 				return err
@@ -408,13 +410,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-s.permits[lane] }()
-			for {
-				s.mu.Lock()
-				delay := time.Until(s.coolUntil)
-				s.mu.Unlock()
-				if delay <= 0 {
-					break
-				}
+			for delay := s.cooldown(); delay > 0; delay = s.cooldown() {
 				if err := sleepContext(ctx, delay); err != nil {
 					return false, err
 				}
@@ -429,10 +425,6 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return false, err
 			}
 			req.Header.Set("Authorization", "Bearer "+token)
-			if byteRange != "" {
-				req.Header.Set("Range", byteRange)
-				req.Header.Set("Accept-Encoding", "identity")
-			}
 			if contentType != "" {
 				req.Header.Set("Content-Type", contentType)
 			}
@@ -444,10 +436,10 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return method == http.MethodGet && errors.Cause(err) != errSessionClosed, err
 			}
 			defer resp.Body.Close()
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			if resp.StatusCode == http.StatusOK || (method != http.MethodGet && resp.StatusCode/100 == 2) {
 				err := consume(resp)
-				// A buffered GET exposes no partial bytes before success; a span can.
-				return err != nil && buffered && method == http.MethodGet && err != errDriveSize, err
+				// GET consumers expose nothing until the whole response succeeds.
+				return err != nil && method == http.MethodGet && err != errDriveSize, err
 			}
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "" {
 				s.delayRequests(resp.Header) // Other lanes must not wait for this error body to finish.
@@ -468,8 +460,6 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			case resp.StatusCode == http.StatusForbidden && rateLimited(detail):
 				s.delayRequests(resp.Header)
 				return true, err
-			case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
-				return false, errDriveRange
 			case (method == http.MethodPost || method == http.MethodPatch) &&
 				(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge):
 				return false, refusedPayload{err}
@@ -479,17 +469,15 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return method == http.MethodGet && retryableStatus(resp.StatusCode), err
 			}
 		}()
-		if !retry || err == nil || ctx.Err() != nil {
+		if !retry || attempt+1 == driveMaxAttempts {
 			return err
 		}
-		last = err
 	}
-	return last
 }
 
 func (s *driveStorage) bytes(ctx context.Context, lane driveLane, method, target, contentType string, payload []byte, limit int64) ([]byte, error) {
 	var data []byte
-	err := s.request(ctx, lane, method, target, contentType, payload, "", true, func(resp *http.Response) error {
+	err := s.request(ctx, lane, method, target, contentType, payload, func(resp *http.Response) error {
 		var err error
 		data, err = readLimited(resp.Body, limit)
 		return err
@@ -516,7 +504,7 @@ func (f driveFile) regular() bool {
 }
 
 // Before using an ID chosen by the peer, bind it to a file in this session.
-// Lazy creates already establish identity; eager slots are verified on first use.
+// A successful create establishes identity; reads of existing IDs check it explicitly.
 func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
 	s.boundFolder = s.folder
 	if s.folder == "root" || s.folder == "appDataFolder" {
@@ -588,30 +576,22 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 	return err
 }
 
-var (
-	errDriveScope = errors.New("Drive file does not belong to the announced session")
-	errDriveRange = errors.New("Drive range not yet available")
-)
+var errDriveScope = errors.New("Drive file does not belong to the announced session")
 
 type refusedPayload struct{ error }
 
 func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
 	f := driveFile{ID: id, Name: flatten(name), MimeType: "application/octet-stream", Parents: []string{s.folder}, Description: description}
-	err := s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
+	err := s.writeFile(ctx, writeLane(body), http.MethodPost, "", f, body)
 	if err == nil {
 		s.unchecked.Delete(id)
 	}
 	return err
 }
 
-type headKey struct{}
-
-func writeLane(ctx context.Context, body []byte) driveLane {
+func writeLane(body []byte) driveLane {
 	if body != nil {
 		return mediaLane
-	}
-	if ctx.Value(headKey{}) != nil {
-		return priorityLane
 	}
 	return metadataLane
 }
@@ -622,7 +602,7 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 			return err
 		}
 	}
-	return s.writeFile(ctx, writeLane(ctx, body), http.MethodPatch, id, driveFile{Description: description}, body)
+	return s.writeFile(ctx, writeLane(body), http.MethodPatch, id, driveFile{Description: description}, body)
 }
 
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
@@ -631,7 +611,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	if pending {
 		fields += ",name,parents,trashed,mimeType"
 	}
-	data, err := s.bytes(ctx, writeLane(ctx, nil), http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?fields="+fields+"&supportsAllDrives=true", "", nil, 64<<10)
+	data, err := s.bytes(ctx, metadataLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?fields="+fields+"&supportsAllDrives=true", "", nil, 64<<10)
 	if err != nil {
 		return "", err
 	}
@@ -648,109 +628,37 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	return f.Description, nil
 }
 
-// A range owns [lo, hi) block indices. On retry next never moves back: even
-// a server that ignores Range cannot replay a block. After the last block a
-// retry still has to verify a nonempty suffix and its exact EOF.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error) error {
-	next := lo
-	for attempt := 0; ; attempt++ {
-		first := min(next, hi-1)
-		start, end := first*slotStreamBlockBytes, min(hi*slotStreamBlockBytes, f.size)
-		var header string
-		if start > 0 || end < f.size {
-			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
+// Each attempt fills a private frame. Even an error in the last byte restarts
+// the GET from zero; nothing has been delivered or acknowledged yet.
+func (s *driveStorage) readMedia(ctx context.Context, id string, f slotFrame) ([]byte, error) {
+	target := filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+	body := make([]byte, f.size)
+	read := func(resp *http.Response) error {
+		if resp.ContentLength >= 0 && resp.ContentLength != int64(len(body)) {
+			return errors.New("unexpected Drive media length")
 		}
-		bodyFailed := false
-		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, false, func(resp *http.Response) error {
-			bodyFailed = true
-			from, to, length := first, hi, end-start
-			switch resp.StatusCode {
-			case http.StatusOK:
-				from, to, length = 0, len(f.blocks), f.size
-			case http.StatusPartialContent:
-				if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, f.size) {
-					return errors.New("Drive returned a different media range")
-				}
-			default:
-				return fmt.Errorf("unexpected Drive media status %d", resp.StatusCode)
-			}
-			if resp.ContentLength >= 0 && resp.ContentLength != int64(length) {
-				return errors.New("unexpected Drive media length")
-			}
-			for i := from; i < to; i++ {
-				b := make([]byte, streamBlockSize(f.size, i))
-				if _, err := io.ReadFull(resp.Body, b); err != nil {
-					return err
-				}
-				if !validStreamBlock(f, i, b) {
-					return errors.New("Drive media block checksum mismatch")
-				}
-				if i == next && i < hi {
-					if err := emit(b); err != nil {
-						bodyFailed = false
-						return err
-					}
-					next++
-				}
-			}
-			var extra [1]byte
-			if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
-				return errors.New("Drive media did not end at the declared length").Base(err)
-			}
-			return nil
-		})
-		if err == nil || attempt != 0 || (!bodyFailed && err != errNotFound && err != errDriveRange) || ctx.Err() != nil {
+		if _, err := io.ReadFull(resp.Body, body); err != nil {
 			return err
 		}
-		if err := sleepContext(ctx, driveInitialBackoff); err != nil {
-			return err
+		var extra [1]byte
+		if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
+			return errors.New("Drive media did not end at its declared length").Base(err)
+		}
+		if crc32.ChecksumIEEE(body) != f.crc {
+			return errors.New("Drive media checksum mismatch")
+		}
+		return nil
+	}
+	err := s.request(ctx, mediaLane, http.MethodGet, target, "", nil, read)
+	if err == errNotFound { // A newly created description can precede its body.
+		if err = sleepContext(ctx, driveInitialBackoff); err == nil {
+			err = s.request(ctx, mediaLane, http.MethodGet, target, "", nil, read)
 		}
 	}
-}
-
-func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
-	n := len(f.blocks)
-	if n == 0 || f.mode != slotStream {
-		return errors.New("invalid Drive stream frame")
+	if err != nil {
+		return nil, err
 	}
-	if f.size+len(f.prefix) <= slotProgressiveMax || s.cooling() {
-		return s.readSpan(ctx, id, f, 0, n, emit)
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer func() {
-		cancel()
-		wg.Wait()
-	}()
-	type part struct {
-		blocks chan []byte
-		err    error // published by close(blocks)
-	}
-	parts := make([]part, min(4, n))
-	for i := range parts {
-		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
-		p := &parts[i]
-		p.blocks = make(chan []byte, hi-lo)
-		wg.Go(func() {
-			defer close(p.blocks)
-			p.err = s.readSpan(ctx, id, f, lo, hi, func(b []byte) error {
-				p.blocks <- b // capacity is the range size, each block is emitted once
-				return nil
-			})
-		})
-	}
-	for i := range parts {
-		p := &parts[i]
-		for b := range p.blocks {
-			if err := emit(b); err != nil {
-				return err
-			}
-		}
-		if p.err != nil {
-			return p.err
-		}
-	}
-	return nil
+	return body, nil
 }
 
 func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
@@ -773,7 +681,7 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 		var batch struct {
 			IDs []string `json:"ids"`
 		}
-		if json.Unmarshal(data, &batch) != nil || len(batch.IDs) != count || !validSlotIDs(make(map[string]bool, count), batch.IDs...) {
+		if json.Unmarshal(data, &batch) != nil || len(batch.IDs) != count || !validSlotIDs(batch.IDs) {
 			return nil, errors.New("invalid Drive ID batch")
 		}
 		s.ids, s.idsExpire = batch.IDs, time.Now().Add(10*time.Minute)
@@ -817,7 +725,7 @@ func (s *driveStorage) find(ctx context.Context, query string, describe, dateEnt
 	for {
 		var data []byte
 		var served, observed time.Time
-		err := s.request(ctx, metadataLane, http.MethodGet, filesURL+"?"+q.Encode(), "", nil, "", true, func(resp *http.Response) error {
+		err := s.request(ctx, metadataLane, http.MethodGet, filesURL+"?"+q.Encode(), "", nil, func(resp *http.Response) error {
 			if dateEntries {
 				observed = time.Now()
 				served, _ = http.ParseTime(resp.Header.Get("Date"))
@@ -848,11 +756,9 @@ func (s *driveStorage) find(ctx context.Context, query string, describe, dateEnt
 				if served.IsZero() {
 					return nil, errors.New("missing Drive listing date")
 				}
-				created, err := time.Parse(time.RFC3339Nano, f.CreatedTime)
-				if err != nil {
-					continue // Unknown age: skip this file, not unrelated sessions.
+				if created, err := time.Parse(time.RFC3339Nano, f.CreatedTime); err == nil {
+					f.created = observed.Add(-max(0, served.Sub(created)))
 				}
-				f.created = observed.Add(-max(0, served.Sub(created)))
 			}
 			found = append(found, f)
 		}
@@ -885,12 +791,12 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 			if child {
 				continue
 			}
-			if seen { // Multiple physical files must not contribute one age and another payload.
+			if seen || f.created.IsZero() { // Unknown-age files still count as physical name conflicts.
 				entries[name] = Entry{}
 				continue
 			}
 		}
-		e.Name, e.created = name, f.created
+		e.Name, e.created, e.driveID = name, f.created, f.ID
 		// A malformed description must not hide an entry from age-based cleanup.
 		if !child && f.Description != "" {
 			if data, err := base64.StdEncoding.DecodeString(f.Description); err == nil {
@@ -919,6 +825,9 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 		return nil, errDriveDuplicate
 	}
 	f := files[0]
+	if id, _ := ctx.Value(listedDriveIDKey{}).(string); id != "" && f.ID != id {
+		return nil, errNotFound
+	}
 	limit, _ := ctx.Value(maxBodyKey{}).(int64)
 	if limit <= 0 {
 		limit = maxSegmentBytes
@@ -954,8 +863,9 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 	if announcement && len(files) > 1 {
 		return errDriveDuplicate
 	}
+	listedID, _ := ctx.Value(cleanupKey{}).(string)
 	for _, f := range files {
-		if f.ID == "" || (f.Name != flat && (announcement || !strings.HasPrefix(f.Name, prefix))) {
+		if f.ID == "" || (listedID != "" && f.ID != listedID) || (f.Name != flat && (announcement || !strings.HasPrefix(f.Name, prefix))) {
 			continue
 		}
 		// Share cleanup pacing across sessions instead of competing with uploads.

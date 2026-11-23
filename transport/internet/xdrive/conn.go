@@ -28,7 +28,6 @@ type Conn struct {
 	writeDeadline *pipeDeadline
 	closing       chan struct{}
 
-	publishWG sync.WaitGroup // registered before Dial exposes the connection
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -62,14 +61,14 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 	}
 }
 
-func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, first []byte, onClose func()) *Conn {
+func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, onClose func()) *Conn {
 	ctx, fail := context.WithCancelCause(ctx)
 	closing := make(chan struct{})
 	return &Conn{
 		ctx:     ctx,
 		cancel:  func() { fail(context.Canceled) },
 		writer:  newSlotWriter(ctx, fail, store, write, p),
-		reader:  newSlotReader(ctx, fail, store, read, p, first, closing),
+		reader:  newSlotReader(ctx, fail, store, read, p, closing),
 		onClose: onClose,
 
 		readDeadline:  newPipeDeadline(),
@@ -193,7 +192,15 @@ func (c *Conn) Close() error {
 		progress := func() time.Time { return started }
 		if writer, ok := c.writer.(*slotWriter); ok {
 			writer.markProgress()
-			progress = writer.closeProgress
+			reader := c.reader.(*slotReader)
+			progress = func() time.Time {
+				last := writer.closeProgress()
+				// Inbound activity must not hide a stalled outbound writer.
+				if credit := reader.drainCredit.Load(); isClosedChan(writer.done) && credit != nil && credit.After(last) {
+					return *credit
+				}
+				return last
+			}
 		}
 		go func() {
 			result = c.closeOrdered(c.writer.Close())
@@ -209,22 +216,14 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) closeOrdered(err error) error {
-	c.publishWG.Wait()
-	if err == nil {
-		if writer, ok := c.writer.(interface{ Err() error }); ok {
-			err = writer.Err()
-		}
-	}
 	if reader, ok := c.reader.(*slotReader); ok && err == nil {
-		ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
-		// Only verified data earns credit. Abort does not start a new write.
-		err = reader.finish(ctx)
-		cancel()
+		// Our END says nothing about the peer's outstanding writes. Keep the
+		// reader alive to return credit through the peer's END.
+		// The outer watchdog bounds this wait even if the peer never closes.
+		reader.wait()
+		err = context.Cause(c.ctx)
 	}
 	c.cancel()
-	if writer, ok := c.writer.(interface{ wait() }); ok {
-		writer.wait()
-	}
 	if reader, ok := c.reader.(interface{ wait() }); ok {
 		reader.wait()
 	}

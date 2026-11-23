@@ -20,6 +20,7 @@ var errNotFound = errors.New("object not found")
 type Entry struct {
 	Name    string
 	Inline  []byte
+	driveID string    // object listed under Name, empty for non-Drive entries
 	created time.Time // optional backend-supplied creation time on the local clock
 }
 
