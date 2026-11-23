@@ -64,7 +64,6 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 
 func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, first []byte, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
-	p.link = new(slotLink)
 	return &Conn{
 		ctx:     ctx,
 		cancel:  cancel,
@@ -187,18 +186,26 @@ func (c *Conn) Close() error {
 		close(c.closing)
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
-		done := make(chan error, 1)
+		done := make(chan struct{})
+		var result error
+		finish := func(err error) {
+			result = c.closeOrdered(err)
+			close(done)
+		}
 		started := time.Now()
 		progress := func() time.Time { return started }
 		if writer, ok := c.writer.(*slotWriter); ok {
 			// The writer owns the drain bound; teardown uses its remaining budget.
 			err := writer.Close()
 			progress = writer.closeProgress
-			go func() { done <- c.closeOrdered(err) }()
+			go finish(err)
 		} else {
-			go func() { done <- c.closeOrdered(c.writer.Close()) }()
+			go func() { finish(c.writer.Close()) }()
 		}
-		c.closeErr = waitCloseProgress(done, nil, progress)
+		c.closeErr = waitCloseProgress(done, progress)
+		if c.closeErr == nil {
+			c.closeErr = result
+		}
 		c.cancel()
 	})
 	return c.closeErr
@@ -210,6 +217,12 @@ func (c *Conn) closeOrdered(err error) error {
 		if writer, ok := c.writer.(interface{ Err() error }); ok {
 			err = writer.Err()
 		}
+	}
+	if reader, ok := c.reader.(*slotReader); ok && err == nil && c.ctx.Err() == nil {
+		ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
+		// Only verified data earns credit. Abort does not start a new write.
+		_ = reader.finish(ctx)
+		cancel()
 	}
 	c.cancel()
 	if writer, ok := c.writer.(interface{ wait() }); ok {

@@ -1,105 +1,83 @@
 # XDRIVE
 
-XDRIVE carries one ordered byte stream per session through a storage backend:
-Google Drive, S3, a URL template, or a local folder. Both peers must run the
-same release. There is no compatibility with earlier XDRIVE releases or
-negotiation with them.
+xDrive carries an ordered byte stream in each direction. Use matching releases on
+both peers. Drive uses slots; local, URL-template and S3 stores keep their WAL.
+This repository is a review candidate based on the maintainer's fork, not a merge
+of the current upstream branch.
 
-## Sessions and slots
+## Drive protocol
 
-On Drive the client announces a session with a ring of slot files for each
-direction plus one watermark file per reader. Each frame is written to slot
-`seq % len(ring)`, and its description says what the slot holds:
+The announcement names a table of file IDs and one reader-owned watermark for
+**each direction**. IDs are allocated in batches. The first lap creates files
+on first publication. Established sessions do not list files to find data:
+sequence `n` maps directly to `slots[n % depth]`. If present, the announcement's
+first payload is sequence zero, not an additional record.
 
-| mode | meaning |
-| --- | --- |
-| 1 inline | the payload (up to 14 KiB) sits in the description, no media request |
-| 3 end / 4 error | the stream ended / the peer could not store this segment |
-| 5 stream | the payload is the file body; the description carries its size, CRC32 and one CRC32 per 32 KiB block |
-| 6 stream + prefix | as 5, plus the first 11 KiB of the payload in the description |
+The frame magic (`XDRVSL01`), sequence and length fields, JSON keys, and modes
+are unchanged. Mode 1 carries up to 14 KiB in metadata. Modes 5 and 6 carry a
+body with one CRC32 per 32 KiB block; mode 6 additionally carries an 11 KiB
+prefix in metadata. Modes 3 and 4 mean end and error. CRCs detect accidental
+corruption, not malicious modification; VLESS encryption remains required.
 
-Other backends (S3, template, local) use a WAL of `<seq>.seg` objects. A
-template WAL writer also uploads a 48-byte `<seq>.commit` (`XDWALC01`, length,
-SHA-256); readers deliver a segment only after its commit matches.
+- **Write:** one goroutine batches caller input and assigns sequence numbers.
+  After idle, a small write has a 2 ms gather window. The planner uses up to 24
+  available inline positions; larger bursts can use media. There are at most
+  32 upload workers per direction and never more than the ring depth. Reuse
+  requires both previous local completion and cumulative remote credit.
+- **Read:** only the ordered head is polled when idle. During activity, up to
+  12 known descriptions are prefetched. An active head may start one extra
+  metadata GET after 125 ms. Media lookahead has two credits held through frame
+  retirement; the ordered head cannot be blocked waiting for those credits.
+  Workers can finish out of order; one coordinator alone delivers bytes.
+- **Media:** frames through 512 KiB use one progressive GET; larger frames can
+  use four block-aligned ranges. Validate the checksum table, each emitted
+  block, HTTP range/length and EOF. One retry can resume an incomplete span
+  without delivering the same bytes twice. There is no speculative media GET.
+- **Close:** publish END after draining prior uploads. On graceful connection
+  close, stop the reader, take a final verified watermark snapshot, and attempt
+  its write with a live, bounded context. Interrupt cancels instead.
 
-Invariants:
+## Implementation and trade-offs
 
-- Bytes are delivered in order. A later frame never overtakes a missing earlier
-  one, and bytes already delivered are never replayed by a retry or a copy.
-- Every block is checked against its CRC before delivery. The block table must
-  match the frame CRC before the first block is delivered.
-- A slot is reused only after the reader has fully verified the frame (exact
-  length, EOF, every block queued) and advanced its watermark.
-- CRC32 detects corruption; it is not authentication. Confidentiality and
-  integrity come from VLESS encryption, which is mandatory with mux.
+`slots.go` and `slot_stream.go` own the wire codec. `slot_writer.go` and
+`slot_reader.go` own sequencing, scheduling, and credit. `drive.go` owns OAuth,
+Drive requests, quotas, object CRUD, ID allocation, and media verification.
+`client.go` is shared with the URL-template and S3 transports. It retains the
+configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
+keepalive and XMUX leases. Drive uses distinct metadata, priority and media
+pools. A lease is selected once instead of sampling and rejecting candidates.
 
-## Reading
+Removed from the larger implementation: custom spare-connection probes,
+background connection/token/ID keepers, eager spare rings, duplicated media
+rescue and latency controllers, and detailed per-burst telemetry. A Drive ID
+allocation failure now fails the dial explicitly instead of switching to WAL.
+An ambiguously completed mutation is not automatically replayed. These are
+behavior differences, not just source rearrangement. Historical throughput
+and tail-latency measurements from the larger version are **not** measurements
+of this one. This candidate has not been built or benchmarked here.
 
-- The head slot is polled every 10-25 ms while the session is active; slots
-  behind it follow the observed frame pace (150 ms-2 s) and back off after
-  repeated misses. Near successors (up to 11, or 23 while full inline frames
-  arrive) poll at 40 ms during a burst or while a media body is downloading.
-- Stream frames up to 512 KiB are read by one progressive GET that hands each
-  verified block over as soon as its turn comes. Larger frames are split into
-  block-aligned ranges over four media lanes (at most four ranges for the head).
-- A stalled or persistently slow head download can get one alternate GET that
-  starts at the first unverified block, within a per-session token budget, and
-  never during cooldown or within 5 s of a rate limit.
-- Body admission is bounded by bytes and by a prefetch window, so a slow
-  consumer cannot make the reader buffer without limit.
+## Drive source budget (physical lines, including comments and blanks)
 
-## Writing
+Count all six implementation files in full, **including the shared HTTP client**.
+For mixed files, the following inventory charges whole integration functions
+where practical, including generic code within them. The remaining WAL/backend,
+protocol-wide listener, configuration and generated protobuf code is shared or
+unrelated, not a hidden second Drive implementation. Ranges below are inclusive
+for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/`.
 
-- Frames up to 14 KiB go inline; larger ones go as stream frames. During a
-  burst the front of the upload queue may also carry an 11 KiB prefix (mode 6).
-- A live-sized burst (up to one inline wave, 24 frames = 336 KiB) stays inline
-  next to other traffic unless a sustained transfer or quota recovery is under
-  way. A larger live burst sends its first wave inline and the rest as media in
-  parallel.
-- Upload concurrency comes from an adaptive latency window, capped at 36
-  uploads. 403/429 answers trigger exponential backoff with jitter and a shared
-  cooldown.
-
-## Connections
-
-Requests use separate HTTP/2 pools (main, priority, bulk, four media lanes,
-head media). Each active pool keeps one warm spare connection, opened with an
-unauthenticated HEAD to the service host. If a connection hears nothing for
-1.5 s after a small request while other connections answer, it is probed with a
-HEAD on that connection. If the probe gets no answer within 1 s the connection
-is closed and its requests are retried elsewhere.
-
-On both client and server, `streamSettings` configure the Drive connections:
-`tlsSettings` (including `alpn` and `fingerprint`), `sockopt`, `finalmask`,
-`xdriveSettings.xmux`, and `address`/`port`. If set, the address is dialed
-instead of the service host; SNI stays the service host. On a client,
-`streamSettings.address` takes priority over the outbound address, which is
-used only when it is unset.
-
-## Quota
-
-Drive [limits](https://developers.google.com/workspace/drive/api/guides/limits)
-(checked November 2026): 325,000 units/minute per user per project and
-1,000,000 per project. A metadata read costs 5 units, an edit 50, a list 100
-and a media GET 200 (ranges included). Measured live sessions used about
-18,000-35,000 units/minute per peer.
-
-Drive cannot serve a request in under about two writes plus two reads:
-request-to-first-byte is about 2.0 s for inline frames and about 4 s once any
-media frame is involved. Each segment of a serially fetched stream must
-arrive within its own duration, so 2 s live segments cannot keep up. Segments
-of 6 s or more can.
-
-## Logs
-
-- `xdrive write` / `xdrive read` (debug): per frame, with mode, upload or
-  discovery timings, `head-wait`, `first-block-wait` and body-window state.
-- `xdrive burst write` / `xdrive burst read` (info): one line per segment-sized
-  burst (frames of at least 8 KiB, closed after a 600 ms gap). Fields include
-  `span`, `first-put`, `last-cut`, upload p50/max, `mbps`, and `after-read` /
-  `after-write`. On the client, `after-write` is a lower bound of request to
-  last byte.
-- `xdrive download` (debug): one line per media GET, with `ttfb`, `body`,
-  `mbps`, connection id, lane, and the number of overlapping downloads.
-- `xdrive spare connection <n> ready`, `xdrive connection <n> slow but alive`
-  (debug), and `xdrive connection <n> answered nothing ... closing it` (info).
+| Source | Inclusive lines counted | Count |
+|---|---|---:|
+| `drive.go` | whole file | 832 |
+| `slots.go` | whole file | 220 |
+| `slot_reader.go` | whole file | 393 |
+| `slot_writer.go` | whole file | 341 |
+| `slot_stream.go` | whole file | 136 |
+| `client.go` | whole file | 522 |
+| `conn.go` | 65–78, 184–212, 214–238 | 68 |
+| `xdrive.go` | 135–226, 325–424, 490–504, 506–530, 557–589, 605–707 | 368 |
+| `params.go` | 74–88 | 15 |
+| `storage.go` | 34–61, 63–73 | 39 |
+| `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
+| `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
+| `infra/conf/transport_internet.go` | 266–275 | 10 |
+| **Total** | | **2996** |

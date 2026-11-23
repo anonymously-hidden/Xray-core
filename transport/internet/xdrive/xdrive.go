@@ -5,12 +5,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	stderrors "errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -26,11 +24,6 @@ const (
 	streamsDir   = "streams"
 	uplinkDir    = "c2s"
 	downlinkDir  = "s2c"
-)
-
-const (
-	spareCount    = 2
-	spareIdleStop = 10 * time.Minute
 )
 
 func init() {
@@ -139,284 +132,6 @@ func streamConfig(streamSettings *internet.MemoryStreamConfig) (*Config, error) 
 	return config, nil
 }
 
-type spareRing struct {
-	storage Storage
-	session string
-	ring    ring
-	at      time.Time
-}
-
-type spareBox struct {
-	ch     chan spareRing
-	wake   chan struct{}
-	done   chan struct{}
-	busy   atomic.Bool
-	last   atomic.Int64
-	ttl    atomic.Int64
-	stop   atomic.Bool
-	closed atomic.Bool
-	mu     sync.Mutex
-	ctx    context.Context
-	cancel context.CancelFunc
-	timer  *time.Timer
-	key    spareKey
-}
-
-type spareKey struct {
-	config  *Config
-	profile string
-}
-
-var spareBoxes sync.Map
-
-func spareBoxFor(config *Config, settings ...*internet.MemoryStreamConfig) *spareBox {
-	var streamSettings *internet.MemoryStreamConfig
-	if len(settings) > 0 {
-		streamSettings = settings[0]
-	}
-	key := spareKey{config: config, profile: shareKey(streamSettings, config)}
-	for {
-		if b, ok := spareBoxes.Load(key); ok {
-			box := b.(*spareBox)
-			if !box.closed.Load() {
-				return box
-			}
-			spareBoxes.CompareAndDelete(key, box)
-			continue
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		box := &spareBox{
-			ch: make(chan spareRing, spareCount), wake: make(chan struct{}, 1), done: make(chan struct{}),
-			ctx: ctx, cancel: cancel, key: key,
-		}
-		box.last.Store(time.Now().UnixNano())
-		box.ttl.Store(int64(defaultSessionTTL))
-		if _, loaded := spareBoxes.LoadOrStore(key, box); loaded {
-			cancel()
-			continue
-		}
-		go box.reap()
-		return box
-	}
-}
-
-func (box *spareBox) reap() {
-	defer close(box.done)
-	for {
-		if box.stop.Load() {
-			box.cancel()
-			box.mu.Lock()
-			if box.timer != nil {
-				box.timer.Stop()
-				box.timer = nil
-			}
-			if !box.busy.Load() {
-				for len(box.ch) > 0 {
-					dropSpare(box.ctx, <-box.ch)
-				}
-				box.mu.Unlock()
-				return
-			}
-			box.mu.Unlock()
-			<-box.wake
-			continue
-		}
-		box.mu.Lock()
-		now := time.Now()
-		next := spareIdleStop - now.Sub(time.Unix(0, box.last.Load()))
-		for n := len(box.ch); n > 0; n-- {
-			s := <-box.ch
-			remaining := time.Duration(box.ttl.Load())*2/3 - now.Sub(s.at)
-			if remaining <= 0 {
-				dropSpare(box.ctx, s)
-			} else {
-				box.ch <- s
-				next = min(next, remaining)
-			}
-		}
-		box.mu.Unlock()
-		if next <= 0 {
-			box.close()
-			continue
-		}
-		timer := time.NewTimer(next)
-		select {
-		case <-box.ctx.Done():
-		case <-box.wake:
-		case <-timer.C:
-		}
-		timer.Stop()
-	}
-}
-
-func (box *spareBox) signal() {
-	select {
-	case box.wake <- struct{}{}:
-	default:
-	}
-}
-
-func dropSpare(_ context.Context, s spareRing) {
-	s.storage.Close()
-}
-
-// Wake the reaper to cancel refill and drain after admitted work exits.
-func (box *spareBox) close() {
-	if !box.closed.CompareAndSwap(false, true) {
-		return
-	}
-	box.stop.Store(true)
-	spareBoxes.CompareAndDelete(box.key, box)
-	box.signal()
-}
-
-func takeSpare(config *Config, p params, settings ...*internet.MemoryStreamConfig) (spareRing, bool) {
-	var streamSettings *internet.MemoryStreamConfig
-	if len(settings) > 0 {
-		streamSettings = settings[0]
-	}
-	value, found := spareBoxes.Load(spareKey{config: config, profile: shareKey(streamSettings, config)})
-	if !found {
-		return spareRing{}, false
-	}
-	box := value.(*spareBox)
-	box.mu.Lock()
-	defer box.mu.Unlock()
-	if box.stop.Load() {
-		return spareRing{}, false
-	}
-	box.last.Store(time.Now().UnixNano())
-	box.ttl.Store(int64(p.sessionTTL))
-	box.signal()
-	for {
-		select {
-		case s := <-box.ch:
-			if time.Since(s.at) < p.sessionTTL*2/3 {
-				return s, true
-			}
-			dropSpare(box.ctx, s)
-		default:
-			return spareRing{}, false
-		}
-	}
-}
-
-func warmSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	box := spareBoxFor(config, streamSettings)
-	box.last.Store(time.Now().UnixNano())
-	box.ttl.Store(int64(p.sessionTTL))
-	box.signal()
-	fillSpares(streamSettings, config, p)
-}
-
-func fillSpares(streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	fillSparesBox(spareBoxFor(config, streamSettings), streamSettings, config, p)
-}
-
-func fillSparesBox(box *spareBox, streamSettings *internet.MemoryStreamConfig, config *Config, p params) {
-	box.mu.Lock()
-	if box.stop.Load() || !box.busy.CompareAndSwap(false, true) {
-		box.mu.Unlock()
-		return
-	}
-	if box.timer != nil {
-		box.timer.Stop()
-	}
-	box.timer = nil
-	box.mu.Unlock()
-	go func() {
-		defer func() {
-			box.busy.Store(false)
-			box.signal()
-		}()
-		box.mu.Lock()
-		for n := len(box.ch); n > 0; n-- {
-			s := <-box.ch
-			if time.Since(s.at) < p.sessionTTL/3 {
-				box.ch <- s
-			} else {
-				dropSpare(box.ctx, s)
-			}
-		}
-		box.mu.Unlock()
-		for len(box.ch) < cap(box.ch) {
-			select {
-			case <-box.ctx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
-			box.mu.Lock()
-			stopped, full := box.stop.Load(), len(box.ch) == cap(box.ch)
-			box.mu.Unlock()
-			if stopped {
-				return
-			}
-			if full {
-				break
-			}
-			storage, err := newStorage(streamSettings)
-			if err != nil {
-				return
-			}
-			storage, err = transferSessionStorage(storage)
-			if err != nil {
-				return
-			}
-			slots, ok := storage.(slotStore)
-			if !ok {
-				storage.Close()
-				return
-			}
-			session, err := newSessionID()
-			if err != nil {
-				storage.Close()
-				return
-			}
-			ctx, cancel := context.WithTimeout(box.ctx, 30*time.Second)
-			r, err := makeRing(ctx, slots, session, p)
-			cancel()
-			if err != nil {
-				dropSpare(box.ctx, spareRing{storage: storage, session: session})
-				return
-			}
-			box.mu.Lock()
-			if box.stop.Load() {
-				box.mu.Unlock()
-				storage.Close()
-				return
-			}
-			select {
-			case box.ch <- spareRing{storage: storage, session: session, ring: r, at: time.Now()}:
-				box.signal()
-				box.mu.Unlock()
-			default:
-				box.mu.Unlock()
-				storage.Close()
-				return
-			}
-		}
-		box.mu.Lock()
-		defer box.mu.Unlock()
-		if box.stop.Load() {
-			return
-		}
-		box.timer = time.AfterFunc(p.sessionTTL/4, func() {
-			if box.stop.Load() {
-				return
-			}
-			if time.Since(time.Unix(0, box.last.Load())) >= spareIdleStop {
-				box.close()
-				return
-			}
-			fillSparesBox(box, streamSettings, config, p)
-		})
-	}()
-}
-
-func terminalSessionError(err error) bool {
-	return isAuthError(err) || stderrors.Is(err, context.Canceled) || stderrors.Is(err, context.DeadlineExceeded)
-}
-
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (stat.Connection, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -434,82 +149,28 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		streamSettings = &patched
 	}
 
-	p := paramsFromConfig(config)
-
-	var spare spareRing
-	var warm bool
-	if streamSettings.FinalMask == nil {
-		spare, warm = takeSpare(config, p, streamSettings)
+	storage, err := newStorage(streamSettings)
+	if err != nil {
+		return nil, err
 	}
-	storage, session, r := spare.storage, spare.session, spare.ring
-	if !warm {
-		storage, err = newStorage(streamSettings)
-		if err != nil {
-			return nil, err
-		}
-		storage, err = transferSessionStorage(storage)
-		if err != nil {
-			return nil, err
-		}
-
-		session, err = newSessionID()
+	storage, err = transferSessionStorage(storage)
+	if err != nil {
+		return nil, err
+	}
+	session, err := newSessionID()
+	if err != nil {
+		storage.Close()
+		return nil, err
+	}
+	p := paramsForStorage(config, storage)
+	if slots, ok := storage.(slotStore); ok {
+		depth := max(2, p.concurrency)
+		ids, err := slots.takeIDs(ctx, 2*(depth+1))
 		if err != nil {
 			storage.Close()
 			return nil, err
 		}
-	}
-
-	p = paramsForStorage(config, storage)
-
-	slots, ok := storage.(slotStore)
-	ls, canAllocate := storage.(interface {
-		takeIDs(context.Context, int, int) ([]string, error)
-	})
-	lazy := false
-	if ok && !warm {
-		if canAllocate {
-			depth := max(p.concurrency, 2)
-			worth := depth + 1
-			ids, e := ls.takeIDs(ctx, 2*worth, worth)
-			if e != nil && !terminalSessionError(e) {
-				if cooled, ok := storage.(interface{ waitCool(context.Context) error }); ok {
-					if e = cooled.waitCool(ctx); e == nil {
-						ids, e = ls.takeIDs(ctx, 2*worth, worth)
-					}
-				}
-			}
-			if ctx.Err() != nil {
-				e = ctx.Err()
-			}
-			if terminalSessionError(e) {
-				storage.Close()
-				return nil, e
-			}
-			if e == nil && len(ids) >= 2*worth {
-				r = lazyRing(session, depth, ids)
-				lazy = true
-			}
-		}
-		if !lazy {
-			if r, err = makeRing(ctx, slots, session, p); err != nil {
-				if terminalSessionError(err) {
-					storage.Close()
-					return nil, err
-				}
-				ok = false
-				errors.LogWarningInner(ctx, err, "failed to make the slots of session ", session, ", it goes in segments")
-			}
-		}
-	}
-
-	if err := ctx.Err(); err != nil {
-		storage.Close()
-		return nil, err
-	}
-	if ok {
-		if !canAllocate && !lazy && streamSettings.FinalMask == nil {
-			warmSpares(streamSettings, config, p)
-		}
+		r := lazyRing(session, depth, ids)
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
 		releaseSession, err := holdStorageSession(storage, session)
 		if err != nil {
@@ -521,7 +182,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			releaseSession()
 		})
 		writer := conn.writer.(*slotWriter)
-		writer.first = make(chan []byte, 1)
+
 		conn.publishWG.Add(1)
 		go func() {
 			defer conn.publishWG.Done()
