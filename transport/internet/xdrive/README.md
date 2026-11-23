@@ -24,7 +24,9 @@ corruption, not malicious modification; VLESS encryption remains required.
   available inline positions; larger bursts can use media. There are at most
   32 upload workers per direction and never more than the ring depth. Reuse
   requires both previous local completion and cumulative remote credit.
-- **Read:** only the ordered head is polled when idle. During activity, up to
+- **Read:** idle polling focuses on the head. After a minute without a head,
+  one bounded background probe at a time rotates through other slot descriptions
+  to distinguish a gap from a genuinely idle peer. During activity, up to
   12 known descriptions are prefetched. An active head may start one extra
   metadata GET after 125 ms. Media lookahead has two credits held through frame
   retirement; the ordered head cannot be blocked waiting for those credits.
@@ -33,9 +35,9 @@ corruption, not malicious modification; VLESS encryption remains required.
   use four block-aligned ranges. Validate the checksum table, each emitted
   block, HTTP range/length and EOF. One retry can resume an incomplete span
   without delivering the same bytes twice. There is no speculative media GET.
-- **Close:** publish END after draining prior uploads. On graceful connection
-  close, stop the reader, take a final verified watermark snapshot, and attempt
-  its write with a live, bounded context. Interrupt cancels instead.
+- **Close:** while outbound uploads drain, Close discards unread inbound bytes
+  but keeps verifying frames and returning credit. It then publishes END, stops
+  the reader and flushes its final verified watermark. Interrupt cancels instead.
 
 ## Implementation and trade-offs
 
@@ -46,21 +48,57 @@ Drive requests, quotas, object CRUD, ID allocation, and media verification.
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
 pools. A lease is selected once instead of sampling and rejecting candidates.
+Peer-supplied IDs are checked for valid syntax and uniqueness. An existing
+object must match its announced session name and configured parent on first
+use. Keep the folder private to the two peers; these checks do not authenticate
+a writer who already has access to the session folder.
 
 Removed from the larger implementation: custom spare-connection probes,
 background connection/token/ID keepers, eager spare rings, duplicated media
 rescue and latency controllers, and detailed per-burst telemetry. A Drive ID
 allocation failure now fails the dial explicitly instead of switching to WAL.
-An ambiguously completed slot or watermark write is checked by reading its exact
-description back from the known ID, without replaying it. If confirmation fails,
+Announcements are also created with reserved IDs. After a lost reply, read back
+the exact slot, watermark or inline announcement description; for a media
+announcement also compare the complete body. Never replay an ambiguous write.
+If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
 the original write error is preserved. Graceful close reports final ACK errors. These are
 behavior differences, not just source rearrangement. Historical throughput
 and tail-latency measurements from the larger version are **not** measurements
-of this one. This candidate has not been built or benchmarked here.
+of this one. Empty Drive announcements are rejected rather than opened as WAL
+sessions. Uploads and OAuth refresh requests do not follow redirects.
+
+## Failure handling and verification
+
+A fatal upload, media-read or watermark error cancels both halves of a Drive
+connection with the first error as the cause. A normal END only closes its
+own direction. Readers reject an overwritten sequence; a writer verifies that
+a cumulative ACK cannot cover its own unpublished sequence before reusing a slot.
+Buffered GETs can retry an interrupted response body. Streamed media resumes
+by block, and an ambiguous mutation is not replayed. Listing and ID allocation
+use the app-data space when `remoteFolder` is `appDataFolder`. Drive announcement
+age is seeded from `createdTime` and the listing response’s `Date`, so an expired
+announcement does not become fresh when a listener restarts. This is not a
+persistent exactly-once claim within the TTL. An unprovable gap (no subsequent
+frame) still looks like an idle connection; use a read deadline when one is required.
+
+Transient OAuth transport and service failures can retry before any file operation
+is sent. Drive rate-limit responses and 503 responses with `Retry-After` apply a
+shared cooldown; a 503 is not permission to replay a mutation. Cleanup excludes
+folders and Google-native objects. Conflicting regular files with the exact same
+announcement name are not selected or deleted as a group; resolve them manually.
+The admission deadline also applies while loading or binding the announcement,
+not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+This snapshot contains no XDrive test files. It was rechecked statically and
+with offline protocol models, not compiled, race-tested or run against a live
+Drive account here. To check the package in a checkout with the Go toolchain
+specified in `go.mod`, run `go build ./transport/internet/xdrive` and
+`go vet ./transport/internet/xdrive`. Before deployment, run a transfer in both
+directions through ring reuse, a media frame, and simultaneous close.
 
 ## Drive source budget (physical lines, including comments and blanks)
 
-Count all six implementation files in full, **including the shared HTTP client**.
+Count all six implementation files in full, including the shared HTTP client.
 For mixed files, the following inventory charges whole integration functions
 where practical, including generic code within them. The remaining WAL/backend,
 protocol-wide listener, configuration and generated protobuf code is shared or
@@ -69,17 +107,17 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 847 |
-| `slots.go` | whole file | 202 |
-| `slot_reader.go` | whole file | 393 |
-| `slot_writer.go` | whole file | 341 |
-| `slot_stream.go` | whole file | 136 |
-| `client.go` | whole file | 522 |
-| `conn.go` | 65–78, 184–212, 214–238 | 68 |
-| `xdrive.go` | 135–226, 325–424, 490–504, 506–530, 557–589, 605–707 | 368 |
+| `drive.go` | whole file | 972 |
+| `slots.go` | whole file | 204 |
+| `slot_reader.go` | whole file | 379 |
+| `slot_writer.go` | whole file | 308 |
+| `slot_stream.go` | whole file | 119 |
+| `client.go` | whole file | 500 |
+| `conn.go` | 65–79, 185–209, 211–235 | 65 |
+| `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
 | `params.go` | 74–88 | 15 |
-| `storage.go` | 34–61, 63–73 | 39 |
+| `storage.go` | 9, 20–24, 36–63, 65–75 | 45 |
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2993** |
+| **Total** | | **2998** |

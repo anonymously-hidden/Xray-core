@@ -15,7 +15,8 @@ import (
 // head. Lookahead media retains at most two whole frames, plus the ordered head.
 type slotReader struct {
 	ctx      context.Context
-	cancel   context.CancelFunc
+	setErr   context.CancelCauseFunc
+	discard  <-chan struct{}
 	stopRead context.CancelFunc
 	readDone chan struct{}
 	store    slotStore
@@ -24,24 +25,22 @@ type slotReader struct {
 	ch                              chan []byte
 	wake, ack, ackTurn, media       chan struct{}
 	head, frontier, activeAt, acked atomic.Int64
+	probing                         atomic.Bool
 	wg                              sync.WaitGroup
-	mu                              sync.Mutex
-	err                             error
 }
 
 type readSlot struct {
-	seq                        int64
-	head, retired, ready, done chan struct{}
-	data                       chan []byte // published by ready; closed after the last verified block
-	end                        bool
-	err                        error // published by done
+	seq                  int64
+	head, retired, ready chan struct{}
+	data                 chan []byte // published by ready; closed after the last verified block
+	end                  bool
+	err                  error // published by closing ready (no data) or data
 }
 
-func newSlotReader(parent context.Context, store slotStore, table slotTable, p params, first []byte) *slotReader {
-	ctx, cancel := context.WithCancel(parent)
+func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
 	readCtx, stopRead := context.WithCancel(ctx)
 	r := &slotReader{
-		ctx: ctx, cancel: cancel, stopRead: stopRead, readDone: make(chan struct{}), store: store, table: table, params: p,
+		ctx: ctx, setErr: fail, discard: discard, stopRead: stopRead, readDone: make(chan struct{}), store: store, table: table, params: p,
 		ch: make(chan []byte, 2), wake: make(chan struct{}, 1), ack: make(chan struct{}, 1),
 		ackTurn: make(chan struct{}, 1), media: make(chan struct{}, 2),
 	}
@@ -51,17 +50,13 @@ func newSlotReader(parent context.Context, store slotStore, table slotTable, p p
 	if len(first) != 0 {
 		r.ch <- first
 		r.head.Store(1)
+		r.ack <- struct{}{}
 	}
-	r.wg.Add(2)
-	go func() {
-		defer r.wg.Done()
+	r.wg.Go(func() {
 		defer close(r.readDone)
 		r.run(readCtx)
-	}()
-	go func() {
-		defer r.wg.Done()
-		r.ackLoop()
-	}()
+	})
+	r.wg.Go(r.ackLoop)
 	return r
 }
 
@@ -76,20 +71,9 @@ func (r *slotReader) Wake() {
 	}
 }
 
-func (r *slotReader) setErr(err error) {
-	r.mu.Lock()
-	if r.err == nil {
-		r.err = err
-	}
-	r.mu.Unlock()
-	r.cancel()
-}
-
 func (r *slotReader) Err() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.err != nil {
-		return r.err
+	if err := context.Cause(r.ctx); err != nil {
+		return err
 	}
 	return io.EOF
 }
@@ -115,21 +99,19 @@ func (r *slotReader) sample(ctx context.Context, id string, seq int64, overlap b
 	defer cancel()
 	results := make(chan observation, 2)
 	launch := func() {
-		r.wg.Add(1)
-		go func() {
-			defer r.wg.Done()
-			results <- read(ctx)
-		}()
+		r.wg.Go(func() { results <- read(ctx) })
 	}
 	launch()
 	t := time.NewTimer(125 * time.Millisecond)
 	defer t.Stop()
 	pending := 1
 	var realErr error
+	var invalid bool
 	for {
 		select {
 		case v := <-results:
-			if isAuthError(v.err) || (v.f.mode != 0 && v.f.seq == seq && v.err == nil) {
+			invalid = invalid || v.invalid
+			if v.err == errDriveScope || isAuthError(v.err) || (v.f.mode != 0 && v.f.seq >= seq && v.err == nil) {
 				return v.f, v.invalid, v.err
 			}
 			if v.err != nil && v.err != errNotFound {
@@ -140,7 +122,7 @@ func (r *slotReader) sample(ctx context.Context, id string, seq int64, overlap b
 				if realErr != nil {
 					return slotFrame{}, false, realErr
 				}
-				return v.f, v.invalid, v.err
+				return v.f, invalid, v.err
 			}
 		case <-t.C:
 			pending++
@@ -151,8 +133,15 @@ func (r *slotReader) sample(ctx context.Context, id string, seq int64, overlap b
 	}
 }
 
+func (r *slotReader) observe(n int64) {
+	for old := r.frontier.Load(); old < n && !r.frontier.CompareAndSwap(old, n); old = r.frontier.Load() {
+	}
+}
+
 func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, error) {
-	id := r.table.Slots[job.seq%int64(len(r.table.Slots))]
+	depth := int64(len(r.table.Slots))
+	id := r.table.Slots[job.seq%depth]
+	probeAt, offset := time.Now().Add(slotStallTimeout), int64(1)
 	var unhealthy time.Time
 	for {
 		head := job.seq == r.head.Load()
@@ -162,19 +151,34 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 			if head {
 				readCtx = context.WithValue(ctx, headKey{}, true)
 			}
-			overlap := head && active
-			if isCooling(r.store) {
-				overlap = false
-			}
+			overlap := head && active && !isCooling(r.store)
 			f, invalid, err := r.sample(readCtx, id, job.seq, overlap)
+			if err == nil && f.seq > job.seq {
+				return slotFrame{}, errors.New("Drive slot ", job.seq, " was overwritten by sequence ", f.seq)
+			}
 			if err == nil && f.mode != 0 && f.seq == job.seq {
 				r.activeAt.Store(time.Now().UnixNano())
-				for n := r.frontier.Load(); n < f.seq && !r.frontier.CompareAndSwap(n, f.seq); n = r.frontier.Load() {
-				}
+				r.observe(f.seq)
 				return f, nil
 			}
-			if isAuthError(err) {
+			if err == errDriveScope || isAuthError(err) {
 				return slotFrame{}, err
+			}
+			// A lazy missing head is also a valid idle state. Occasionally inspect a
+			// different description for evidence of a gap, never speculative media.
+			if head && depth > 1 && time.Now().After(probeAt) && r.frontier.Load() <= job.seq && !isCooling(r.store) && r.probing.CompareAndSwap(false, true) {
+				idx := (job.seq + offset) % depth
+				offset, probeAt = offset%(depth-1)+1, time.Now().Add(slotStallTimeout/12)
+				r.wg.Go(func() {
+					defer r.probing.Store(false)
+					probe, cancel := context.WithTimeout(ctx, slotStallTimeout)
+					defer cancel()
+					d, err := r.store.readDescription(probe, r.table.Slots[idx])
+					if f, ok := decodeSlot(d); err == nil && ok && f.seq > job.seq && f.seq%depth == idx {
+						r.observe(f.seq)
+						r.Wake()
+					}
+				})
 			}
 			missing := err == errNotFound && (!r.table.lazy || job.seq >= int64(len(r.table.Slots)))
 			if head && (missing || (err != nil && err != errNotFound) || invalid || r.frontier.Load() > job.seq) {
@@ -187,27 +191,18 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 				unhealthy = time.Time{}
 			}
 		}
-		var wake <-chan struct{}
-		delay := r.maxPollInterval
+		wake, delay := job.head, 40*time.Millisecond
 		if head {
-			wake = r.wake
-			if active {
-				delay = 25 * time.Millisecond
-			}
-		} else {
-			wake = job.head
-			if active {
-				delay = 40 * time.Millisecond
-			}
+			wake, delay = r.wake, 25*time.Millisecond
 		}
-		timer := time.NewTimer(delay)
+		if !active {
+			delay = r.maxPollInterval
+		}
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return slotFrame{}, ctx.Err()
 		case <-wake:
-			timer.Stop()
-		case <-timer.C:
+		case <-time.After(delay):
 		}
 	}
 }
@@ -220,7 +215,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 			j.err = errors.New("peer could not store segment ", j.seq)
 		}
 		close(j.ready)
-		close(j.done)
 		return
 	}
 	if f.mode == slotInline {
@@ -228,7 +222,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		j.data <- f.data
 		close(j.data)
 		close(j.ready)
-		close(j.done)
 		return
 	}
 	// A promoted head must never queue behind a prefetched successor. A tail
@@ -242,7 +235,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		case <-ctx.Done():
 			j.err = ctx.Err()
 			close(j.ready)
-			close(j.done)
 			return
 		}
 	}
@@ -260,7 +252,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		}
 	})
 	close(j.data)
-	close(j.done)
 	if reserved {
 		select {
 		case <-j.retired:
@@ -276,20 +267,16 @@ func (r *slotReader) run(parent context.Context) {
 	defer cancel()
 	jobs := make(map[int64]*readSlot)
 	next := r.head.Load()
-	for {
+	for ctx.Err() == nil {
 		head := r.head.Load()
 		window := min(12, len(r.table.Slots))
 		if head == 0 {
 			window = 1
 		}
 		for next < head+int64(window) {
-			j := &readSlot{seq: next, head: make(chan struct{}), retired: make(chan struct{}), ready: make(chan struct{}), done: make(chan struct{})}
+			j := &readSlot{seq: next, head: make(chan struct{}), retired: make(chan struct{}), ready: make(chan struct{})}
 			jobs[next] = j
-			r.wg.Add(1)
-			go func() {
-				defer r.wg.Done()
-				r.fetch(ctx, j)
-			}()
+			r.wg.Go(func() { r.fetch(ctx, j) })
 			next++
 		}
 		j := jobs[head]
@@ -303,12 +290,12 @@ func (r *slotReader) run(parent context.Context) {
 			for b := range j.data {
 				select {
 				case r.ch <- b:
+				case <-r.discard: // Close abandons input but must keep returning verified ring credit.
 				case <-ctx.Done():
 					return
 				}
 			}
 		}
-		<-j.done
 		close(j.retired)
 		delete(jobs, head)
 		if j.err != nil {
@@ -337,6 +324,9 @@ func (r *slotReader) writeAck(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	if err := context.Cause(r.ctx); err != nil {
+		return err
+	}
 	n := r.head.Load() - 1
 	prev := r.acked.Load()
 	if n <= prev {
@@ -350,10 +340,12 @@ func (r *slotReader) writeAck(ctx context.Context) error {
 	} else {
 		err = r.store.setSlot(ctx, r.table.Watermark, d, nil)
 	}
-	if err == nil {
-		r.acked.Store(n)
+	if err != nil {
+		r.setErr(errors.New("cannot publish Drive watermark").Base(err))
+		return context.Cause(r.ctx)
 	}
-	return err
+	r.acked.Store(n)
+	return nil
 }
 
 // Stop advancing head before taking the last snapshot. The connection owns ctx,
@@ -364,9 +356,6 @@ func (r *slotReader) finish(ctx context.Context) error {
 	case <-r.readDone:
 	case <-ctx.Done():
 		return ctx.Err()
-	}
-	if r.ctx.Err() != nil {
-		return r.ctx.Err()
 	}
 	return r.writeAck(ctx)
 }
@@ -384,10 +373,7 @@ func (r *slotReader) ackLoop() {
 			}
 		case <-t.C:
 		}
-		if err := r.writeAck(r.ctx); err != nil {
-			if r.ctx.Err() == nil {
-				r.setErr(errors.New("cannot publish Drive watermark").Base(err))
-			}
+		if r.writeAck(r.ctx) != nil {
 			return
 		}
 	}

@@ -6,7 +6,6 @@ import (
 	"io"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -15,10 +14,10 @@ import (
 // run is the sole allocator of sequence numbers and owns the coalescing buffer.
 // Uploads may finish out of order. Each physical position has a completion fence.
 type slotWriter struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	store  slotStore
-	table  slotTable
+	ctx   context.Context
+	fail  context.CancelCauseFunc
+	store slotStore
+	table slotTable
 	params
 	input               chan []byte
 	writeToken, permits chan struct{}
@@ -27,18 +26,15 @@ type slotWriter struct {
 	closeOnce           sync.Once
 	workers             sync.WaitGroup
 	mu                  sync.Mutex
-	err                 error
 	progress            time.Time
-	issued              atomic.Int64
 	wmMu                sync.Mutex
 	acked               int64
 	checked             time.Time
 }
 
-func newSlotWriter(parent context.Context, store slotStore, table slotTable, p params) *slotWriter {
-	ctx, cancel := context.WithCancel(parent)
+func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params) *slotWriter {
 	w := &slotWriter{
-		ctx: ctx, cancel: cancel, store: store, table: table, params: p,
+		ctx: ctx, fail: fail, store: store, table: table, params: p,
 		input: make(chan []byte), writeToken: make(chan struct{}, 1), permits: make(chan struct{}, min(len(table.Slots), 32)),
 		stop: make(chan struct{}), done: make(chan struct{}), first: make(chan []byte, 1), acked: -1, progress: time.Now(),
 	}
@@ -46,20 +42,8 @@ func newSlotWriter(parent context.Context, store slotStore, table slotTable, p p
 	return w
 }
 
-func (w *slotWriter) fail(err error) {
-	w.mu.Lock()
-	if w.err == nil {
-		w.err = err
-	}
-	w.mu.Unlock()
-	w.cancel()
-}
-
-func (w *slotWriter) Err() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.err
-}
+// Both directions observe the first fatal error, but END leaves the other half open.
+func (w *slotWriter) Err() error { return context.Cause(w.ctx) }
 
 func (w *slotWriter) stopped() error {
 	if err := w.Err(); err != nil {
@@ -121,6 +105,8 @@ func (w *slotWriter) closeProgress() time.Time {
 	return w.progress
 }
 
+var errDriveWatermark = errors.New("invalid receiver watermark")
+
 // Only one watermark GET per refresh interval, even when a wave wraps together.
 func (w *slotWriter) credit(seq int64) (bool, error) {
 	need := seq - int64(len(w.table.Slots))
@@ -129,6 +115,9 @@ func (w *slotWriter) credit(seq int64) (bool, error) {
 	}
 	w.wmMu.Lock()
 	defer w.wmMu.Unlock()
+	if w.acked >= seq {
+		return false, errDriveWatermark
+	}
 	if w.acked >= need || time.Since(w.checked) < 100*time.Millisecond {
 		return w.acked >= need, nil
 	}
@@ -143,8 +132,8 @@ func (w *slotWriter) credit(seq int64) (bool, error) {
 		return false, err
 	}
 	n, err := strconv.ParseInt(d, 10, 64)
-	if err != nil || n < 0 || n >= w.issued.Load() {
-		return false, errors.New("invalid receiver watermark")
+	if err != nil || n < 0 || n >= seq {
+		return false, errDriveWatermark // this worker has not published seq yet
 	}
 	if n > w.acked {
 		w.acked = n
@@ -163,7 +152,7 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 	}
 	for since := time.Now(); ; {
 		ok, err := w.credit(seq)
-		if err != nil && (isAuthError(err) || err == errNotFound) {
+		if isAuthError(err) || err == errNotFound || err == errDriveScope || err == errDriveWatermark {
 			return err
 		}
 		if ok {
@@ -194,12 +183,6 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 
 func (w *slotWriter) run() {
 	defer close(w.done)
-	defer w.cancel()
-	defer func() {
-		if err := w.ctx.Err(); err != nil {
-			w.fail(err)
-		}
-	}()
 	defer w.workers.Wait()
 	var seq int64
 	fences := make([]chan struct{}, len(w.table.Slots))
@@ -211,7 +194,6 @@ func (w *slotWriter) run() {
 		}
 		n := seq
 		seq++
-		w.issued.Store(seq)
 		i := n % int64(len(fences))
 		prev, done := fences[i], make(chan struct{})
 		fences[i] = done
@@ -222,37 +204,25 @@ func (w *slotWriter) run() {
 				w.first <- chunk
 			}
 		}
-		w.workers.Add(1)
-		go func() {
-			defer w.workers.Done()
+		w.workers.Go(func() {
 			defer close(done)
 			defer func() { <-w.permits }()
 			if err := w.publish(n, prev, mode, chunk); err != nil {
 				w.fail(err)
 			}
-		}()
+		})
 		return true
 	}
 	var buf []byte
-	var timer *time.Timer
-	var tick <-chan time.Time
-	defer func() {
-		if timer != nil {
-			timer.Stop()
-		}
-	}()
+	timer := time.NewTimer(w.flushInterval)
+	timer.Stop()
+	defer timer.Stop()
 	flush := func() bool {
-		if timer != nil {
-			timer.Stop()
-		}
-		tick = nil
+		timer.Stop()
 		unit := min(w.segmentBytes, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
-		if len(buf) > wave*unit && (wave < 24 || len(buf) > w.segmentBytes) {
-			inline = 0
-		}
-		if isCooling(w.store) {
+		if isCooling(w.store) || len(buf) > wave*unit && (wave < 24 || len(buf) > w.segmentBytes) {
 			inline = 0
 		}
 		for len(buf) > 0 {
@@ -291,15 +261,14 @@ func (w *slotWriter) run() {
 				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !isCooling(w.store) {
 					d = min(d, 2*time.Millisecond)
 				}
-				timer = time.NewTimer(d)
-				tick = timer.C
+				timer.Reset(d)
 			} else {
 				buf = append(buf, b...)
 			}
 			if len(buf) >= w.segmentBytes && !flush() {
 				return
 			}
-		case <-tick:
+		case <-timer.C:
 			if !flush() {
 				return
 			}
@@ -331,12 +300,10 @@ func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
 				return context.DeadlineExceeded
 			}
 		}
-		t := time.NewTimer(remaining)
 		select {
 		case <-done:
-			t.Stop()
 			return nil
-		case <-t.C:
+		case <-time.After(remaining):
 		}
 	}
 }

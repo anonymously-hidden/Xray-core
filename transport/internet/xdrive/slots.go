@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"hash/crc32"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xtls/xray-core/common/errors"
@@ -63,7 +64,9 @@ func (f slotFrame) encode() string {
 	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
 	binary.BigEndian.PutUint32(b[21:], f.crc)
 	if f.mode == slotStream {
-		b = appendStreamChecksums(b, f.blocks)
+		for _, check := range f.blocks {
+			b = binary.BigEndian.AppendUint32(b, check)
+		}
 		if len(f.prefix) != 0 {
 			b[16] = slotStreamPrefix
 			b = binary.BigEndian.AppendUint32(b, crc32.ChecksumIEEE(f.prefix))
@@ -141,34 +144,33 @@ type ring struct {
 	Lazy  bool      `json:"lazy,omitempty"`
 }
 
+// IDs are single opaque URL path components, never paths or special segments.
+func validSlotIDs(seen map[string]bool, ids ...string) bool {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+	for _, id := range ids {
+		if id == "" || len(id) > maxSlotIDLen || strings.Trim(id, alphabet) != "" || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	return true
+}
+
 func decodeRing(b []byte) (ring, bool) {
 	var r ring
-	if json.Unmarshal(b, &r) != nil || len(r.Up.Slots) == 0 || len(r.Down.Slots) == 0 ||
-		r.Up.Watermark == "" || r.Down.Watermark == "" {
+	if json.Unmarshal(b, &r) != nil || len(r.First) > slotInlineLimit {
 		return ring{}, false
 	}
-	if len(r.First) > slotInlineLimit || len(r.Up.Slots) > maxConcurrency || len(r.Down.Slots) > maxConcurrency {
-		return ring{}, false
-	}
-	seen := make(map[string]bool, len(r.Up.Slots)+len(r.Down.Slots)+2)
+	seen := make(map[string]bool)
 	for _, t := range []slotTable{r.Up, r.Down} {
-		if len(t.Watermark) > maxSlotIDLen || seen[t.Watermark] {
+		if len(t.Slots) == 0 || len(t.Slots) > maxConcurrency || !validSlotIDs(seen, t.Watermark) || !validSlotIDs(seen, t.Slots...) {
 			return ring{}, false
-		}
-		seen[t.Watermark] = true
-		for _, id := range t.Slots {
-			if len(id) == 0 || len(id) > maxSlotIDLen || seen[id] {
-				return ring{}, false
-			}
-			seen[id] = true
 		}
 	}
 	return r, true
 }
 
-// lazyRing assembles a ring from pre-generated ids without any create call.
-// ids must hold 2*(depth+1) entries: up slots, up watermark, down slots, down
-// watermark.
+// IDs are allocated in direction order: slots, watermark, slots, watermark.
 func lazyRing(session string, depth int, ids []string) ring {
 	r := ring{
 		Lazy: true,

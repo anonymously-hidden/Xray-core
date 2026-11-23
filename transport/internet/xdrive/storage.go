@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"sync"
+	"time"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
@@ -17,8 +18,9 @@ import (
 var errNotFound = errors.New("object not found")
 
 type Entry struct {
-	Name   string
-	Inline []byte
+	Name    string
+	Inline  []byte
+	created time.Time // optional backend-supplied creation time on the local clock
 }
 
 // Config.Secrets for clients need only create/update/read/list permissions;

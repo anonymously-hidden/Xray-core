@@ -5,12 +5,14 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,30 +55,32 @@ const (
 
 type driveStorage struct {
 	*driveShared
-	clients [laneCount]*http.Client
-	child   bool
+	clients     [laneCount]*http.Client
+	child       bool
+	boundFolder string
+	unchecked   sync.Map // peer-selected ID -> expected name, until first verified access
 }
 
 type driveShared struct {
-	folder, clientID, clientSecret, refreshToken, tokenURL string
-	tokenClient                                            *http.Client
-	pools                                                  [laneCount]*connPool
-	permits                                                [laneCount]chan struct{}
-	cancel                                                 context.CancelFunc
-	sessionGuard                                           driveSessionGuard
-	mu                                                     sync.Mutex
-	token                                                  string
-	expiry, coolUntil, tokenRetryAt                        time.Time
-	tokenErr                                               error
-	refreshing                                             chan struct{}
-	nextDelete                                             time.Time
-	idLock                                                 chan struct{}
-	ids                                                    []string
-	idsExpire                                              time.Time
+	folder, space, clientID, clientSecret, refreshToken, tokenURL string
+	tokenClient                                                   *http.Client
+	pools                                                         [laneCount]*connPool
+	permits                                                       [laneCount]chan struct{}
+	cancel                                                        context.CancelFunc
+	sessionGuard                                                  driveSessionGuard
+	mu                                                            sync.Mutex
+	token                                                         string
+	expiry, coolUntil                                             time.Time
+	tokenErr                                                      error
+	refreshing                                                    chan struct{}
+	nextDelete                                                    time.Time
+	idLock                                                        chan struct{}
+	ids                                                           []string
+	idsExpire                                                     time.Time
 }
 
 func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*driveStorage, error) {
-	if config.RemoteFolder == "" || len(config.Secrets) != 3 || config.Secrets[0] == "" || config.Secrets[1] == "" || config.Secrets[2] == "" {
+	if config.RemoteFolder == "" || len(config.Secrets) != 3 || slices.Contains(config.Secrets, "") {
 		return nil, errors.New("Drive requires a folder ID, client ID, client secret and refresh token")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,20 +89,32 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 		return newServiceClient(ctx, hosts, settings, driveTimeout, driveMaxInflight)
 	}
 	s := &driveStorage{driveShared: &driveShared{
-		folder: config.RemoteFolder, clientID: config.Secrets[0], clientSecret: config.Secrets[1], refreshToken: config.Secrets[2],
+		folder: config.RemoteFolder, space: "drive", clientID: config.Secrets[0], clientSecret: config.Secrets[1], refreshToken: config.Secrets[2],
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
 	}}
+	if s.folder == "appDataFolder" {
+		s.space = s.folder
+	}
 	for i, limit := range [laneCount]int{48, 8, 24} {
 		s.pools[i] = newConnPool(config.Xmux, client)
 		s.permits[i] = make(chan struct{}, limit)
 	}
+	s.tokenClient.CheckRedirect = driveRedirect
 	s.openClients()
 	return s, nil
 }
 
+// Redirect reads only: never convert a mutation to GET or forward a refresh form.
+func driveRedirect(req *http.Request, via []*http.Request) error {
+	if via[0].Method != http.MethodGet || req.URL.Scheme != "https" || len(via) >= 10 {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
 func (s *driveStorage) openClients() {
 	for i, pool := range s.pools {
-		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool}}
+		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool}, CheckRedirect: driveRedirect}
 	}
 }
 
@@ -126,70 +142,47 @@ var errSessionInUse = errors.New("session is live or already being collected")
 
 type driveSessionGuard struct {
 	mu       sync.Mutex
-	sessions map[string]*driveSessionUse
-}
-
-type driveSessionUse struct {
-	active   int
-	cleaning bool
+	sessions map[string]int // positive: active leases; -1: exclusive cleanup
 }
 
 func (g *driveSessionGuard) acquire(prefix string, cleanup bool) (func(), error) {
 	g.mu.Lock()
-	if g.sessions == nil {
-		g.sessions = make(map[string]*driveSessionUse)
-	}
-	use := g.sessions[prefix]
-	if use == nil {
-		use = &driveSessionUse{}
-		g.sessions[prefix] = use
-	}
-	if use.cleaning || cleanup && use.active > 0 {
-		g.mu.Unlock()
+	defer g.mu.Unlock()
+	n := g.sessions[prefix]
+	if n < 0 || cleanup && n != 0 {
 		return nil, errSessionInUse
 	}
-	if cleanup {
-		use.cleaning = true
-	} else {
-		use.active++
+	if g.sessions == nil {
+		g.sessions = make(map[string]int)
 	}
-	g.mu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			g.mu.Lock()
-			defer g.mu.Unlock()
-			if cleanup {
-				use.cleaning = false
-			} else {
-				use.active--
-			}
-			if use.active == 0 && !use.cleaning {
-				delete(g.sessions, prefix)
-			}
-		})
-	}, nil
+	delta := 1
+	if cleanup {
+		delta = -1
+	}
+	g.sessions[prefix] = n + delta
+	return sync.OnceFunc(func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.sessions[prefix] -= delta
+		if g.sessions[prefix] == 0 {
+			delete(g.sessions, prefix)
+		}
+	}), nil
 }
 
 func (s *driveStorage) holdSession(session string) (func(), error) {
 	return s.sessionGuard.acquire(sessionPrefix(session), false)
 }
 
-func (s *driveStorage) guardSessionCleanup(ctx context.Context, prefix string) (func(), error) {
-	if ctx.Value(cleanupKey{}) != nil && strings.HasPrefix(prefix, streamsDir+"/") &&
-		safeSessionID(strings.TrimPrefix(prefix, streamsDir+"/")) {
-		return s.sessionGuard.acquire(prefix, true)
-	}
-	return func() {}, nil
-}
-
-func flatten(name string) string {
-	return strings.ReplaceAll(name, "/", flatSeparator)
-}
+func flatten(name string) string { return strings.ReplaceAll(name, "/", flatSeparator) }
 
 func quoteDriveValue(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
 }
+
+type tokenRetry struct{ error }
+
+func (e tokenRetry) Unwrap() error { return e.error }
 
 type authError struct{ code string }
 
@@ -217,33 +210,38 @@ func (s *driveStorage) fetchToken(ctx context.Context) (string, time.Duration, e
 
 	resp, err := s.tokenClient.Do(req)
 	if err != nil {
-		return "", 0, errors.New("failed to refresh the access token").Base(err)
+		return "", 0, tokenRetry{errors.New("failed to refresh the access token").Base(err)}
 	}
 	defer resp.Body.Close()
+	if retryableStatus(resp.StatusCode) || resp.StatusCode == http.StatusRequestTimeout {
+		s.delayRequests(resp.Header) // Honor Retry-After even when the error body is truncated.
+		return "", 0, tokenRetry{errors.New("the token endpoint answered ", resp.StatusCode)}
+	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := readLimited(resp.Body, 1<<20)
 	if err != nil {
-		return "", 0, errors.New("failed to read the token response").Base(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		var rejected struct {
-			Error string `json:"error"`
+		if err == errDriveSize {
+			return "", 0, err
 		}
-		if json.Unmarshal(body, &rejected) == nil {
-			switch rejected.Error {
-			case "invalid_grant", "invalid_client", "unauthorized_client":
-				return "", 0, authError{rejected.Error}
-			}
-		}
-		return "", 0, errors.New("the token endpoint answered ", resp.StatusCode, ": ", string(body))
+		return "", 0, tokenRetry{errors.New("failed to read the token response").Base(err)}
 	}
-
 	var parsed struct {
+		Error       string `json:"error"`
 		AccessToken string `json:"access_token"`
 		ExpiresIn   int64  `json:"expires_in"`
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", 0, errors.New("failed to parse the token response").Base(err)
+	parseErr := json.Unmarshal(body, &parsed)
+	if resp.StatusCode != http.StatusOK {
+		switch parsed.Error {
+		case "invalid_grant", "invalid_client", "unauthorized_client":
+			if parseErr == nil && (resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+				return "", 0, authError{parsed.Error}
+			}
+		}
+		return "", 0, errors.New("the token endpoint answered ", resp.StatusCode)
+	}
+	if parseErr != nil {
+		return "", 0, errors.New("failed to parse the token response").Base(parseErr)
 	}
 	if parsed.AccessToken == "" {
 		return "", 0, errors.New("the token endpoint returned no access token")
@@ -284,23 +282,40 @@ func rateLimited(payload []byte) bool {
 }
 
 func retryableStatus(status int) bool {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusInternalServerError,
-		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return true
+	return status == http.StatusTooManyRequests || status == http.StatusInternalServerError ||
+		status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout
+}
+
+// Convert Retry-After to a local delay. A response Date avoids local clock skew.
+func retryAfter(h http.Header, now time.Time) time.Duration {
+	raw := h.Get("Retry-After")
+	if raw != "" && strings.Trim(raw, "0123456789") == "" {
+		n, _ := strconv.ParseUint(raw, 10, 64) // overflow saturates before the duration clamp
+		return time.Duration(min(n, uint64((1<<63-1)/time.Second))) * time.Second
 	}
-	return false
+	if until, err := http.ParseTime(raw); err == nil {
+		if server, err := http.ParseTime(h.Get("Date")); err == nil {
+			now = server
+		}
+		return max(0, until.Sub(now))
+	}
+	return 0
+}
+
+func (s *driveStorage) delayRequests(h http.Header) {
+	now := time.Now()
+	until := now.Add(max(jitter(2*time.Second), retryAfter(h, now)))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if until.After(s.coolUntil) {
+		s.coolUntil = until
+	}
 }
 
 func multipartBody(metadata, data []byte) ([]byte, string) {
-	var boundary string
-	for {
-		var entropy [24]byte
-		rand.Read(entropy[:])
-		boundary = "xdrive-" + hex.EncodeToString(entropy[:])
-		if !bytes.Contains(metadata, []byte(boundary)) && !bytes.Contains(data, []byte(boundary)) {
-			break
-		}
+	boundary := rand.Text()
+	for bytes.Contains(metadata, []byte(boundary)) || bytes.Contains(data, []byte(boundary)) {
+		boundary = rand.Text()
 	}
 	var body bytes.Buffer
 	body.Grow(len(metadata) + len(data) + 3*len(boundary) + 256)
@@ -317,14 +332,10 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	for {
 		s.mu.Lock()
 		switch {
-		case s.token != "" && time.Now().Before(s.expiry):
-			t := s.token
+		case (s.token != "" || s.tokenErr != nil) && (time.Now().Before(s.expiry) || isAuthError(s.tokenErr)):
+			token, err := s.token, s.tokenErr
 			s.mu.Unlock()
-			return t, nil
-		case s.tokenErr != nil && (isAuthError(s.tokenErr) || time.Now().Before(s.tokenRetryAt)):
-			err := s.tokenErr
-			s.mu.Unlock()
-			return "", err
+			return token, err
 		case s.refreshing != nil:
 			done := s.refreshing
 			s.mu.Unlock()
@@ -345,7 +356,7 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 			s.token, s.expiry = token, time.Now().Add(life-min(time.Minute, life/5))
 			s.tokenErr = nil
 		} else if ctx.Err() == nil {
-			s.tokenErr, s.tokenRetryAt = err, time.Now().Add(time.Second)
+			s.token, s.tokenErr, s.expiry = "", err, time.Now().Add(time.Second)
 		}
 		close(s.refreshing)
 		s.refreshing = nil
@@ -355,12 +366,10 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
-	t := time.NewTimer(d)
-	defer t.Stop()
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-t.C:
+	case <-time.After(d):
 		return nil
 	}
 }
@@ -371,17 +380,19 @@ func (s *driveStorage) cooling() bool {
 	return time.Now().Before(s.coolUntil)
 }
 
+var errDriveSize = errors.New("Drive response exceeds size limit")
+
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if int64(len(b)) > limit {
-		return nil, errors.New("Drive response exceeds size limit")
+		return nil, errDriveSize
 	}
 	return b, err
 }
 
 // request owns the response through consume, including the HTTP permit. Only
 // an explicit rejection permits replaying a mutation: a lost reply is ambiguous.
-func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, byteRange string, consume func(*http.Response) error) error {
+func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, byteRange string, buffered bool, consume func(*http.Response) error) error {
 	var last error
 	refreshed := false
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
@@ -410,7 +421,8 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			}
 			token, err := s.accessToken(ctx)
 			if err != nil {
-				return false, err
+				_, retry := err.(tokenRetry) // No file request has been sent yet.
+				return retry, err
 			}
 			req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 			if err != nil {
@@ -429,11 +441,17 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			}
 			resp, err := s.clients[lane].Do(req)
 			if err != nil {
-				return method == http.MethodGet, err
+				return method == http.MethodGet && errors.Cause(err) != errSessionClosed, err
 			}
 			defer resp.Body.Close()
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				return false, consume(resp)
+				err := consume(resp)
+				// A buffered GET exposes no partial bytes before success; a span can.
+				return err != nil && buffered && method == http.MethodGet && err != errDriveSize, err
+			}
+			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable && resp.Header.Get("Retry-After") != "" {
+				s.delayRequests(resp.Header) // Other lanes must not wait for this error body to finish.
+				return resp.StatusCode == http.StatusTooManyRequests || method == http.MethodGet, fmt.Errorf("Drive %s: HTTP %d", method, resp.StatusCode)
 			}
 			detail, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 			err = fmt.Errorf("Drive %s: HTTP %d: %s", method, resp.StatusCode, detail)
@@ -447,17 +465,13 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				retry := !refreshed
 				refreshed = true
 				return retry, authError{"401"}
-			case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden && rateLimited(detail):
-				s.mu.Lock()
-				until := time.Now().Add(jitter(2 * time.Second))
-				if until.After(s.coolUntil) {
-					s.coolUntil = until
-				}
-				s.mu.Unlock()
+			case resp.StatusCode == http.StatusForbidden && rateLimited(detail):
+				s.delayRequests(resp.Header)
 				return true, err
 			case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 				return false, errDriveRange
-			case resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge:
+			case (method == http.MethodPost || method == http.MethodPatch) &&
+				(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge):
 				return false, refusedPayload{err}
 			case resp.StatusCode == http.StatusNotFound:
 				return false, errNotFound
@@ -475,19 +489,54 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 
 func (s *driveStorage) bytes(ctx context.Context, lane driveLane, method, target, contentType string, payload []byte, limit int64) ([]byte, error) {
 	var data []byte
-	err := s.request(ctx, lane, method, target, contentType, payload, "", func(resp *http.Response) error {
+	err := s.request(ctx, lane, method, target, contentType, payload, "", true, func(resp *http.Response) error {
 		var err error
 		data, err = readLimited(resp.Body, limit)
 		return err
 	})
+	if err != nil {
+		data = nil
+	}
 	return data, err
 }
 
 type driveFile struct {
-	ID          string   `json:"id,omitempty"`
-	Name        string   `json:"name,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Parents     []string `json:"parents,omitempty"`
+	MimeType    string    `json:"mimeType,omitempty"`
+	Trashed     bool      `json:"trashed,omitempty"`
+	CreatedTime string    `json:"createdTime,omitempty"`
+	created     time.Time // estimated local instant from Drive's Date and createdTime
+	ID          string    `json:"id,omitempty"`
+	Name        string    `json:"name,omitempty"`
+	Description string    `json:"description,omitempty"`
+	Parents     []string  `json:"parents,omitempty"`
+}
+
+func (f driveFile) regular() bool {
+	return f.MimeType != "" && !strings.HasPrefix(f.MimeType, "application/vnd.google-apps.")
+}
+
+// Before using an ID chosen by the peer, bind it to a file in this session.
+// Lazy creates already establish identity; eager slots are verified on first use.
+func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
+	s.boundFolder = s.folder
+	if s.folder == "root" || s.folder == "appDataFolder" {
+		data, err := s.bytes(ctx, metadataLane, http.MethodGet, filesURL+"/"+s.folder+"?fields=id", "", nil, 4096)
+		if err != nil {
+			return err
+		}
+		var f driveFile
+		if json.Unmarshal(data, &f) != nil || f.ID == "" {
+			return errors.New("cannot resolve Drive folder ID")
+		}
+		s.boundFolder = f.ID
+	}
+	for _, t := range []slotTable{r.Up, r.Down} {
+		s.unchecked.Store(t.Watermark, flatten(t.name+"/w"))
+		for i, id := range t.Slots {
+			s.unchecked.Store(id, flatten(t.name+"/s"+strconv.Itoa(i)))
+		}
+	}
+	return nil
 }
 
 func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id string, f driveFile, payload []byte) error {
@@ -502,11 +551,10 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 	}
 	if id != "" {
 		target += "/" + url.PathEscape(id)
+	} else {
+		id = f.ID // ID reserved before the create
 	}
 	data, err := s.bytes(ctx, lane, method, target+query, typ, md, 4096)
-	if id == "" {
-		id = f.ID // preallocated lazy slot; ordinary announcements have no known ID
-	}
 	if err == nil {
 		var reply driveFile
 		if json.Unmarshal(data, &reply) == nil && reply.ID != "" && (id == "" || reply.ID == id) {
@@ -524,25 +572,36 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 	for verify.Err() == nil {
 		d, readErr := s.readDescription(verify, id)
 		if readErr == nil && d == f.Description {
-			return nil
+			if payload == nil || d != "" { // metadata object or a checksummed slot frame
+				return nil
+			}
+			var media []byte // a media announcement has no identifying description
+			media, readErr = s.bytes(verify, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, int64(len(payload)))
+			if readErr == nil && bytes.Equal(media, payload) {
+				return nil
+			}
 		}
-		if isAuthError(readErr) {
-			return readErr
-		}
-		if sleepContext(verify, 150*time.Millisecond) != nil {
+		if readErr == errDriveScope || isAuthError(readErr) || sleepContext(verify, 150*time.Millisecond) != nil {
 			break
 		}
 	}
 	return err
 }
 
-var errDriveRange = errors.New("Drive range not yet available")
+var (
+	errDriveScope = errors.New("Drive file does not belong to the announced session")
+	errDriveRange = errors.New("Drive range not yet available")
+)
 
 type refusedPayload struct{ error }
 
 func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
-	f := driveFile{ID: id, Name: flatten(name), Parents: []string{s.folder}, Description: description}
-	return s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
+	f := driveFile{ID: id, Name: flatten(name), MimeType: "application/octet-stream", Parents: []string{s.folder}, Description: description}
+	err := s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
+	if err == nil {
+		s.unchecked.Delete(id)
+	}
+	return err
 }
 
 type headKey struct{}
@@ -558,17 +617,35 @@ func writeLane(ctx context.Context, body []byte) driveLane {
 }
 
 func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
+	if _, pending := s.unchecked.Load(id); pending {
+		if _, err := s.readDescription(ctx, id); err != nil {
+			return err
+		}
+	}
 	return s.writeFile(ctx, writeLane(ctx, body), http.MethodPatch, id, driveFile{Description: description}, body)
 }
 
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
-	data, err := s.bytes(ctx, writeLane(ctx, nil), http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true", "", nil, 64<<10)
+	name, pending := s.unchecked.Load(id)
+	fields := "description"
+	if pending {
+		fields += ",name,parents,trashed,mimeType"
+	}
+	data, err := s.bytes(ctx, writeLane(ctx, nil), http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?fields="+fields+"&supportsAllDrives=true", "", nil, 64<<10)
 	if err != nil {
 		return "", err
 	}
 	var f driveFile
-	err = json.Unmarshal(data, &f)
-	return f.Description, err
+	if err := json.Unmarshal(data, &f); err != nil {
+		return "", err
+	}
+	if pending {
+		if !f.regular() || f.Trashed || f.Name != name || !slices.Contains(f.Parents, s.boundFolder) {
+			return "", errDriveScope
+		}
+		s.unchecked.Delete(id)
+	}
+	return f.Description, nil
 }
 
 // A range owns [lo, hi) block indices. On retry next never moves back: even
@@ -584,7 +661,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
 		}
 		bodyFailed := false
-		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, func(resp *http.Response) error {
+		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, false, func(resp *http.Response) error {
 			bodyFailed = true
 			from, to, length := first, hi, end-start
 			switch resp.StatusCode {
@@ -654,15 +731,13 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
 		p := &parts[i]
 		p.blocks = make(chan []byte, hi-lo)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer close(p.blocks)
 			p.err = s.readSpan(ctx, id, f, lo, hi, func(b []byte) error {
 				p.blocks <- b // capacity is the range size, each block is emitted once
 				return nil
 			})
-		}()
+		})
 	}
 	for i := range parts {
 		p := &parts[i]
@@ -685,9 +760,12 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	if n <= 0 || n > 1000 {
+		return nil, errors.New("invalid Drive ID count")
+	}
 	if len(s.ids) < n || time.Now().After(s.idsExpire) {
 		count := min(1000, 3*n)
-		target := fmt.Sprintf("%s/generateIds?count=%d&space=drive", filesURL, count)
+		target := fmt.Sprintf("%s/generateIds?count=%d&space=%s", filesURL, count, s.space)
 		data, err := s.bytes(ctx, metadataLane, http.MethodGet, target, "", nil, 256<<10)
 		if err != nil {
 			return nil, err
@@ -695,17 +773,13 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 		var batch struct {
 			IDs []string `json:"ids"`
 		}
-		if json.Unmarshal(data, &batch) != nil || len(batch.IDs) != count {
+		if json.Unmarshal(data, &batch) != nil || len(batch.IDs) != count || !validSlotIDs(make(map[string]bool, count), batch.IDs...) {
 			return nil, errors.New("invalid Drive ID batch")
 		}
-		seen := make(map[string]bool, count)
-		for _, id := range batch.IDs {
-			if id == "" || len(id) > maxSlotIDLen || seen[id] {
-				return nil, errors.New("invalid or repeated Drive file ID")
-			}
-			seen[id] = true
-		}
 		s.ids, s.idsExpire = batch.IDs, time.Now().Add(10*time.Minute)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	ids := s.ids[:n:n]
 	s.ids = s.ids[n:]
@@ -713,39 +787,75 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 }
 
 func (s *driveStorage) Put(ctx context.Context, name string, payload []byte) error {
-	f := driveFile{Name: flatten(name), Parents: []string{s.folder}}
-	if len(payload) <= driveInlineLimit {
-		f.Description = base64.StdEncoding.EncodeToString(payload)
-		payload = nil
-	}
-	return s.writeFile(ctx, writeLane(ctx, payload), http.MethodPost, "", f, payload)
+	return putDriveObject(ctx, s, "", name, payload)
 }
 
-func (s *driveStorage) find(ctx context.Context, query string, describe bool) ([]driveFile, error) {
-	fields := "id,name"
+func putDriveObject(ctx context.Context, s slotStore, id, name string, payload []byte) error {
+	var description string
+	if len(payload) <= driveInlineLimit {
+		description = base64.StdEncoding.EncodeToString(payload)
+		payload = nil
+	}
+	return s.createSlot(ctx, id, name, description, payload)
+}
+
+func (s *driveStorage) find(ctx context.Context, query string, describe, dateEntries bool) ([]driveFile, error) {
+	fields := "id,name,mimeType"
 	if describe {
 		fields += ",description"
 	}
+	if dateEntries {
+		fields += ",createdTime"
+	}
 	q := url.Values{
-		"q":      {"'" + quoteDriveValue(s.folder) + "' in parents and trashed = false and (" + query + ")"},
-		"fields": {"nextPageToken,files(" + fields + ")"}, "pageSize": {"1000"},
+		"q":      {"'" + quoteDriveValue(s.folder) + "' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder' and (" + query + ")"},
+		"fields": {"nextPageToken,incompleteSearch,files(" + fields + ")"}, "pageSize": {"1000"}, "spaces": {s.space},
 		"supportsAllDrives": {"true"}, "includeItemsFromAllDrives": {"true"},
 	}
 	var found []driveFile
 	seen := make(map[string]bool)
 	for {
-		data, err := s.bytes(ctx, metadataLane, http.MethodGet, filesURL+"?"+q.Encode(), "", nil, 32<<20)
+		var data []byte
+		var served, observed time.Time
+		err := s.request(ctx, metadataLane, http.MethodGet, filesURL+"?"+q.Encode(), "", nil, "", true, func(resp *http.Response) error {
+			if dateEntries {
+				observed = time.Now()
+				served, _ = http.ParseTime(resp.Header.Get("Date"))
+			}
+			var err error
+			data, err = readLimited(resp.Body, 32<<20)
+			return err
+		})
 		if err != nil {
 			return nil, err
 		}
 		var page struct {
-			Files         []driveFile
-			NextPageToken string
+			Files            []driveFile
+			NextPageToken    string
+			IncompleteSearch bool
 		}
 		if err := json.Unmarshal(data, &page); err != nil {
 			return nil, err
 		}
-		found = append(found, page.Files...)
+		if page.IncompleteSearch {
+			return nil, errors.New("Drive returned an incomplete file listing")
+		}
+		for _, f := range page.Files {
+			if !f.regular() {
+				continue // Never read or delete native Drive objects through the flat namespace.
+			}
+			if dateEntries {
+				if served.IsZero() {
+					return nil, errors.New("missing Drive listing date")
+				}
+				created, err := time.Parse(time.RFC3339Nano, f.CreatedTime)
+				if err != nil {
+					continue // Unknown age: skip this file, not unrelated sessions.
+				}
+				f.created = observed.Add(-max(0, served.Sub(created)))
+			}
+			found = append(found, f)
+		}
 		if page.NextPageToken == "" {
 			return found, nil
 		}
@@ -759,7 +869,7 @@ func (s *driveStorage) find(ctx context.Context, query string, describe bool) ([
 
 func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error) {
 	flat := flatten(prefix) + flatSeparator
-	files, err := s.find(ctx, "name contains '"+quoteDriveValue(flat)+"'", ctx.Value(namesOnlyKey{}) == nil)
+	files, err := s.find(ctx, "name contains '"+quoteDriveValue(flat)+"'", ctx.Value(namesOnlyKey{}) == nil, prefix == sessionsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -770,66 +880,82 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 			continue
 		}
 		name, _, child := strings.Cut(suffix, flatSeparator)
-		e := entries[name]
-		e.Name = name
-		if !child && f.Description != "" {
-			e.Inline, err = base64.StdEncoding.DecodeString(f.Description)
-			if err != nil {
+		e, seen := entries[name]
+		if prefix == sessionsDir {
+			if child {
 				continue
+			}
+			if seen { // Multiple physical files must not contribute one age and another payload.
+				entries[name] = Entry{}
+				continue
+			}
+		}
+		e.Name, e.created = name, f.created
+		// A malformed description must not hide an entry from age-based cleanup.
+		if !child && f.Description != "" {
+			if data, err := base64.StdEncoding.DecodeString(f.Description); err == nil {
+				e.Inline = data
 			}
 		}
 		entries[name] = e
 	}
-	out := make([]Entry, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e)
-	}
-	return out, nil
+	out := slices.Collect(maps.Values(entries))
+	return slices.DeleteFunc(out, func(e Entry) bool { return e.Name == "" }), nil
 }
+
+var errDriveDuplicate = errors.New("multiple Drive files have the requested name")
 
 func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 	flat := flatten(name)
-	files, err := s.find(ctx, "name = '"+quoteDriveValue(flat)+"'", true)
+	files, err := s.find(ctx, "name = '"+quoteDriveValue(flat)+"'", true, false)
 	if err != nil {
 		return nil, err
 	}
+	files = slices.DeleteFunc(files, func(f driveFile) bool { return f.Name != flat || f.ID == "" })
+	if len(files) == 0 {
+		return nil, errNotFound
+	}
+	if len(files) != 1 {
+		return nil, errDriveDuplicate
+	}
+	f := files[0]
 	limit, _ := ctx.Value(maxBodyKey{}).(int64)
 	if limit <= 0 {
 		limit = maxSegmentBytes
 	}
-	for _, f := range files {
-		if f.Name != flat || f.ID == "" {
-			continue
-		}
-		if f.Description != "" {
-			b, err := base64.StdEncoding.DecodeString(f.Description)
-			if int64(len(b)) > limit {
-				return nil, errors.New("oversized Drive inline object")
-			}
-			return b, err
-		}
-		b, err := s.bytes(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(f.ID)+"?alt=media&supportsAllDrives=true", "", nil, limit)
-		if err != errNotFound {
-			return b, err
-		}
+	if f.Description == "" {
+		return s.bytes(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(f.ID)+"?alt=media&supportsAllDrives=true", "", nil, limit)
 	}
-	return nil, errNotFound
+	b, err := base64.StdEncoding.DecodeString(f.Description)
+	if int64(len(b)) > limit {
+		return nil, errDriveSize
+	}
+	return b, err
 }
 
 func (s *driveStorage) Delete(ctx context.Context, name string) error {
-	release, err := s.guardSessionCleanup(ctx, name)
+	if session, ok := strings.CutPrefix(name, streamsDir+"/"); ok && ctx.Value(cleanupKey{}) != nil && safeSessionID(session) {
+		release, err := s.sessionGuard.acquire(name, true)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
+	flat := flatten(name)
+	prefix, query := flat+flatSeparator, "name = '"+quoteDriveValue(flat)+"'"
+	announcement := strings.HasPrefix(name, sessionsDir+"/")
+	if !announcement {
+		query += " or name contains '" + quoteDriveValue(prefix) + "'"
+	}
+	files, err := s.find(ctx, query, false, false)
 	if err != nil {
 		return err
 	}
-	defer release()
-	flat := flatten(name)
-	prefix := flat + flatSeparator
-	files, err := s.find(ctx, "name = '"+quoteDriveValue(flat)+"' or name contains '"+quoteDriveValue(prefix)+"'", false)
-	if err != nil {
-		return err
+	if announcement && len(files) > 1 {
+		return errDriveDuplicate
 	}
 	for _, f := range files {
-		if f.ID == "" || (f.Name != flat && !strings.HasPrefix(f.Name, prefix)) {
+		if f.ID == "" || (f.Name != flat && (announcement || !strings.HasPrefix(f.Name, prefix))) {
 			continue
 		}
 		// Share cleanup pacing across sessions instead of competing with uploads.

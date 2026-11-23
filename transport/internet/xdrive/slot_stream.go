@@ -30,18 +30,7 @@ func streamBlockChecksums(data []byte) []uint32 {
 	return checks
 }
 
-// appendStreamChecksums appends the raw big-endian table to an encoded header.
-// The caller applies base64 encoding after appending the table.
-func appendStreamChecksums(encoded []byte, checks []uint32) []byte {
-	for _, check := range checks {
-		encoded = binary.BigEndian.AppendUint32(encoded, check)
-	}
-	return encoded
-}
-
-// decodeStreamChecksums validates the complete table against the whole-frame
-// CRC before any individual block can be delivered. CRCs detect corruption;
-// this consistency check is not authentication.
+// Validate the whole CRC table before allowing progressive delivery.
 func decodeStreamChecksums(size int, wholeCRC uint32, trailer []byte) ([]uint32, bool) {
 	if size <= 0 || size > maxSegmentBytes {
 		return nil, false
@@ -74,9 +63,7 @@ func streamBlockSize(size, index int) int {
 	return min(slotStreamBlockBytes, size-index*slotStreamBlockBytes)
 }
 
-// validStreamBlock checks one complete block. frame.blocks must first have
-// passed decodeStreamChecksums; checking the table root again per block would
-// turn incremental verification into quadratic work.
+// The caller has already validated the checksum table root.
 func validStreamBlock(frame slotFrame, index int, data []byte) bool {
 	size := streamBlockSize(frame.size, index)
 	if frame.mode != slotStream || size == 0 || len(data) != size ||
@@ -86,10 +73,7 @@ func validStreamBlock(frame slotFrame, index int, data []byte) bool {
 	return crc32.ChecksumIEEE(data) == frame.blocks[index]
 }
 
-// crc32Combine returns the IEEE CRC of the concatenation of two byte strings
-// from their finalized CRCs and the second string's byte length. It applies
-// zero-bit operators over GF(2), using the reflected IEEE polynomial. A
-// nonpositive second length leaves the first CRC unchanged.
+// Combine two finalized IEEE CRCs by advancing the first by secondLen bytes.
 func crc32Combine(first, second uint32, secondLen int) uint32 {
 	if secondLen <= 0 {
 		return first
@@ -100,8 +84,7 @@ func crc32Combine(first, second uint32, secondLen int) uint32 {
 	return first ^ second
 }
 
-// Each matrix advances a CRC by 2^i zero bytes. Preparing the matrices once
-// keeps repeated description polls from rebuilding them for every block.
+// Cache the operators for advancing by powers of two bytes.
 var crc32BytePowers = func() [bits.UintSize - 1][32]uint32 {
 	var powers [bits.UintSize - 1][32]uint32
 	var bit, two, four [32]uint32

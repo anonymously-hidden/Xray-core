@@ -32,10 +32,7 @@ type serviceTransport struct {
 	stall  time.Duration
 }
 
-// RoundTrip ends a request that stands still for t.stall, with no answer that
-// long after its body went out or no byte of either body, but not one that just
-// runs long: a large object on a slow link takes minutes and is fine as long as
-// its bytes move
+// Cancel stalled requests, not long transfers that continue to make progress.
 func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	next := t.plain
 	if r.URL.Scheme == "https" {
@@ -69,15 +66,13 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		cancel(nil)
 	}
 	r = r.WithContext(ctx)
-	// the headers of chrome as with XHTTP and DoH, net/http and http3 would send
-	// their own user agent after a hello of chrome
+	// Clone before setting defaults: the caller owns the original headers.
 	r.Header = r.Header.Clone()
 	utils.TryDefaultHeadersWith(r.Header, "fetch")
 	if r.Body != nil && r.Body != http.NoBody {
 		r.Body = &progressBody{ReadCloser: r.Body, alive: alive, upload: true}
 	}
-	// a body sent again by the transport itself, after a GOAWAY or on a reused
-	// connection that failed, moves just the same
+	// Rewinds performed by the transport must also reset the stall timer.
 	if getBody := r.GetBody; getBody != nil {
 		r.GetBody = func() (io.ReadCloser, error) {
 			body, err := getBody()
@@ -110,8 +105,7 @@ func closeIdleTransport(t http.RoundTripper) {
 	}
 }
 
-// stalled returns errStalled for an error that the stall gave, which http2 reports
-// as a plain cancel
+// HTTP/2 can report the stall timeout as an ordinary cancellation.
 func stalled(ctx context.Context, err error) error {
 	if context.Cause(ctx) == errStalled {
 		return errStalled
@@ -129,8 +123,7 @@ type progressBody struct {
 }
 
 func (b *progressBody) Read(p []byte) (int, error) {
-	// http2 reads a request body up to 512 KiB at a time and sends it all before
-	// the next read, which on a slow link could look like no progress
+	// Short upload reads keep the stall timer meaningful on slow connections.
 	if b.upload {
 		p = p[:min(len(p), 16<<10)]
 	}
@@ -152,27 +145,21 @@ func (b *progressBody) Close() error {
 	return err
 }
 
-// newServiceClient returns a client whose requests end after stall without
-// progress, see serviceTransport.RoundTrip, and whose connections close when
-// connCtx is done. Clients that share h1Hosts share which hosts answer over h1
+// connCtx owns sockets; h1Hosts shares ALPN observations between clients.
 func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings *internet.MemoryStreamConfig, stall time.Duration, maxConns int) *http.Client {
 	var (
 		tlsConfig *tls.Config
 		sockopt   *internet.SocketConfig
 		fronting  *net.Destination
-		// A silently dead h2 connection must be found in seconds, not after
-		// the 45 s Chrome period (net.ChromeH2KeepAlivePeriod). Pings go out only after no frame at all has
-		// arrived, so bulk transfers are not affected. An explicit Xmux
-		// keep-alive setting overrides this.
+		// Detect silent h2 loss unless XMUX supplies an explicit keepalive.
 		h2Idle, h2PingWait = 1500 * time.Millisecond, 2500 * time.Millisecond
-		// h3 keeps alive only when asked to, see below
-		h3KeepAlive time.Duration
+		h3KeepAlive        time.Duration
 	)
 	if streamSettings != nil {
 		tlsConfig = tls.ConfigFromStreamSettings(streamSettings)
 		sockopt = streamSettings.SocketSettings
 		fronting = streamSettings.Destination
-		if config, ok := streamSettings.ProtocolSettings.(*Config); ok && config.Xmux != nil {
+		if config, ok := streamSettings.ProtocolSettings.(*Config); ok && config != nil && config.Xmux != nil {
 			switch period := config.Xmux.HKeepAlivePeriod; {
 			case period > 0:
 				h3KeepAlive = time.Duration(period) * time.Second
@@ -187,15 +174,14 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	}
 	fingerprint := tls.GetFingerprint(tlsConfig.Fingerprint)
 
-	// fronting takes only the address and port, the network stays that of the
-	// dial, which is UDP for h3 though the destination is built as TCP
+	// A configured front replaces the address, not the transport network.
 	dial := func(ctx context.Context, network, addr string) (net.Conn, net.Destination, error) {
 		ctx, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(connCtx, cancel)
 		defer stop()
 		defer cancel()
-		if connCtx.Err() != nil {
-			cancel()
+		if err := connCtx.Err(); err != nil {
+			return nil, net.Destination{}, err
 		}
 		host, err := net.ParseDestination(network + ":" + addr)
 		if err != nil {
@@ -222,13 +208,11 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		if err != nil {
 			return nil, host, errors.New("failed to dial to dest").Base(err)
 		}
-		// h3 closes its QUIC connection instead, as the server never hears of a UDP
-		// socket that closes
+		// HTTP/3 must close QUIC itself as well as its UDP socket.
 		if network == "udp" {
 			return conn, host, nil
 		}
-		// CloseIdleConnections leaves an h2 connection open while a stream just
-		// canceled has not left it yet
+		// A recently canceled h2 stream may still own the socket.
 		stopConn := context.AfterFunc(connCtx, func() { conn.Close() })
 		return &ctxConn{Conn: conn, stop: stopConn}, host, nil
 	}
@@ -252,8 +236,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		} else {
 			tlsConn = tls.UClient(conn, gotlsConfig, fingerprint)
 		}
-		// the dial outlives the request that started it, and a handshake that hangs
-		// would keep the one connection of the host to itself
+		// Bound the handshake independently of connection reuse.
 		ctx, cancel := context.WithTimeout(ctx, stall)
 		defer cancel()
 		if err := tlsConn.(tls.Interface).HandshakeContext(ctx); err != nil {
@@ -282,9 +265,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		if quicParams == nil {
 			quicParams = &internet.QuicParams{BbrProfile: string(bbr.ProfileStandard)}
 		}
-		// the defaults are those of quic-go, with no keepalive unless asked for, as
-		// in DoH: http3 never closes a connection that is idle or that it dropped
-		// after an error, so only the idle timeout or the end of connCtx ends it
+		// QUIC idle timeout and connCtx bound unused connections.
 		quicConfig := &quic.Config{
 			InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
 			MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
@@ -313,8 +294,6 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 				switch quicParams.Congestion {
 				case "", "bbr", "reno":
 				default:
-					// brutal is for Hysteria servers, not services, and a panic here, in
-					// a goroutine of http3, would end the process
 					return nil, errors.New("unsupported congestion control over h3: ", quicParams.Congestion)
 				}
 
@@ -336,8 +315,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 					return nil, errors.New("failed to dial to dest: unexpected ", reflect.TypeOf(c))
 				}
 
-				// built for each dial with the host as SNI, as for h2: http3 sets the
-				// SNI on a copy, which a pinned CA and the ECH lookup do not see
+				// Set SNI before certificate pinning and ECH lookup.
 				gotlsConfig := tlsConfig.GetTLSConfig(tls.WithDestination(host))
 				// it is for servers, and ChromeParrot refuses a config that has it
 				gotlsConfig.GetCertificate = nil
@@ -376,8 +354,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	}
 }
 
-// ctxConn is a connection that connCtx no longer closes once it is closed,
-// so that one that ends on its own leaves nothing behind in connCtx
+// Closing the socket unregisters the owner-context callback.
 type ctxConn struct {
 	net.Conn
 	stop func() bool
@@ -388,9 +365,7 @@ func (c *ctxConn) Close() error {
 	return c.Conn.Close()
 }
 
-// secureTransport keeps a host to one connection, all that h2 needs, as without
-// a limit parallel requests would each dial their own. A host that answers over
-// h1 moves to a transport with more, since h1 carries one request at a time
+// Use one h2 connection per host, but allow parallel h1 connections.
 type secureTransport struct {
 	h2, h1  http.RoundTripper
 	h1Hosts *sync.Map
@@ -475,6 +450,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	p.mu.Lock()
 	if t.closed || p.ctx.Err() != nil || r.Context().Err() != nil {
 		p.mu.Unlock()
+		if r.Body != nil {
+			r.Body.Close()
+		}
 		if err := r.Context().Err(); err != nil {
 			return nil, err
 		}
