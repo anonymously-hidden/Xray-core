@@ -68,11 +68,15 @@ func paramsFromConfig(c *Config) params {
 	return p
 }
 
-// Drive uses the configured concurrency as its ring depth, not an upload
-// worker count. Only the default flush and poll intervals differ from WAL.
+// paramsForStorage applies the Drive slot-path defaults only where the storage
+// is a slotStore and only to fields the config leaves at 0; wal-based backends
+// keep the defaults above because their concurrency and flush mean other things
 func paramsForStorage(c *Config, storage Storage) params {
 	p := paramsFromConfig(c)
 	if _, ok := storage.(slotStore); ok {
+		if c.Concurrency == 0 {
+			p.concurrency = 64
+		}
 		if c.FlushIntervalMs == 0 {
 			p.flushInterval = 10 * time.Millisecond
 		}
