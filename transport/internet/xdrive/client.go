@@ -681,6 +681,7 @@ type poolConn struct {
 
 	heardAt time.Time // last response headers or body bytes
 	waits   map[*connWait]struct{}
+	recheck *time.Timer // one follow-up until this connection answers or its waits drain
 	warming bool
 	probing bool
 	dead    bool
@@ -702,6 +703,7 @@ func (c *poolConn) heard() {
 	now := time.Now()
 	c.mu.Lock()
 	c.heardAt = now
+	c.clearRecheckLocked()
 	c.mu.Unlock()
 	noteHeardAny(now)
 }
@@ -797,6 +799,16 @@ func (c *poolConn) unwatch(w *connWait) {
 	if w.timer != nil {
 		w.timer.Stop()
 	}
+	if len(c.waits) == 0 {
+		c.clearRecheckLocked()
+	}
+}
+
+func (c *poolConn) clearRecheckLocked() {
+	if c.recheck != nil {
+		c.recheck.Stop()
+		c.recheck = nil
+	}
 }
 
 // checkDead probes a connection that answered nothing since its oldest waiting
@@ -807,12 +819,22 @@ func (c *poolConn) checkDead() {
 	c.mu.Lock()
 	var oldest *connWait
 	for w := range c.waits {
+		// A request written before the connection last answered says
+		// nothing about whether it still answers; a later one does.
+		if c.heardAt.After(w.wroteAt) {
+			continue
+		}
 		if oldest == nil || w.wroteAt.Before(oldest.wroteAt) {
 			oldest = w
 		}
 	}
-	probe := oldest != nil && now.Sub(oldest.wroteAt) >= deadConnSuspect && !c.heardAt.After(oldest.wroteAt) &&
-		connHeardAny.Load() > oldest.wroteAt.UnixNano() && !c.closing && !c.probing && !c.dead
+	suspect := oldest != nil && now.Sub(oldest.wroteAt) >= deadConnSuspect && !c.closing && !c.probing && !c.dead
+	probe := suspect && connHeardAny.Load() > oldest.wroteAt.UnixNano()
+	if suspect && !probe && c.recheck == nil {
+		// Another connection may answer just after this check. Keep the timer
+		// recorded after it fires so persistent silence cannot rearm it.
+		c.recheck = time.AfterFunc(deadConnProbe, c.checkDead)
+	}
 	var since time.Time
 	var scheme, host string
 	if probe {
@@ -1061,8 +1083,10 @@ func (t *sessionTransport) spreadTrip(r *http.Request, sp *connSpread, failed *p
 		}
 	}
 	for try := 0; try < 3 && client == nil; try++ {
+		// At maxConnections this returns an existing connection, which may be
+		// the failed one or one sp already uses: that is no spread.
 		c := t.pool.xmux.GetXmuxClient(r.Context())
-		if pc := c.XmuxConn.(*poolConn); pc.acquire() {
+		if pc := c.XmuxConn.(*poolConn); pc != failed && !sp.has(pc) && pc.acquire() {
 			client, conn = c, pc
 		}
 	}

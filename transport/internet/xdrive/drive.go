@@ -78,6 +78,10 @@ type tokenFlight struct {
 
 type laneKey struct{}
 
+// priorityConnKey sends a request over the priority client only, without the
+// reserved permits, token fast-fail or hedging that laneKey also brings.
+type priorityConnKey struct{}
+
 type bodyKey struct{}
 
 type bodyProgressKey struct{}
@@ -1038,7 +1042,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 
 		httpc, lane := s.client, "main"
-		if ctx.Value(laneKey{}) != nil && !descriptionHedge && s.priorityClient != nil {
+		if (ctx.Value(laneKey{}) != nil || ctx.Value(priorityConnKey{}) != nil) && !descriptionHedge && s.priorityClient != nil {
 			httpc, lane = s.priorityClient, "priority"
 		}
 		if ctx.Value(bodyKey{}) != nil && s.bulkClient != nil {
@@ -1259,11 +1263,13 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		// extra retry allowance; speculative requests still never retry.
 		if media != nil && media.stream != nil && !singleAttempt && !retriedMissingBody {
 			missing := resp.StatusCode == http.StatusNotFound
-			staleSuffix := resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && requestMedia.start > media.start
-			if missing || staleSuffix {
+			// Any range inside the verified frame, an original later range
+			// included, can hit a previous lap's shorter body.
+			staleBody := resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && requestMedia.start < media.size
+			if missing || staleBody {
 				lastErr = errNotFound
-				if staleSuffix {
-					lastErr = errors.New("Drive could not serve the resumed media suffix")
+				if staleBody {
+					lastErr = errors.New("Drive could not serve media range ", requestMedia.start, "-", requestMedia.end-1)
 				}
 				retriedMissingBody = true
 				failedConn = selected.Load()
@@ -4043,7 +4049,7 @@ func classifyDriveRequest(ctx context.Context, method, target, contentType strin
 			return kindBodyRead
 		case strings.Contains(target, "q="):
 			return kindList
-		case ctx.Value(laneKey{}) != nil:
+		case ctx.Value(laneKey{}) != nil || ctx.Value(priorityConnKey{}) != nil:
 			return kindHeadRead
 		default:
 			return kindOtherRead

@@ -188,14 +188,17 @@ func (p *bodyPermit) finish(d time.Duration, ok bool) {
 	}
 	p.active = false
 	g.inflight--
-	if !ok {
-		p.discardLocked()
-	} else {
+	if ok {
 		g.observeLatencyLocked(d)
-		if p.left == 0 {
-			p.closed = true
-			delete(g.live, p)
-		}
+	} else {
+		// A failed lookahead frame still owns its verified, undelivered bytes.
+		// Return only unused reservation; handoff or gate close frees the rest.
+		g.resident -= p.left - p.buffered
+		p.left = p.buffered
+	}
+	if p.left == 0 {
+		p.closed = true
+		delete(g.live, p)
 	}
 	g.admitLocked()
 }

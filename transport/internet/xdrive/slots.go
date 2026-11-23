@@ -80,6 +80,11 @@ var (
 
 var slotWriteInflight = 12
 
+// slotFirstFlightGather is how long the first write after idle waits for the
+// writes that follow it back to back: through VLESS encryption each buffer is
+// its own record, so a mux frame header arrives just before its data.
+var slotFirstFlightGather = 2 * time.Millisecond
+
 // slotStore is a storage of objects that are written and read again by id,
 // each with a description and a body
 type slotStore interface {
@@ -382,6 +387,7 @@ type slotWriter struct {
 	lastSize           int
 	held               int
 	flushing           bool          // a flush is waiting for a token with mu released
+	firstFlightArmed   bool          // firstFlight is scheduled; guarded by mu
 	available          chan struct{} // closed when an upload permit is returned; guarded by mu
 	failed             chan struct{}
 	bulkSegments       int
@@ -477,6 +483,12 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 	if err := w.admissionErrorLocked(deadline, closing, false); err != nil {
 		return 0, err
 	}
+	// Nothing is on its way, so there is nothing to coalesce this write with:
+	// send it once the writes right behind it have joined, not on the ticker.
+	if w.batch != nil && len(p) > 0 && len(w.buf) == 0 && len(w.slots) == 0 && !w.firstFlightArmed && !w.quotaRecovery() {
+		w.firstFlightArmed = true
+		time.AfterFunc(slotFirstFlightGather, w.firstFlight)
+	}
 
 	accepted := 0
 	for len(p) > 0 {
@@ -494,6 +506,20 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 		}
 	}
 	return accepted, nil
+}
+
+// firstFlight sends what the first write after idle buffered, if it is still
+// one inline frame and nothing went out meanwhile. Larger bursts are left to
+// the ticker and its inline plans.
+func (w *slotWriter) firstFlight() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.firstFlightArmed = false
+	if w.closed || w.err != nil || w.flushing || w.ctx.Err() != nil || len(w.slots) > 0 ||
+		len(w.buf) == 0 || len(w.buf) > w.batch.unit || w.quotaRecovery() {
+		return
+	}
+	w.flushLocked(nil, nil)
 }
 
 func (w *slotWriter) appendBufferLocked(p []byte) {
@@ -1807,7 +1833,10 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				permit.finish(timing.result(f.bodyTime), f.err == nil)
 				if f.err == nil {
 					r.hit()
-				} else {
+				} else if isAuthError(f.err) {
+					// Credentials fail the whole session. Any other failure
+					// stays on this frame: run reports it in order, once the
+					// frames before it are delivered.
 					r.setErr(f.err)
 				}
 				return
@@ -2004,6 +2033,7 @@ func (r *slotReader) gapProgress(seq int64, launched time.Time) (<-chan struct{}
 func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int64, promoted <-chan struct{}, pending *slotDescriptionHunt) (string, error) {
 	r.mu.Lock()
 	head := r.head == seq
+	ordered := head
 	var wake <-chan struct{}
 	if head {
 		promoted = nil
@@ -2039,11 +2069,16 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 		pending.outstanding++
 		pending.lastLaunch = time.Now()
 		readCtx := ctx
-		role := head
+		role := ordered || head // includes idle heads and fetches promoted during this hunt
 		if head {
 			readCtx = context.WithValue(ctx, laneKey{}, true)
 			readCtx = context.WithValue(readCtx, slotExpectedSeqKey{}, seq)
 			readCtx = context.WithValue(readCtx, avoidConnKey{}, &pending.spread)
+		} else if ordered {
+			// The ordered head of an idle session: off the connections that
+			// carry inline uploads, but still one read at a time on shared
+			// permits, so idle sessions cannot crowd the reserved ones.
+			readCtx = context.WithValue(ctx, priorityConnKey{}, true)
 		}
 		results := pending.results
 		r.wg.Add(1)
