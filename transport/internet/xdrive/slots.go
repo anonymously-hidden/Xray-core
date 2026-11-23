@@ -43,7 +43,6 @@ const (
 	slotBulkDepth    = 64
 
 	slotInline = 1
-	slotMedia  = 2
 	slotEnd    = 3
 	slotErr    = 4
 
@@ -91,7 +90,9 @@ type slotStore interface {
 	// setSlot sets the description of a slot and, unless body is nil, its body
 	setSlot(ctx context.Context, id, description string, body []byte) error
 	readDescription(ctx context.Context, id string) (string, error)
-	readBody(ctx context.Context, id string) ([]byte, error)
+	// readFrameStream reads the body of a streamed frame, handing each
+	// verified block to emit in order
+	readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error
 }
 
 // throttleStore is the optional part of a slotStore that reports how often
@@ -174,10 +175,6 @@ func decodeSlotBytes(b []byte) (slotFrame, bool) {
 		if f.size == 0 || !f.holds(f.data) {
 			return slotFrame{}, false
 		}
-	case slotMedia, slotDirectMedia:
-		if f.mode == slotDirectMedia && f.size > slotDirectMediaMax || f.size == 0 || len(b) != slotHeaderLen {
-			return slotFrame{}, false
-		}
 	case slotStream, slotStreamPrefix:
 		trailer := b[slotHeaderLen:]
 		if f.mode == slotStreamPrefix {
@@ -213,28 +210,21 @@ func (f slotFrame) holds(body []byte) bool {
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
-// watermark of its reader. name, lazy and capability flags are local, not serialized.
+// watermark of its reader. name and lazy are local, not serialized.
 type slotTable struct {
-	Slots            []string `json:"s"`
-	Watermark        string   `json:"w"`
-	name             string
-	lazy             bool
-	streamPrefix     bool
-	directMedia      bool
-	progressiveMedia bool
+	Slots     []string `json:"s"`
+	Watermark string   `json:"w"`
+	name      string
+	lazy      bool
 }
 
 // ring is what a client announces a session with, the tables are named from
 // its side. Lazy rings create their slots on first write instead of up front.
 type ring struct {
-	Up               slotTable `json:"u"`
-	Down             slotTable `json:"d"`
-	First            []byte    `json:"first,omitempty"`
-	Lazy             bool      `json:"lazy,omitempty"`
-	ProgressiveMedia bool      `json:"progressiveMedia,omitempty"` // prefer one progressively verified media download
-	DirectMedia      bool      `json:"directMedia,omitempty"`
-	StreamPrefix     bool      `json:"streamPrefix,omitempty"` // downstream reader also accepts a verified metadata prefix
-	StreamVersion    uint32    `json:"stream,omitempty"`       // receiver capability, not a v1 watermark change
+	Up    slotTable `json:"u"`
+	Down  slotTable `json:"d"`
+	First []byte    `json:"first,omitempty"`
+	Lazy  bool      `json:"lazy,omitempty"`
 }
 
 func decodeRing(b []byte) (ring, bool) {
@@ -880,13 +870,13 @@ func (w *slotWriter) flushAdmittedLocked(deadline, closing <-chan struct{}, allo
 // carry useful bytes at metadata time. Limit the expansion to the front of
 // the upload queue, where an earlier handoff is most likely to be useful.
 func (w *slotWriter) useInlinePrefix(n int) bool {
-	if !w.table.streamPrefix || n < 2*slotStreamBlockBytes {
+	if n < 2*slotStreamBlockBytes {
 		return false
 	}
 	if len(w.slots) == 1 {
 		return true
 	}
-	if !w.table.progressiveMedia || n > slotDirectMediaMax || w.pendingUploadBytes > slotDirectMediaMax {
+	if n > slotProgressiveMax || w.pendingUploadBytes > slotProgressiveMax {
 		return false
 	}
 	if s, ok := w.store.(interface{ cooling() bool }); ok && s.cooling() {
@@ -929,11 +919,9 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	}()
 	defer close(result.done)
 
-	mode := byte(slotMedia)
+	mode := byte(slotStream)
 	if len(chunk) <= slotInlineLimit {
 		mode = slotInline
-	} else if s, ok := w.store.(interface{ streamingEnabled() bool }); ok && s.streamingEnabled() {
-		mode = slotStream
 	}
 	prefetchAt := time.Now()
 	w.prefetchWatermark(seq)
@@ -948,9 +936,6 @@ func (w *slotWriter) upload(seq int64, chunk []byte, prev, result *slotWriteResu
 	putAt := time.Now()
 	burstAwait, burstPutAt = awaited, putAt
 	var prefix []byte
-	if mode == slotStream && w.table.directMedia && !w.table.progressiveMedia && len(chunk) <= slotDirectMediaMax {
-		mode = slotDirectMedia
-	}
 	if mode == slotStream && result.inlinePrefix {
 		prefix = chunk[:slotStreamPrefixBytes]
 	}
@@ -1000,10 +985,8 @@ func (w *slotWriter) write(seq int64, mode byte, data, prefix []byte) (err error
 	f := newSlotFrame(seq, mode, data)
 	f.prefix = prefix
 	var body []byte
-	if mode == slotMedia || mode == slotStream {
+	if mode == slotStream {
 		body = data
-	} else if mode == slotDirectMedia {
-		body = encodeDirectSlot(f, data)
 	}
 	id := w.slotID(seq)
 	if w.lazy {
@@ -1351,7 +1334,6 @@ type slotReader struct {
 	frontierAt      time.Time // last advance of the observed description frontier
 	frontierChanged chan struct{}
 	burstAt         time.Time // last discovery of a full inline frame
-	directNext      int64     // next head eligible for a direct read after contiguous media
 	err             error
 	stop            context.CancelFunc
 	reads           atomic.Int64
@@ -1371,7 +1353,6 @@ type slotReader struct {
 	ackRetry          time.Duration
 	stallTimeout      time.Duration
 	ackDelay          time.Duration
-	bodyRate          float64
 	lazy              bool
 	seen              []bool
 	wmCreated         bool
@@ -1600,9 +1581,6 @@ func (r *slotReader) run() {
 		// the slot is free once the bytes are here, not once they are read
 		r.mu.Lock()
 		r.head++
-		if f.mode == slotDirectMedia {
-			r.directNext = r.head
-		}
 		r.started = true
 		r.mu.Unlock()
 		size := len(f.body)
@@ -1652,38 +1630,6 @@ func (r *slotReader) run() {
 			}
 		}
 	}
-}
-
-type directSlotStore interface {
-	readDirectSlot(context.Context, string, slotFrame) (slotFrame, error)
-}
-
-type directSlotProbe struct {
-	stop   context.CancelFunc
-	result <-chan slotFrame
-}
-
-func (r *slotReader) startDirectProbe(ctx context.Context, seq int64, id string) *directSlotProbe {
-	store, ok := r.store.(directSlotStore)
-	if !ok || !r.table.directMedia || r.descriptionBudget() == 1 {
-		return nil
-	}
-	r.mu.Lock()
-	followsMedia := seq > 0 && r.head == seq && r.directNext == seq && time.Since(r.hitAt) <= slotReadAheadBurst
-	r.mu.Unlock()
-	if !followsMedia {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, directProbeKey{}, true), slotDirectProbeTimeout)
-	done := make(chan slotFrame, 1)
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		defer cancel()
-		frame, _ := store.readDirectSlot(ctx, id, slotFrame{seq: seq})
-		done <- frame
-	}()
-	return &directSlotProbe{stop: cancel, result: done}
 }
 
 func (r *slotReader) isHead(seq int64) bool {
@@ -1749,12 +1695,7 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 	}
 	descriptionCtx, cancelDescription := newDescriptionContext()
 	defer func() { cancelDescription() }()
-	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), probeContext: ctx}
-	defer func() {
-		if hunt.probe != nil {
-			hunt.probe.stop()
-		}
-	}()
+	hunt := slotDescriptionHunt{results: make(chan slotDescriptionResult, 4)}
 	backoff := r.huntFloor
 	quietMisses := 0
 	_, drive := r.store.(throttleStore)
@@ -1804,9 +1745,6 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 		switch {
 		case err == nil && ok && frame.seq == seq:
 			cancelDescription()
-			if frame.mode != slotDirectMedia && hunt.probe != nil {
-				hunt.probe.stop()
-			}
 			if f.visibleAt.IsZero() {
 				f.visibleAt = time.Now()
 			}
@@ -1835,137 +1773,44 @@ func (r *slotReader) fetch(ctx context.Context, seq int64, offset int, f *slotFe
 				r.hit()
 				return
 			case slotStream:
-				store, streams := r.store.(interface {
-					readFrameStream(context.Context, string, slotFrame, func(int, []byte) error) error
-				})
-				if len(frame.prefix) != 0 && (!r.table.streamPrefix || !streams) {
-					f.err = errors.New("unnegotiated inline stream prefix")
-					return
-				}
-				if streams {
-					admissionAt := time.Now()
-					f.prefixBytes = len(frame.prefix)
-					permit, admitted := r.bodies.acquire(ctx, seq, frame.size+f.prefixBytes)
-					if !admitted {
-						f.err = ctx.Err()
-						return
-					}
-					f.bodyAdmission += time.Since(admissionAt)
-					f.permit = permit
-					f.stream = newSlotStreamBuffer(frame)
-					f.stream.credit = permit
-					permit.received(f.prefixBytes)
-					frame.prefix = nil
-					f.progressive = r.table.progressiveMedia && frame.size+f.prefixBytes <= slotDirectMediaMax
-					close(f.streamReady)
-					bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
-					bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
-					if f.progressive {
-						bodyCtx = context.WithValue(bodyCtx, progressiveMediaKey{}, true)
-					}
-					timing := &bodyReadTiming{}
-					bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
-					if r.isHead(seq) {
-						bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
-					}
-					began := time.Now()
-					f.err = store.readFrameStream(bodyCtx, id, frame, f.stream.offer)
-					f.bodyTime = time.Since(began)
-					if f.err == nil && !f.stream.complete() {
-						f.err = errors.New("streamed slot ended without every verified block")
-					}
-					permit.finish(timing.result(f.bodyTime), f.err == nil)
-					if f.err == nil {
-						r.hit()
-					} else {
-						r.setErr(f.err)
-					}
-					return
-				}
-				fallthrough
-			case slotDirectMedia, slotMedia:
-				if frame.mode == slotDirectMedia && !r.table.directMedia {
-					f.err = errors.New("unnegotiated direct media frame")
-					return
-				}
 				admissionAt := time.Now()
-				permit, admitted := r.bodies.acquire(ctx, seq, frame.size)
+				f.prefixBytes = len(frame.prefix)
+				permit, admitted := r.bodies.acquire(ctx, seq, frame.size+f.prefixBytes)
 				if !admitted {
+					f.err = ctx.Err()
 					return
 				}
 				f.bodyAdmission += time.Since(admissionAt)
 				f.permit = permit
-				began := time.Now()
+				f.stream = newSlotStreamBuffer(frame)
+				f.stream.credit = permit
+				permit.received(f.prefixBytes)
+				frame.prefix = nil
+				f.progressive = frame.size+f.prefixBytes <= slotProgressiveMax
+				close(f.streamReady)
 				bodyCtx := context.WithValue(ctx, mediaPromotionKey{}, (<-chan struct{})(f.promoted))
+				bodyCtx = context.WithValue(bodyCtx, mediaDeliveryKey{}, f.stream.deliveryState)
+				if f.progressive {
+					bodyCtx = context.WithValue(bodyCtx, progressiveMediaKey{}, true)
+				}
 				timing := &bodyReadTiming{}
 				bodyCtx = context.WithValue(bodyCtx, bodyReadTimingKey{}, timing)
-				var body []byte
-				var bodyErr error
-				if frame.mode == slotDirectMedia {
-					store, supported := r.store.(directSlotStore)
-					if !supported {
-						bodyErr = errors.New("unnegotiated direct media frame")
-					} else {
-						direct := hunt.direct
-						if hunt.probe != nil && hunt.probe.result != nil {
-							select {
-							case direct = <-hunt.probe.result:
-							case <-ctx.Done():
-								permit.finish(timing.result(0), false)
-								return
-							}
-							hunt.probe.result = nil
-						}
-						if direct.size != frame.size || direct.crc != frame.crc {
-							if r.isHead(seq) {
-								bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
-							}
-							direct, bodyErr = store.readDirectSlot(bodyCtx, id, frame)
-						}
-						if bodyErr == nil && (direct.size != frame.size || direct.crc != frame.crc) {
-							bodyErr = errors.New("direct media frame does not match its description")
-						}
-						body = direct.data
-					}
-				} else {
-					body, bodyErr = r.readMediaBody(bodyCtx, id, seq, frame)
+				if r.isHead(seq) {
+					bodyCtx = context.WithValue(bodyCtx, mediaHeadKey{}, true)
 				}
-				bodyTime := time.Since(began)
-				f.bodyTime += bodyTime
-				if bodyErr == nil {
-					permit.received(len(body))
+				began := time.Now()
+				f.err = r.store.readFrameStream(bodyCtx, id, frame, f.stream.offer)
+				f.bodyTime = time.Since(began)
+				if f.err == nil && !f.stream.complete() {
+					f.err = errors.New("streamed slot ended without every verified block")
 				}
-				permit.finish(timing.result(bodyTime), bodyErr == nil)
-				if isAuthError(bodyErr) {
-					f.err = bodyErr
-					r.setErr(bodyErr)
-					return
-				}
-				if bodyErr == nil {
-					f.body = body
+				permit.finish(timing.result(f.bodyTime), f.err == nil)
+				if f.err == nil {
 					r.hit()
-					return
+				} else {
+					r.setErr(f.err)
 				}
-				if ctx.Err() == nil && time.Since(warnedAt) > 10*time.Second {
-					warnedAt = time.Now()
-					if bodyErr != nil {
-						errors.LogWarningInner(ctx, bodyErr, "failed to read body of slot ", id)
-					} else {
-						errors.LogWarning(ctx, "body of slot ", id, " does not match segment ", seq)
-					}
-				}
-				if visibleSince.IsZero() {
-					visibleSince = time.Now()
-				}
-				if time.Since(visibleSince) > r.stallTimeout {
-					f.err = errors.New("segment ", seq, " has no usable body after ", r.stallTimeout).Base(bodyErr)
-					return
-				}
-				descriptionCtx, cancelDescription = newDescriptionContext()
-				if hunt.probe != nil {
-					hunt.probe.stop()
-				}
-				hunt = slotDescriptionHunt{results: make(chan slotDescriptionResult, 4), observations: hunt.observations, present: hunt.present, frontierProbe: hunt.frontierProbe}
+				return
 			}
 		case err == nil && !ok && description != "":
 			// A present but undecodable description for this slot is not idle;
@@ -2099,9 +1944,6 @@ type slotDescriptionResult struct {
 }
 
 type slotDescriptionHunt struct {
-	probeContext  context.Context
-	probe         *directSlotProbe
-	direct        slotFrame
 	results       chan slotDescriptionResult
 	outstanding   int
 	lastLaunch    time.Time  // retained across observations and tail promotion
@@ -2112,24 +1954,6 @@ type slotDescriptionHunt struct {
 	observations  uint64
 	present       uint64
 	frontierProbe bool // at most one evidence-based overlapping read per hunt
-}
-
-// Frame-aware stores validate the complete size and checksum before returning;
-// only generic body readers need the validation here.
-func (r *slotReader) readMediaBody(ctx context.Context, id string, seq int64, frame slotFrame) ([]byte, error) {
-	if store, ok := r.store.(interface {
-		readFrameBody(context.Context, string, slotFrame) ([]byte, error)
-	}); ok {
-		if r.isHead(seq) {
-			ctx = context.WithValue(ctx, mediaHeadKey{}, true)
-		}
-		return store.readFrameBody(ctx, id, frame)
-	}
-	body, err := r.readBodyHedged(ctx, id, frame.size)
-	if err == nil && !frame.holds(body) {
-		err = errors.New("slot body does not match the segment checksum")
-	}
-	return body, err
 }
 
 func (r *slotReader) headOverlapDelay() time.Duration {
@@ -2258,14 +2082,6 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 	admit()
 	_, drive := r.store.(throttleStore)
 	for {
-		var direct <-chan slotFrame
-		if head && pending.probeContext != nil {
-			pending.probe = r.startDirectProbe(pending.probeContext, seq, id)
-			pending.probeContext = nil
-		}
-		if pending.probe != nil {
-			direct = pending.probe.result
-		}
 		var frontierChanged <-chan struct{}
 		if drive && !head && !pending.frontierProbe && pending.outstanding == 1 {
 			var evidence bool
@@ -2280,14 +2096,6 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			}
 		}
 		select {
-		case frame := <-direct:
-			pending.probe.result = nil
-			if frame.size > 0 {
-				pending.direct = frame
-				wire := frame
-				wire.data = nil
-				return wire.encode(), nil
-			}
 		case <-frontierChanged:
 			continue
 		case res := <-pending.results:
@@ -2367,100 +2175,6 @@ func (r *slotReader) huntSlotDescription(ctx context.Context, id string, seq int
 			observationTimer.Reset(observationWindow)
 		case <-ctx.Done():
 			return "", ctx.Err()
-		}
-	}
-}
-
-func (r *slotReader) readBodyHedged(ctx context.Context, id string, size int) ([]byte, error) {
-	if slotBodyHedge <= 0 {
-		return r.store.readBody(ctx, id)
-	}
-	delay := slotBodyHedge
-	r.mu.Lock()
-	rate := r.bodyRate
-	r.mu.Unlock()
-	if rate > 0 && size > 0 {
-		if scaled := time.Duration(float64(2*size) / rate * float64(time.Second)); scaled > delay {
-			delay = scaled
-		}
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	start := time.Now()
-	var progress struct {
-		sync.Mutex
-		at time.Time
-	}
-	ctx = context.WithValue(ctx, bodyProgressKey{}, func() {
-		progress.Lock()
-		progress.at = time.Now()
-		progress.Unlock()
-	})
-
-	type result struct {
-		body []byte
-		err  error
-	}
-	results := make(chan result, 2)
-	launch := func() {
-		r.wg.Add(1)
-		go func() {
-			defer r.wg.Done()
-			body, err := r.store.readBody(ctx, id)
-			results <- result{body, err}
-		}()
-	}
-	launch()
-	outstanding := 1
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	var last result
-	for {
-		select {
-		case res := <-results:
-			outstanding--
-			if res.err == nil {
-				if elapsed := time.Since(start); elapsed > 0 && len(res.body) > 0 {
-					instant := float64(len(res.body)) / elapsed.Seconds()
-					r.mu.Lock()
-					if r.bodyRate == 0 {
-						r.bodyRate = instant
-					} else {
-						r.bodyRate = (r.bodyRate + instant) / 2
-					}
-					r.mu.Unlock()
-				}
-				return res.body, nil
-			}
-			last = res
-			if outstanding == 0 {
-				return nil, last.err
-			}
-		case <-timer.C:
-			// A body that is moving shares the bulk connection with its hedge;
-			// duplicating it would compete with the bytes already on their way.
-			progress.Lock()
-			remaining := delay - time.Since(progress.at)
-			progress.Unlock()
-			if remaining > 0 {
-				timer.Reset(remaining)
-				continue
-			}
-			if outstanding == 1 {
-				if s, ok := r.store.(interface {
-					cooling() bool
-					lastRateLimitAt() time.Time
-				}); ok && (s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second) {
-					// The timer just fired and is spent; re-arm it so the
-					// hedge can still start once the cooldown ends.
-					timer.Reset(delay)
-					continue
-				}
-				launch()
-				outstanding++
-			}
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		}
 	}
 }

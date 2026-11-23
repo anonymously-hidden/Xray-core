@@ -192,7 +192,6 @@ func isCleanupRateLimited(err error) bool {
 
 type driveStorage struct {
 	*driveShared
-	streamCaps      atomic.Pointer[driveStreamCaps]
 	progressiveFull rangeLatency // comparable clean near-512 KiB GET durations in this session
 	// Clients and permits are session-local.
 	client         *http.Client
@@ -786,8 +785,7 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 	descriptionHedge := method == http.MethodGet && ctx.Value(descriptionHedgeKey{}) != nil
 	media, _ := ctx.Value(driveMediaKey{}).(*driveMediaRequest)
 	mediaTiming, _ := ctx.Value(bodyReadTimingKey{}).(*bodyReadTiming)
-	readHedgeAttempt := descriptionHedge || method == http.MethodGet &&
-		(media != nil && media.rescue || ctx.Value(directProbeKey{}) != nil)
+	readHedgeAttempt := descriptionHedge || method == http.MethodGet && media != nil && media.rescue
 	singleAttempt := readHedgeAttempt || method == http.MethodGet && ctx.Value(keeperProbeKey{}) != nil
 	if readHedgeAttempt && !s.readHedgeAllowed(ctx) {
 		return 0, nil, errReadHedgeSkipped
@@ -1286,13 +1284,6 @@ func (s *driveStorage) do(parent context.Context, method, target, contentType st
 		}
 		if media != nil && media.stream == nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
 			payload, err = media.extract(resp.StatusCode, resp.Header.Get("Content-Range"), payload)
-			if want := media.direct; want != nil && err == nil {
-				// Validate each candidate before it can win and cancel its sibling.
-				got, ok := decodeDirectSlot(payload, want.seq)
-				if !ok || got.size != want.size || got.crc != want.crc {
-					err = errors.New("direct media frame does not match its description")
-				}
-			}
 		}
 		if err != nil {
 			mediaTiming.reject()
@@ -2151,11 +2142,7 @@ func (s *driveStorage) setSlot(ctx context.Context, id, description string, body
 	} else {
 		ctx = context.WithValue(ctx, bodyKey{}, true)
 	}
-	fields := map[string]interface{}{"description": description}
-	if properties := s.streamingProperties(); properties != nil {
-		fields["properties"] = properties
-	}
-	metadata, err := json.Marshal(fields)
+	metadata, err := json.Marshal(map[string]interface{}{"description": description})
 	if err != nil {
 		return errors.New("failed to build the slot metadata").Base(err)
 	}
@@ -2275,7 +2262,7 @@ func (s *driveStorage) readHedgeAllowed(ctx context.Context) bool {
 			return false
 		}
 	}
-	if ctx.Value(descriptionHedgeKey{}) != nil || ctx.Value(directProbeKey{}) != nil {
+	if ctx.Value(descriptionHedgeKey{}) != nil {
 		return s.descriptionHedgeAllowed()
 	}
 	if media, ok := ctx.Value(driveMediaKey{}).(*driveMediaRequest); ok && media.rescue {
@@ -2418,7 +2405,7 @@ func (s *driveStorage) readDescHedged(ctx context.Context, target string) (statu
 
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
 	ctx = context.WithValue(ctx, attemptKey{}, driveSlotRead)
-	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields="+s.streamingFields()+"&supportsAllDrives=true")
+	status, payload, err := s.readDescHedged(ctx, s.filesURL+"/"+url.PathEscape(id)+"?fields=description&supportsAllDrives=true")
 	switch {
 	case err != nil:
 		return "", err
@@ -2429,13 +2416,11 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	}
 
 	var parsed struct {
-		Description string            `json:"description"`
-		Properties  map[string]string `json:"properties"`
+		Description string `json:"description"`
 	}
 	if err := json.Unmarshal(payload, &parsed); err != nil {
 		return "", errors.New("failed to parse the description of ", id).Base(err)
 	}
-	s.observeStreamingProperties(parsed.Properties)
 	return parsed.Description, nil
 }
 
@@ -2802,9 +2787,6 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 		"parents":     []string{s.folder},
 		"description": description,
 	}
-	if properties := s.streamingProperties(); properties != nil {
-		metadata["properties"] = properties
-	}
 	err := s.createWithID(ctx, metadata, body)
 	if err == nil {
 		return nil
@@ -3077,7 +3059,6 @@ type driveMediaRequest struct {
 	rescue           bool
 	rescueSettled    *atomic.Bool // one reservation, settled by dispatch or refund
 	progressive      bool
-	direct           *slotFrame // expected envelope for a full direct-media object
 	stream           *driveRangeStream
 	progress         *driveRangeProgress
 }
@@ -3162,75 +3143,6 @@ func (r *driveMediaRequest) extract(status int, contentRange string, body []byte
 		return body, nil
 	}
 	return nil, errors.New("Drive media range has an unexpected offset or length")
-}
-
-func (s *driveStorage) readFrameBody(ctx context.Context, id string, frame slotFrame) ([]byte, error) {
-	if frame.size <= 0 || frame.size > maxSegmentBytes {
-		return nil, errors.New("invalid Drive media frame size")
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	ctx = context.WithValue(ctx, bodyKey{}, true)
-	ctx = context.WithValue(ctx, maxBodyKey{}, int64(max(frame.size, 64<<10)))
-	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
-	lanes := max(1, len(s.mediaClients))
-
-	partSize := int(defaultSegmentBytes)
-	if ctx.Value(mediaHeadKey{}) != nil {
-		partSize = driveMediaPart
-	}
-	parts := max(1, min((frame.size+partSize-1)/partSize, lanes))
-	if s.cooling() || time.Since(s.lastRateLimitAt()) <= 5*time.Second {
-		parts = 1
-	}
-	first := s.mediaNext.Add(uint32(parts)) - uint32(parts)
-	if parts == 1 {
-		r := driveMediaRequest{end: frame.size, size: frame.size, seq: frame.seq}
-		if len(s.mediaClients) > 0 {
-			r.client = s.mediaClients[int(first%uint32(len(s.mediaClients)))]
-		}
-		body, err := s.readMediaRange(ctx, target, r)
-		if err != nil {
-			return nil, err
-		}
-		if !frame.holds(body) {
-			return nil, errors.New("Drive media ranges do not match the segment checksum")
-		}
-		return body, nil
-	}
-	width := (frame.size + parts - 1) / parts
-	type result struct {
-		start int
-		body  []byte
-		err   error
-	}
-	results := make(chan result, parts)
-	for i := range parts {
-		r := driveMediaRequest{start: i * width, end: min((i+1)*width, frame.size), size: frame.size, seq: frame.seq}
-		if len(s.mediaClients) > 0 {
-			r.client = s.mediaClients[int((first+uint32(i))%uint32(len(s.mediaClients)))]
-		}
-		go func() {
-			body, err := s.readMediaRange(ctx, target, r)
-			results <- result{r.start, body, err}
-		}()
-	}
-	body := make([]byte, frame.size)
-	for range parts {
-		select {
-		case res := <-results:
-			if res.err != nil {
-				return nil, res.err
-			}
-			copy(body[res.start:], res.body)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	if !frame.holds(body) {
-		return nil, errors.New("Drive media ranges do not match the segment checksum")
-	}
-	return body, nil
 }
 
 func mediaDeliveryRemaining(ctx context.Context, primary *driveReadProgress, r driveMediaRequest, startup, delay time.Duration, delivery func() (int, <-chan struct{}, time.Time)) (time.Duration, bool, <-chan struct{}) {
@@ -3598,40 +3510,6 @@ func (s *driveRangeStream) read(request driveMediaRequest, status int, contentRa
 	return nil, nil
 }
 
-type directProbeKey struct{}
-
-func (s *driveStorage) readDirectSlot(ctx context.Context, id string, want slotFrame) (slotFrame, error) {
-	ctx = context.WithValue(ctx, bodyKey{}, true)
-	ctx = context.WithValue(ctx, maxBodyKey{}, int64(slotHeaderLen+slotDirectMediaMax))
-	target := s.filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
-	// Discovery has no trusted size yet. Once metadata identifies the frame,
-	// schedule a single full-object range on the existing media lanes so a
-	// stalled delivery head is eligible for the normal bounded rescue.
-	if want.size != 0 {
-		width := slotHeaderLen + want.size
-		request := driveMediaRequest{end: width, size: width, seq: want.seq, direct: &want}
-		if n := uint32(len(s.mediaClients)); n != 0 {
-			request.client = s.mediaClients[(s.mediaNext.Add(1)-1)%n]
-		}
-		wire, err := s.readMediaRange(ctx, target, request)
-		if err != nil {
-			return slotFrame{}, err
-		}
-		want.data = wire[slotHeaderLen:]
-		return want, nil
-	}
-	status, payload, err := s.do(ctx, http.MethodGet, target, "", nil)
-	if err != nil {
-		return slotFrame{}, err
-	}
-	if status == http.StatusOK {
-		if frame, ok := decodeDirectSlot(payload, want.seq); ok {
-			return frame, nil
-		}
-	}
-	return slotFrame{}, errors.New("Drive did not return a complete direct media frame for sequence ", want.seq)
-}
-
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slotFrame, emit func(int, []byte) error) error {
 	if frame.size <= 0 || frame.size > maxSegmentBytes || frame.mode != slotStream ||
 		len(frame.blocks) != (frame.size+driveStreamBlockBytes-1)/driveStreamBlockBytes || emit == nil {
@@ -3710,76 +3588,6 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, frame slo
 		}
 	}
 	return firstErr
-}
-
-// Streaming negotiation.
-
-const (
-	driveStreamCapsVersionKey = "xdriveStream"
-	driveStreamCapsSessionKey = "xdriveSession"
-	driveStreamCapsVersion    = "1"
-)
-
-// Session-local negotiation, not authentication or integrity protection.
-
-type driveStreamCaps struct {
-	session   string
-	advertise bool
-	peerReady atomic.Bool
-}
-
-// Configure before traffic; a new nonce starts a fresh capability epoch.
-
-func (s *driveStorage) configureStreaming(session string, peerSupports bool) {
-	if session == "" {
-		return
-	}
-	for {
-		current := s.streamCaps.Load()
-		if current != nil && current.session == session {
-			if peerSupports {
-				current.peerReady.Store(true)
-			}
-			return
-		}
-		next := &driveStreamCaps{session: session, advertise: peerSupports}
-		next.peerReady.Store(peerSupports)
-		if s.streamCaps.CompareAndSwap(current, next) {
-			return
-		}
-	}
-}
-
-func (s *driveStorage) streamingEnabled() bool {
-	caps := s.streamCaps.Load()
-	return caps != nil && caps.peerReady.Load()
-}
-
-// Only servers acknowledge accepted offers; client metadata must not self-enable.
-
-func (s *driveStorage) streamingProperties() map[string]string {
-	caps := s.streamCaps.Load()
-	if caps == nil || !caps.advertise {
-		return nil
-	}
-	return map[string]string{
-		driveStreamCapsVersionKey: driveStreamCapsVersion,
-		driveStreamCapsSessionKey: caps.session,
-	}
-}
-
-func (s *driveStorage) observeStreamingProperties(properties map[string]string) {
-	caps := s.streamCaps.Load()
-	if caps != nil && properties[driveStreamCapsVersionKey] == driveStreamCapsVersion && properties[driveStreamCapsSessionKey] == caps.session {
-		caps.peerReady.Store(true)
-	}
-}
-
-func (s *driveStorage) streamingFields() string {
-	if s.streamCaps.Load() != nil {
-		return "description,properties"
-	}
-	return "description"
 }
 
 // driveStreamHeadRanges bounds the ranges of a streamed head frame.
@@ -3905,7 +3713,7 @@ func mediaDelayFromMedian(median time.Duration) time.Duration {
 
 func comparableProgressive(r driveMediaRequest) bool {
 	return r.progressive && r.start == 0 && r.end == r.size &&
-		r.size >= slotDirectMediaMax-slotStreamPrefixBytes && r.size <= slotDirectMediaMax
+		r.size >= slotProgressiveMax-slotStreamPrefixBytes && r.size <= slotProgressiveMax
 }
 
 func (s *driveStorage) observeMediaLatency(r *driveMediaRequest, sample timingSample, status, attempt int, replayed bool, err error) {

@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math/bits"
-	"time"
 )
 
 const (
@@ -13,29 +12,9 @@ const (
 	// Leave room for checksums and headers under the existing inline description size.
 	slotStreamPrefixBytes = 11 << 10
 	slotStreamBlockBytes  = 32 << 10
+	// slotProgressiveMax bounds a frame read progressively by one GET.
+	slotProgressiveMax = defaultSegmentBytes
 )
-
-const (
-	slotDirectMedia        byte = 7
-	slotDirectMediaMax          = defaultSegmentBytes
-	slotDirectProbeTimeout      = 1250 * time.Millisecond
-)
-
-func encodeDirectSlot(frame slotFrame, data []byte) []byte {
-	return append(frame.header(), data...)
-}
-
-func decodeDirectSlot(payload []byte, seq int64) (slotFrame, bool) {
-	if len(payload) <= slotHeaderLen || len(payload) > slotHeaderLen+slotDirectMediaMax {
-		return slotFrame{}, false
-	}
-	frame, ok := decodeSlotBytes(payload[:slotHeaderLen])
-	if !ok || frame.mode != slotDirectMedia || frame.seq != seq || !frame.holds(payload[slotHeaderLen:]) {
-		return slotFrame{}, false
-	}
-	frame.data = payload[slotHeaderLen:]
-	return frame, true
-}
 
 // streamBlockChecksums covers each fixed-size block, including the final short
 // block. An empty payload has no checksums and is not a valid stream frame.
