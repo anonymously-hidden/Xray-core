@@ -55,18 +55,13 @@ func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
 	return f
 }
 
-func (f slotFrame) header() []byte {
+func (f slotFrame) encode() string {
 	b := make([]byte, slotHeaderLen, slotHeaderLen+len(f.data))
 	copy(b, slotMagic)
 	binary.BigEndian.PutUint64(b[8:], uint64(f.seq))
 	b[16] = f.mode
 	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
 	binary.BigEndian.PutUint32(b[21:], f.crc)
-	return b
-}
-
-func (f slotFrame) encode() string {
-	b := f.header()
 	if f.mode == slotStream {
 		b = appendStreamChecksums(b, f.blocks)
 		if len(f.prefix) != 0 {
@@ -82,14 +77,7 @@ func (f slotFrame) encode() string {
 
 func decodeSlot(description string) (slotFrame, bool) {
 	b, err := base64.StdEncoding.DecodeString(description)
-	if err != nil {
-		return slotFrame{}, false
-	}
-	return decodeSlotBytes(b)
-}
-
-func decodeSlotBytes(b []byte) (slotFrame, bool) {
-	if len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
+	if err != nil || len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
 		return slotFrame{}, false
 	}
 	f := slotFrame{
@@ -104,7 +92,7 @@ func decodeSlotBytes(b []byte) (slotFrame, bool) {
 	switch f.mode {
 	case slotInline:
 		f.data = b[slotHeaderLen:]
-		if f.size == 0 || f.size > slotInlineLimit || !f.holds(f.data) {
+		if f.size == 0 || f.size > slotInlineLimit || len(f.data) != f.size || crc32.ChecksumIEEE(f.data) != f.crc {
 			return slotFrame{}, false
 		}
 	case slotStream, slotStreamPrefix:
@@ -133,12 +121,6 @@ func decodeSlotBytes(b []byte) (slotFrame, bool) {
 		return slotFrame{}, false
 	}
 	return f, true
-}
-
-// holds reports whether body is the one that f is about, which a body read
-// right after its description need not be yet
-func (f slotFrame) holds(body []byte) bool {
-	return len(body) == f.size && crc32.ChecksumIEEE(body) == f.crc
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the

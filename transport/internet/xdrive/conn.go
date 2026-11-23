@@ -221,7 +221,7 @@ func (c *Conn) closeOrdered(err error) error {
 	if reader, ok := c.reader.(*slotReader); ok && err == nil && c.ctx.Err() == nil {
 		ctx, cancel := context.WithTimeout(c.ctx, 2*time.Second)
 		// Only verified data earns credit. Abort does not start a new write.
-		_ = reader.finish(ctx)
+		err = reader.finish(ctx)
 		cancel()
 	}
 	c.cancel()

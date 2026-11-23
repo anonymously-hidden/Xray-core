@@ -51,7 +51,9 @@ Removed from the larger implementation: custom spare-connection probes,
 background connection/token/ID keepers, eager spare rings, duplicated media
 rescue and latency controllers, and detailed per-burst telemetry. A Drive ID
 allocation failure now fails the dial explicitly instead of switching to WAL.
-An ambiguously completed mutation is not automatically replayed. These are
+An ambiguously completed slot or watermark write is checked by reading its exact
+description back from the known ID, without replaying it. If confirmation fails,
+the original write error is preserved. Graceful close reports final ACK errors. These are
 behavior differences, not just source rearrangement. Historical throughput
 and tail-latency measurements from the larger version are **not** measurements
 of this one. This candidate has not been built or benchmarked here.
@@ -67,8 +69,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 832 |
-| `slots.go` | whole file | 220 |
+| `drive.go` | whole file | 847 |
+| `slots.go` | whole file | 202 |
 | `slot_reader.go` | whole file | 393 |
 | `slot_writer.go` | whole file | 341 |
 | `slot_stream.go` | whole file | 136 |
@@ -80,4 +82,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2996** |
+| **Total** | | **2993** |

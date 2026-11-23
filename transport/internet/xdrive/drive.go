@@ -457,8 +457,8 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return true, err
 			case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 				return false, errDriveRange
-			case resp.StatusCode == http.StatusConflict:
-				return false, errDriveConflict
+			case resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusRequestEntityTooLarge:
+				return false, refusedPayload{err}
 			case resp.StatusCode == http.StatusNotFound:
 				return false, errNotFound
 			default:
@@ -504,31 +504,45 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 		target += "/" + url.PathEscape(id)
 	}
 	data, err := s.bytes(ctx, lane, method, target+query, typ, md, 4096)
-	if err != nil {
+	if id == "" {
+		id = f.ID // preallocated lazy slot; ordinary announcements have no known ID
+	}
+	if err == nil {
+		var reply driveFile
+		if json.Unmarshal(data, &reply) == nil && reply.ID != "" && (id == "" || reply.ID == id) {
+			return nil
+		}
+		err = errors.New("unexpected Drive file ID in write response")
+	}
+	if _, refused := err.(refusedPayload); refused || id == "" || isAuthError(err) || ctx.Err() != nil {
 		return err
 	}
-	var reply driveFile
-	if json.Unmarshal(data, &reply) != nil || reply.ID == "" || (f.ID != "" && reply.ID != f.ID) || (id != "" && reply.ID != id) {
-		return errors.New("unexpected Drive file ID in write response")
-	}
-	return nil
-}
-
-var (
-	errDriveRange    = errors.New("Drive range not yet available")
-	errDriveConflict = errors.New("Drive file ID already exists")
-)
-
-func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
-	f := driveFile{ID: id, Name: flatten(name), Parents: []string{s.folder}, Description: description}
-	err := s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
-	if err == errDriveConflict {
-		// Reconcile only the exact generation, never overwrite a conflicting ID.
-		if existing, readErr := s.readDescription(ctx, id); readErr == nil && existing == description {
+	// Data and watermark files each have one writer. Confirm the exact frame
+	// or cumulative ACK under the original caller's deadline, without replay.
+	verify, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for verify.Err() == nil {
+		d, readErr := s.readDescription(verify, id)
+		if readErr == nil && d == f.Description {
 			return nil
+		}
+		if isAuthError(readErr) {
+			return readErr
+		}
+		if sleepContext(verify, 150*time.Millisecond) != nil {
+			break
 		}
 	}
 	return err
+}
+
+var errDriveRange = errors.New("Drive range not yet available")
+
+type refusedPayload struct{ error }
+
+func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
+	f := driveFile{ID: id, Name: flatten(name), Parents: []string{s.folder}, Description: description}
+	return s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
 }
 
 type headKey struct{}

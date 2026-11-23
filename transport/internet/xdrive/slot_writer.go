@@ -180,8 +180,8 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 		return err
 	}
 	if err := w.table.publish(w.ctx, w.store, seq, mode, chunk); err != nil {
-		// Best effort only, and never on a position whose reuse wasn't fenced.
-		if mode != slotErr && w.ctx.Err() == nil {
+		// A lost reply is not a refusal: never overwrite possibly committed data.
+		if _, refused := err.(refusedPayload); refused && w.ctx.Err() == nil {
 			ctx, cancel := context.WithTimeout(w.ctx, 2*time.Second)
 			_ = w.table.publish(ctx, w.store, seq, slotErr, nil)
 			cancel()
