@@ -6,9 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"hash/crc32"
 	"io"
-	"math/bits"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,21 +18,26 @@ import (
 )
 
 const (
-	slotMagic        = "XDRVSL01"
-	slotHeaderLen    = len(slotMagic) + 17
+	slotMagic        = "XDRVSL02"
+	slotHeaderLen    = len(slotMagic) + 13
 	slotInlineLimit  = 14 << 10
 	slotInline       = 1
 	slotEnd          = 3
 	slotErr          = 4
+	slotStream       = 5
 	maxSlotIDLen     = 128
 	slotStallTimeout = time.Minute
 
-	slotStream       byte = 5
-	slotStreamPrefix byte = 6
-	// Leave room for checksums and headers under the existing inline description size.
-	slotStreamPrefixBytes = 11 << 10
-	slotStreamBlockBytes  = 32 << 10
-	// slotProgressiveMax bounds a frame read progressively by one GET.
+	// A media body starts with its sequence number, so a reader can tell an
+	// older lap from the frame it was announced, without a checksum.
+	slotBodyHeader = 8
+	// slotReadChunk is the unit a media body is delivered in while it downloads.
+	slotReadChunk = 32 << 10
+	// slotMaxFrame stays below Drive's 5 MB multipart upload limit.
+	slotMaxFrame = 4 << 20
+	// A credit wait this long means the reader is clearly struggling.
+	slotStrainWait = 250 * time.Millisecond
+	// slotProgressiveMax bounds a frame read by one GET instead of four ranges.
 	slotProgressiveMax = defaultSegmentBytes
 )
 
@@ -48,29 +51,13 @@ type slotStore interface {
 	readFrameStream(context.Context, string, slotFrame, func([]byte) error) error
 }
 
-// A slot description identifies its sequence and carries either the payload
-// or the checksums needed to verify a separate media body.
+// A slot description identifies its sequence and either carries the payload
+// (inline) or the length of a media body stored in the same file.
 type slotFrame struct {
-	seq    int64
-	mode   byte
-	size   int
-	crc    uint32
-	data   []byte
-	blocks []uint32 // per-block CRCs; rooted against crc before streamed delivery
-	prefix []byte   // verified bytes before the streamed suffix; excluded from size and crc
-}
-
-func newSlotFrame(seq int64, mode byte, data []byte) slotFrame {
-	f := slotFrame{seq: seq, mode: mode, size: len(data), crc: crc32.ChecksumIEEE(data)}
-	if mode == slotInline {
-		f.data = data
-	} else if mode == slotStream {
-		f.blocks = make([]uint32, 0, (len(data)+slotStreamBlockBytes-1)/slotStreamBlockBytes)
-		for block := range slices.Chunk(data, slotStreamBlockBytes) {
-			f.blocks = append(f.blocks, crc32.ChecksumIEEE(block))
-		}
-	}
-	return f
+	seq  int64
+	mode byte
+	size int
+	data []byte
 }
 
 func (f slotFrame) encode() string {
@@ -79,19 +66,7 @@ func (f slotFrame) encode() string {
 	binary.BigEndian.PutUint64(b[8:], uint64(f.seq))
 	b[16] = f.mode
 	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
-	binary.BigEndian.PutUint32(b[21:], f.crc)
-	if f.mode == slotStream {
-		for _, check := range f.blocks {
-			b = binary.BigEndian.AppendUint32(b, check)
-		}
-		if len(f.prefix) != 0 {
-			b[16] = slotStreamPrefix
-			b = binary.BigEndian.AppendUint32(b, crc32.ChecksumIEEE(f.prefix))
-			b = append(b, f.prefix...)
-		}
-	} else {
-		b = append(b, f.data...)
-	}
+	b = append(b, f.data...)
 	return base64.StdEncoding.EncodeToString(b)
 }
 
@@ -104,7 +79,6 @@ func decodeSlot(description string) (slotFrame, bool) {
 		seq:  int64(binary.BigEndian.Uint64(b[8:])),
 		mode: b[16],
 		size: int(binary.BigEndian.Uint32(b[17:])),
-		crc:  binary.BigEndian.Uint32(b[21:]),
 	}
 	if f.seq < 0 || f.size < 0 || f.size > maxSegmentBytes {
 		return slotFrame{}, false
@@ -112,119 +86,21 @@ func decodeSlot(description string) (slotFrame, bool) {
 	switch f.mode {
 	case slotInline:
 		f.data = b[slotHeaderLen:]
-		if f.size == 0 || f.size > slotInlineLimit || len(f.data) != f.size || crc32.ChecksumIEEE(f.data) != f.crc {
+		if f.size == 0 || f.size > slotInlineLimit || len(f.data) != f.size {
 			return slotFrame{}, false
 		}
-	case slotStream, slotStreamPrefix:
-		trailer := b[slotHeaderLen:]
-		if f.mode == slotStreamPrefix {
-			end := len(trailer) - slotStreamPrefixBytes - 4
-			if end < 0 || f.size > maxSegmentBytes-slotStreamPrefixBytes {
-				return slotFrame{}, false
-			}
-			f.prefix = trailer[end+4:]
-			if crc32.ChecksumIEEE(f.prefix) != binary.BigEndian.Uint32(trailer[end:]) {
-				return slotFrame{}, false
-			}
-			trailer, f.mode = trailer[:end], slotStream
-		}
-		var ok bool
-		f.blocks, ok = decodeStreamChecksums(f.size, f.crc, trailer)
-		if !ok {
+	case slotStream:
+		if f.size == 0 || len(b) != slotHeaderLen {
 			return slotFrame{}, false
 		}
 	case slotEnd, slotErr:
-		if f.size != 0 || f.crc != 0 || len(b) != slotHeaderLen {
+		if f.size != 0 || len(b) != slotHeaderLen {
 			return slotFrame{}, false
 		}
 	default:
 		return slotFrame{}, false
 	}
 	return f, true
-}
-
-// Validate the whole CRC table before allowing progressive delivery.
-func decodeStreamChecksums(size int, wholeCRC uint32, trailer []byte) ([]uint32, bool) {
-	if size <= 0 || size > maxSegmentBytes {
-		return nil, false
-	}
-	count := (size-1)/slotStreamBlockBytes + 1
-	if len(trailer) != 4*count {
-		return nil, false
-	}
-	checks := make([]uint32, count)
-	var combined uint32
-	for i := range checks {
-		checks[i] = binary.BigEndian.Uint32(trailer[4*i:])
-		combined = crc32Combine(combined, checks[i], streamBlockSize(size, i))
-	}
-	if combined != wholeCRC {
-		return nil, false
-	}
-	return checks, true
-}
-
-// streamBlockSize returns zero for a size or index outside a stream frame.
-func streamBlockSize(size, index int) int {
-	if size <= 0 || size > maxSegmentBytes || index < 0 || index >= (size-1)/slotStreamBlockBytes+1 {
-		return 0
-	}
-	return min(slotStreamBlockBytes, size-index*slotStreamBlockBytes)
-}
-
-// The caller has already validated the checksum table root.
-func validStreamBlock(frame slotFrame, index int, data []byte) bool {
-	size := streamBlockSize(frame.size, index)
-	if frame.mode != slotStream || size == 0 || len(data) != size ||
-		len(frame.blocks) != (frame.size-1)/slotStreamBlockBytes+1 {
-		return false
-	}
-	return crc32.ChecksumIEEE(data) == frame.blocks[index]
-}
-
-// Combine two finalized IEEE CRCs by advancing the first by secondLen bytes.
-func crc32Combine(first, second uint32, secondLen int) uint32 {
-	if secondLen <= 0 {
-		return first
-	}
-	for n := uint(secondLen); n != 0; n &= n - 1 {
-		first = crc32MatrixTimes(&crc32BytePowers[bits.TrailingZeros(n)], first)
-	}
-	return first ^ second
-}
-
-// Cache the operators for advancing by powers of two bytes.
-var crc32BytePowers = func() [bits.UintSize - 1][32]uint32 {
-	var powers [bits.UintSize - 1][32]uint32
-	var bit, two, four [32]uint32
-	bit[0] = crc32.IEEE
-	for i := 1; i < len(bit); i++ {
-		bit[i] = 1 << (i - 1)
-	}
-	crc32MatrixSquare(&two, &bit)
-	crc32MatrixSquare(&four, &two)
-	crc32MatrixSquare(&powers[0], &four)
-	for i := 1; i < len(powers); i++ {
-		crc32MatrixSquare(&powers[i], &powers[i-1])
-	}
-	return powers
-}()
-
-func crc32MatrixTimes(matrix *[32]uint32, vector uint32) uint32 {
-	var sum uint32
-	for i := 0; vector != 0; i++ {
-		if vector&1 != 0 {
-			sum ^= matrix[i]
-		}
-		vector >>= 1
-	}
-	return sum
-}
-
-func crc32MatrixSquare(square, matrix *[32]uint32) {
-	for i := range square {
-		square[i] = crc32MatrixTimes(matrix, matrix[i])
-	}
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
@@ -282,15 +158,14 @@ func lazyRing(session string, depth int, ids []string) ring {
 // Each object has one writer. Only its first publication in a lazy ring is a create.
 func (t slotTable) publish(ctx context.Context, store slotStore, seq int64, mode byte, data []byte) error {
 	idx := int(seq % int64(len(t.Slots)))
-	var prefix, body []byte
+	f := slotFrame{seq: seq, mode: mode, size: len(data)}
+	var body []byte
 	if mode == slotStream {
-		if len(data) >= 2*slotStreamBlockBytes {
-			prefix, data = data[:slotStreamPrefixBytes], data[slotStreamPrefixBytes:]
-		}
-		body = data
+		body = binary.BigEndian.AppendUint64(make([]byte, 0, slotBodyHeader+len(data)), uint64(seq))
+		body = append(body, data...)
+	} else if mode == slotInline {
+		f.data = data
 	}
-	f := newSlotFrame(seq, mode, data)
-	f.prefix = prefix
 	if t.lazy && seq < int64(len(t.Slots)) {
 		return store.createSlot(ctx, t.Slots[idx], t.name+"/s"+strconv.Itoa(idx), f.encode(), body)
 	}
@@ -321,6 +196,8 @@ type slotWriter struct {
 	wmMu                sync.Mutex
 	acked               int64
 	checked             time.Time
+	frame               int         // current media frame size, owned by run
+	strained            atomic.Bool // set by a worker that waited long for credit
 }
 
 func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params) *slotWriter {
@@ -330,6 +207,7 @@ func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slot
 		permits: make(chan struct{}, min(len(table.Slots), 32)),
 		stop:    make(chan struct{}), done: make(chan struct{}),
 		first: make(chan []byte, 1), acked: -1, progress: time.Now(),
+		frame: min(p.segmentBytes, slotMaxFrame),
 	}
 	go w.run()
 	return w
@@ -451,6 +329,9 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 		if ok {
 			break
 		}
+		if time.Since(since) > slotStrainWait {
+			w.strained.Store(true)
+		}
 		if time.Since(since) > slotStallTimeout && time.Since(w.closeProgress()) > slotStallTimeout {
 			return errors.New("timed out waiting for receiver watermark").Base(err)
 		}
@@ -510,16 +391,25 @@ func (w *slotWriter) run() {
 	timer := time.NewTimer(w.flushInterval)
 	timer.Stop()
 	defer timer.Stop()
+	base := w.frame
 	flush := func() bool {
 		timer.Stop()
-		unit := min(w.segmentBytes, slotInlineLimit)
+		frame, full := w.frame, len(buf) >= w.frame
+		// Each full round doubles the next frame until the reader clearly
+		// struggles (a long credit wait) or Drive throttles; then halve.
+		if w.strained.Swap(false) || isCooling(w.store) {
+			w.frame = max(base, w.frame/2)
+		} else if full {
+			w.frame = min(2*w.frame, slotMaxFrame)
+		}
+		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
-		if isCooling(w.store) || len(buf) > wave*unit && (wave < 24 || len(buf) > w.segmentBytes) {
+		if isCooling(w.store) || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
 			inline = 0
 		}
 		for len(buf) > 0 {
-			n := min(len(buf), w.segmentBytes)
+			n := min(len(buf), frame)
 			if inline > 0 {
 				n = min(inline, unit)
 				inline -= n
@@ -558,7 +448,7 @@ func (w *slotWriter) run() {
 			} else {
 				buf = append(buf, b...)
 			}
-			if len(buf) >= w.segmentBytes && !flush() {
+			if len(buf) >= w.frame && !flush() {
 				return
 			}
 		case <-timer.C:
@@ -821,10 +711,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 			return
 		}
 	}
-	j.data = make(chan []byte, len(f.blocks)+1)
-	if len(f.prefix) != 0 {
-		j.data <- f.prefix
-	}
+	j.data = make(chan []byte, (f.size+slotReadChunk-1)/slotReadChunk+12) // range and retry splits
 	close(j.ready)
 	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, func(b []byte) error {
 		select {

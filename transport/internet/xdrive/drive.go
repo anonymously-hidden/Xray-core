@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -572,7 +573,7 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 	for verify.Err() == nil {
 		d, readErr := s.readDescription(verify, id)
 		if readErr == nil && d == f.Description {
-			if payload == nil || d != "" { // metadata object or a checksummed slot frame
+			if payload == nil || d != "" { // metadata object or a slot frame (one atomic multipart write)
 				return nil
 			}
 			var media []byte // a media announcement has no identifying description
@@ -648,50 +649,71 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	return f.Description, nil
 }
 
-// A range owns [lo, hi) block indices. On retry next never moves back: even
-// a server that ignores Range cannot replay a block. After the last block a
-// retry still has to verify a nonempty suffix and its exact EOF.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error) error {
-	next := lo
+// readSpan reads body bytes [start, end) and emits them in chunks; a start
+// below slotBodyHeader includes the sequence header, which is checked. A media
+// body begins with its sequence number: a response for another lap is
+// rejected by that header or by the declared total length. One retry resumes
+// after the bytes already emitted, never replaying them, and still has to
+// prove the exact EOF.
+func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, start, end int, emit func([]byte) error) error {
+	total := slotBodyHeader + f.size
+	next := max(start, slotBodyHeader) // the sequence header is checked, never emitted
 	for attempt := 0; ; attempt++ {
-		first := min(next, hi-1)
-		start, end := first*slotStreamBlockBytes, min(hi*slotStreamBlockBytes, f.size)
+		from := next
+		if start < slotBodyHeader && next == slotBodyHeader {
+			from = 0 // nothing emitted yet: check the header again
+		}
+		if from == end { // everything emitted; only the EOF proof is missing
+			from = end - 1
+		}
 		var header string
-		if start > 0 || end < f.size {
-			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
+		if from > 0 || end < total {
+			header = fmt.Sprintf("bytes=%d-%d", from, end-1)
 		}
 		bodyFailed := false
 		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, false, func(resp *http.Response) error {
 			bodyFailed = true
-			from, to, length := first, hi, end-start
+			at, stop := from, end
 			switch resp.StatusCode {
 			case http.StatusOK:
-				from, to, length = 0, len(f.blocks), f.size
+				at, stop = 0, total
 			case http.StatusPartialContent:
-				if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, f.size) {
+				if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", from, end-1, total) {
 					return errors.New("Drive returned a different media range")
 				}
 			default:
 				return fmt.Errorf("unexpected Drive media status %d", resp.StatusCode)
 			}
-			if resp.ContentLength >= 0 && resp.ContentLength != int64(length) {
+			if resp.ContentLength >= 0 && resp.ContentLength != int64(stop-at) {
 				return errors.New("unexpected Drive media length")
 			}
-			for i := from; i < to; i++ {
-				b := make([]byte, streamBlockSize(f.size, i))
+			if at == 0 {
+				var h [slotBodyHeader]byte
+				if _, err := io.ReadFull(resp.Body, h[:]); err != nil {
+					return err
+				}
+				if int64(binary.BigEndian.Uint64(h[:])) != f.seq {
+					return errDriveRange // an older lap of this slot
+				}
+				at = slotBodyHeader
+			}
+			for at < stop {
+				n := min(slotReadChunk, stop-at)
+				if at < next {
+					n = min(n, next-at) // skip bytes already emitted
+				}
+				b := make([]byte, n)
 				if _, err := io.ReadFull(resp.Body, b); err != nil {
 					return err
 				}
-				if !validStreamBlock(f, i, b) {
-					return errors.New("Drive media block checksum mismatch")
-				}
-				if i == next && i < hi {
-					if err := emit(b); err != nil {
+				if at >= next && at < end {
+					if err := emit(b[:min(n, end-at)]); err != nil {
 						bodyFailed = false
 						return err
 					}
-					next++
+					next = min(at+n, end)
 				}
+				at += n
 			}
 			var extra [1]byte
 			if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
@@ -708,13 +730,16 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 	}
 }
 
+// Frames through slotProgressiveMax use one progressive GET. Larger frames
+// use four ranges; the later ones start only after the first range proved
+// the body is the announced lap.
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
-	n := len(f.blocks)
-	if n == 0 || f.mode != slotStream {
+	if f.size <= 0 || f.mode != slotStream {
 		return errors.New("invalid Drive stream frame")
 	}
-	if f.size+len(f.prefix) <= slotProgressiveMax || s.cooling() {
-		return s.readSpan(ctx, id, f, 0, n, emit)
+	total := slotBodyHeader + f.size
+	if f.size <= slotProgressiveMax || s.cooling() {
+		return s.readSpan(ctx, id, f, 0, total, emit)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -723,25 +748,46 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		wg.Wait()
 	}()
 	type part struct {
-		blocks chan []byte
-		err    error // published by close(blocks)
+		chunks chan []byte
+		err    error // published by close(chunks)
 	}
-	parts := make([]part, min(4, n))
+	const ranges = 4
+	parts := make([]part, ranges)
+	proven := make(chan struct{})
+	var proveOnce sync.Once
 	for i := range parts {
-		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
+		lo, hi := slotBodyHeader+i*f.size/ranges, slotBodyHeader+(i+1)*f.size/ranges
+		if i == 0 {
+			lo = 0 // include the sequence header
+		}
 		p := &parts[i]
-		p.blocks = make(chan []byte, hi-lo)
+		p.chunks = make(chan []byte, (hi-lo)/slotReadChunk+2)
 		wg.Go(func() {
-			defer close(p.blocks)
+			defer close(p.chunks)
+			if i != 0 {
+				select {
+				case <-proven:
+				case <-ctx.Done():
+					p.err = ctx.Err()
+					return
+				}
+			}
 			p.err = s.readSpan(ctx, id, f, lo, hi, func(b []byte) error {
-				p.blocks <- b // capacity is the range size, each block is emitted once
-				return nil
+				if i == 0 {
+					proveOnce.Do(func() { close(proven) })
+				}
+				select {
+				case p.chunks <- b:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			})
 		})
 	}
 	for i := range parts {
 		p := &parts[i]
-		for b := range p.blocks {
+		for b := range p.chunks {
 			if err := emit(b); err != nil {
 				return err
 			}

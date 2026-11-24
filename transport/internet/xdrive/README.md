@@ -13,14 +13,11 @@ on first publication. Established sessions do not list files to find data:
 sequence `n` maps directly to `slots[n % depth]`. If present, the announcement's
 first payload is sequence zero, not an additional record.
 
-The frame magic (`XDRVSL01`), sequence and length fields, JSON keys, and modes
-are unchanged. Mode 1 carries up to 14 KiB in metadata. Modes 5 and 6 carry a
-body with one CRC32 per 32 KiB block; mode 6 additionally carries an 11 KiB
-prefix in metadata. Modes 3 and 4 mean end and error. CRCs detect accidental
-corruption, not malicious modification; VLESS encryption remains required.
+Mode 1 carries up to 14 KiB in metadata, mode 5 a media body, modes 3 and 4
+mean end and error. See "Transport model" below.
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
-  After idle, a small write has a 2 ms gather window. The planner uses up to 24
+  Input is gathered for 25 ms; after idle, a small write has a 2 ms window. The planner uses up to 24
   available inline positions; larger bursts can use media. There are at most
   32 upload workers per direction and never more than the ring depth. Reuse
   requires both previous local completion and cumulative remote credit.
@@ -31,9 +28,9 @@ corruption, not malicious modification; VLESS encryption remains required.
   metadata GET after 125 ms. Media lookahead has two credits held through frame
   retirement; the ordered head cannot be blocked waiting for those credits.
   Workers can finish out of order; one coordinator alone delivers bytes.
-- **Media:** frames through 512 KiB use one progressive GET; larger frames can
-  use four block-aligned ranges. Validate the checksum table, each emitted
-  block, HTTP range/length and EOF. One retry can resume an incomplete span
+- **Media:** frames through 512 KiB use one progressive GET; larger frames
+  use four ranges. Validate the body's sequence header, HTTP range/length
+  and EOF. One retry can resume an incomplete span
   without delivering the same bytes twice. There is no speculative media GET.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
@@ -45,9 +42,39 @@ END. The one-minute watchdog tracks outbound progress until the local writer
 finishes, then also counts successful inbound watermark writes during Close.
 Receiving END alone does not close the outbound half.
 
+## Transport model (Drive)
+
+Each direction is a ring of `depth` Drive files plus one watermark file owned
+by the reader. Sequence `n` always lives in `slots[n % depth]`.
+
+1. **Gather.** The writer collects caller input for up to 25 ms (2 ms after
+   idle for a single small write) or until the current frame size is reached.
+2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
+   and doubles after each round that filled a whole frame, up to 4 MiB (below
+   Drive's 5 MB multipart limit). It halves (not below the start) when an
+   upload waited more than 250 ms for ring credit, meaning the reader is
+   clearly struggling, or when Drive throttles.
+3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH,
+   24 inline uploads per wave). Larger frames are one multipart PATCH: the
+   description holds `XDRVSL02`, sequence, mode and length; the body is an
+   8-byte sequence number followed by the data. At most 32 uploads run per
+   direction.
+4. **Discover.** The reader polls the head slot's description (25 ms while
+   active; one extra GET after 125 ms) and prefetches up to 12 slots.
+5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
+   four ranges, started after the first range proved the body's sequence.
+   Bytes are delivered in 32 KiB pieces as they arrive. One retry resumes
+   after the delivered bytes; the declared length and exact EOF are checked.
+6. **Credit.** The reader writes its cumulative watermark every `depth/6`
+   frames or 1.5 s. A slot is rewritten only after that credit.
+
+There are no CRCs: integrity relies on TLS, the length checks and the body's
+sequence header, and VLESS encryption authenticates the payload. Both peers
+must run this release (`XDRVSL02` is not readable by `XDRVSL01` peers).
+
 ## Implementation and trade-offs
 
-`slots.go` contains the frame and checksum codec, ring announcement and
+`slots.go` contains the frame codec, ring announcement and
 publication, outbound writer, and inbound reader, in that order. One reader
 ACK loop owns both periodic and final watermark writes. `drive.go` owns OAuth,
 Drive requests, quotas, object CRUD, ID allocation, and media verification.
@@ -81,7 +108,7 @@ connection with the first error as the cause. A normal END only closes its
 own direction. Readers reject an overwritten sequence; a writer verifies that
 a cumulative ACK cannot cover its own unpublished sequence before reusing a slot.
 Buffered GETs can retry an interrupted response body. Streamed media resumes
-by block, and an ambiguous mutation is not replayed. Listing and ID allocation
+by delivered offset, and an ambiguous mutation is not replayed. Listing and ID allocation
 use the app-data space when `remoteFolder` is `appDataFolder`. Drive announcement
 age is seeded from `createdTime` and the listing response’s `Date`, so an expired
 announcement does not become fresh when a listener restarts. This is not a
@@ -98,12 +125,13 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
-The first step was a literal merge of v6's four slot files: every declaration
-body was byte-identical before subsequent edits. The merge alone changed the
-count from 2,998 to 2,972. The HTTP retry and media-read implementation in
-`drive.go` remains byte-identical to v6.
+This version descends from the v7 candidate, which began as a literal merge
+of v6's four slot files. The per-block CRCs, the checksum table and the
+checksummed media reader are gone here, so the media reader is no longer
+byte-identical to v6; the HTTP retry path is.
 
-The following are **Python model checks, not runs of the Go package**:
+The following are **Python model checks against the v7 candidate, not runs of
+this Go package**:
 
 - At ring depth two, the v6 and candidate models each delivered 1,096,163
   bytes in each direction, with separate deterministic payloads. All received
@@ -118,21 +146,20 @@ The following are **Python model checks, not runs of the Go package**:
   not progress; none of the candidate's 45 reachable states was stuck. This
   is a bounded ordering check, not a goroutine race test.
 
-**Release gates still open:** this workspace lacked Go 1.27 and `gofmt`.
-Neither version was compiled or vetted, run against an HTTP mock in Go,
-run with `-race`, or tested against live Drive. The inventory below is the
-physical count in this archive, not a certified post-`gofmt` count. No XDrive
-test file is shipped.
+**Release gates:** the candidate workspace had no Go 1.27 or `gofmt`, so the
+model checks above did not build it. This snapshot was formatted with `gofmt`
+(and the repository's `vformat`/`vprotogen` checks), vetted and built with the
+`go.mod` toolchain; it has not been run against an HTTP mock in Go, with a
+`-race` workload, or against live Drive. The inventory below is the physical
+post-`gofmt` count. No XDrive test file is shipped.
 
-With the `go.mod` toolchain and dependencies, format the changed Go files,
-recount, then run `go build ./transport/internet/xdrive` and
-`go vet ./transport/internet/xdrive`. In a disposable checkout, run the
-same depth-two transfers against v6 and the candidate with a fault-injecting
-Drive HTTP mock under `go test -race`: compare both byte streams, truncate
-media responses, return 429/403/503, and close both peers with unequal
-outstanding writes. Also check one-sided Close, final ACK failure and
-Interrupt. A plain `go test -race` without a workload is not a concurrency
-test. Repeat the bidirectional transfer with a dedicated live Drive folder.
+For deeper assurance, in a disposable checkout, run the same depth-two
+transfers against v6 and the candidate with a fault-injecting Drive HTTP mock
+under `go test -race`: compare both byte streams, truncate media responses,
+return 429/403/503, and close both peers with unequal outstanding writes.
+Also check one-sided Close, final ACK failure and Interrupt. A plain
+`go test -race` without a workload is not a concurrency test. Repeat the
+bidirectional transfer with a dedicated live Drive folder.
 
 ## Drive source budget (physical lines, including comments and blanks)
 
@@ -145,8 +172,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 972 |
-| `slots.go` | whole file | 947 |
+| `drive.go` | whole file | 1024 |
+| `slots.go` | whole file | 834 |
 | `client.go` | whole file | 500 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -155,4 +182,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2944** |
+| **Total** | | **2883** |

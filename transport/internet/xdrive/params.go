@@ -78,7 +78,7 @@ func paramsForStorage(c *Config, storage Storage) params {
 			p.concurrency = 64
 		}
 		if c.FlushIntervalMs == 0 {
-			p.flushInterval = 10 * time.Millisecond
+			p.flushInterval = 25 * time.Millisecond
 		}
 		if c.MaxPollIntervalMs == 0 {
 			p.maxPollInterval = max(200*time.Millisecond, p.minPollInterval)
