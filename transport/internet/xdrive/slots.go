@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	slotMagic        = "XDRVSL02"
+	slotMagic        = "XDRVSL03"
 	slotHeaderLen    = len(slotMagic) + 13
 	slotInlineLimit  = 14 << 10
 	slotInline       = 1
@@ -28,9 +28,11 @@ const (
 	maxSlotIDLen     = 128
 	slotStallTimeout = time.Minute
 
-	// A media body starts with its sequence number, so a reader can tell an
-	// older lap from the frame it was announced, without a checksum.
+	// A media body is a run of blocks: an 8-byte sequence number, then up to
+	// slotTagBlock data bytes. Any range of whole blocks can tell an older lap
+	// from the announced frame by itself, without a checksum.
 	slotBodyHeader = 8
+	slotTagBlock   = 256 << 10
 	// slotReadChunk is the unit a media body is delivered in while it downloads.
 	slotReadChunk = 32 << 10
 	// slotMaxFrame stays below Drive's 5 MB multipart upload limit.
@@ -44,10 +46,14 @@ const (
 	// slotReadAhead is the reader's prefetch window.
 	slotReadAhead = 12
 	// With this many uploads in flight the writer is streaming: it gathers up
-	// to slotBusyGather or a full frame and sends media, not inline waves.
+	// to slotBusyGather, a full frame or an input pause, and sends media, not
+	// inline waves.
 	slotBusyUploads = 4
 	slotBusyGather  = 200 * time.Millisecond
 )
+
+// slotBlocks is the number of tagged blocks in a media body of size bytes.
+func slotBlocks(size int) int { return (size + slotTagBlock - 1) / slotTagBlock }
 
 // byteBudget bounds bytes in flight. A taker may exceed the limit when nothing
 // else is in flight, so any single frame can always proceed.
@@ -210,8 +216,11 @@ func (t slotTable) publish(ctx context.Context, store slotStore, seq int64, mode
 	f := slotFrame{seq: seq, mode: mode, size: len(data)}
 	var body []byte
 	if mode == slotStream {
-		body = binary.BigEndian.AppendUint64(make([]byte, 0, slotBodyHeader+len(data)), uint64(seq))
-		body = append(body, data...)
+		body = make([]byte, 0, len(data)+slotBodyHeader*slotBlocks(len(data)))
+		for block := range slices.Chunk(data, slotTagBlock) {
+			body = binary.BigEndian.AppendUint64(body, uint64(seq))
+			body = append(body, block...)
+		}
 	} else if mode == slotInline {
 		f.data = data
 	}
@@ -448,7 +457,7 @@ func (w *slotWriter) run() {
 		return true
 	}
 	var buf []byte
-	var bufAt time.Time // arrival of the oldest buffered byte
+	var bufAt, lastIn time.Time // arrival of the oldest and the newest buffered byte
 	timer := time.NewTimer(w.flushInterval)
 	timer.Stop()
 	defer timer.Stop()
@@ -506,6 +515,7 @@ func (w *slotWriter) run() {
 			}
 			return
 		case b := <-w.input:
+			lastIn = time.Now()
 			if len(buf) == 0 {
 				buf, bufAt = b, time.Now()
 				d := w.flushInterval
@@ -520,8 +530,11 @@ func (w *slotWriter) run() {
 				return
 			}
 		case <-timer.C:
-			if wait := slotBusyGather - time.Since(bufAt); len(w.permits) >= slotBusyUploads && wait > 0 {
-				timer.Reset(wait) // streaming: wait for a full frame
+			// Streaming: keep gathering toward a full frame while input keeps
+			// coming, but send a burst once input pauses for flushInterval.
+			quiet := w.flushInterval - time.Since(lastIn)
+			if wait := slotBusyGather - time.Since(bufAt); len(w.permits) >= slotBusyUploads && wait > 0 && quiet > 0 {
+				timer.Reset(min(wait, quiet))
 				continue
 			}
 			if !flush() {
@@ -783,7 +796,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 			return
 		}
 	}
-	j.data = make(chan []byte, (f.size+slotReadChunk-1)/slotReadChunk+12) // range and retry splits
+	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
 	close(j.ready)
 	got := time.Now()
 	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, func(b []byte) error {

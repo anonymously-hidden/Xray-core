@@ -30,8 +30,8 @@ mean end and error. See "Transport model" below.
   waiting for those credits.
   Workers can finish out of order; one coordinator alone delivers bytes.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
-  use four ranges. Validate the body's sequence header, HTTP range/length
-  and EOF. One retry can resume an incomplete span
+  use up to four block ranges at once. Validate every block's sequence tag,
+  HTTP range/length and EOF. One retry can resume an incomplete span
   without delivering the same bytes twice. There is no speculative media GET.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
@@ -51,7 +51,8 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 1. **Gather.** The writer collects caller input for up to 25 ms (2 ms after
    idle for a single small write) or until the current frame size is reached.
    With 4 or more uploads in flight the writer is streaming: it keeps
-   gathering for up to 200 ms or a full frame.
+   gathering while input keeps arriving, up to 200 ms or a full frame, and
+   sends once input pauses for 25 ms, so a reply burst goes out as one frame.
 2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
    and doubles after each round that filled a whole frame, up to 4 MiB (below
    Drive's 5 MB multipart limit). It halves (not below the start) when an
@@ -63,9 +64,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    an idle writer may split a burst into up to 24 inline frames, a streaming
    writer never does, because the reader finds only about 12 frames per round
    trip and 14 KiB frames would cap throughput near 0.5 MB/s). Larger frames
-   are one multipart PATCH: the description holds `XDRVSL02`, sequence, mode
-   and length; the body is an
-   8-byte sequence number followed by the data. At most 32 uploads and
+   are one multipart PATCH: the description holds `XDRVSL03`, sequence, mode
+   and length; the body is blocks of an 8-byte sequence tag followed by up to
+   256 KiB of data. At most 32 uploads and
    4 MiB of unfinished uploads per media connection run per direction (one
    frame may exceed it alone). Media requests are spread per request over
    the media connections (XMUX `maxConnections`, default 4): one Google
@@ -78,7 +79,10 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    ahead of the head download only within that budget; the head never
    waits for it.
 5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
-   four ranges, started after the first range proved the body's sequence.
+   up to four block-aligned ranges, all started at once: every block carries
+   the sequence tag, so each range rejects an older lap by itself (before,
+   later ranges waited for the first one, costing a second time-to-first-byte,
+   ~1 s, per large frame).
    Bytes are delivered in 32 KiB pieces as they arrive. One retry resumes
    after the delivered bytes; the declared length and exact EOF are checked.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
@@ -87,9 +91,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    each media frame: `xdrive upload seq` (credit wait, PUT time) and
    `xdrive read seq` (time to find, lookahead budget wait, body time).
 
-There are no CRCs: integrity relies on TLS, the length checks and the body's
-sequence header, and VLESS encryption authenticates the payload. Both peers
-must run this release (`XDRVSL02` is not readable by `XDRVSL01` peers).
+There are no CRCs: integrity relies on TLS, the length checks and the
+per-block sequence tags, and VLESS encryption authenticates the payload. Both
+peers must run this release (`XDRVSL03` is not readable by older peers).
 
 ## Implementation and trade-offs
 
@@ -193,8 +197,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1024 |
-| `slots.go` | whole file | 908 |
+| `drive.go` | whole file | 997 |
+| `slots.go` | whole file | 921 |
 | `client.go` | whole file | 519 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -203,4 +207,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2978** |
+| **Total** | | **2964** |
