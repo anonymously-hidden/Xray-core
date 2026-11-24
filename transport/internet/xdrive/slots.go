@@ -46,6 +46,10 @@ const (
 	// them share one connection, so this bounds how long the oldest frame,
 	// which every stream waits for, shares bandwidth with newer ones.
 	slotFlightBytes = 2 * slotMaxFrame
+	// With this many uploads in flight the writer is streaming: it gathers up
+	// to slotBusyGather or a full frame and sends media, not inline waves.
+	slotBusyUploads = 4
+	slotBusyGather  = 200 * time.Millisecond
 )
 
 // byteBudget bounds bytes in flight. A taker may exceed the limit when nothing
@@ -442,6 +446,7 @@ func (w *slotWriter) run() {
 		return true
 	}
 	var buf []byte
+	var bufAt time.Time // arrival of the oldest buffered byte
 	timer := time.NewTimer(w.flushInterval)
 	timer.Stop()
 	defer timer.Stop()
@@ -451,18 +456,22 @@ func (w *slotWriter) run() {
 		frame, full := w.frame, len(buf) >= w.frame
 		// Each full round doubles the next frame until the reader clearly
 		// struggles (a long credit wait) or Drive throttles; then halve.
-		if w.strained.Swap(false) || isCooling(w.store) {
+		strained, cooling := w.strained.Swap(false), isCooling(w.store)
+		if strained || cooling {
 			w.frame = max(base, w.frame/2)
 		} else if full {
 			w.frame = min(2*w.frame, slotMaxFrame)
 		}
 		if w.frame != frame {
-			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame)
+			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
+		// Inline waves cut latency for an idle writer. A streaming writer must
+		// not spend 64 ring positions on 14 KiB frames: the reader discovers
+		// about 12 frames per round trip, so frame count caps throughput.
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
-		if isCooling(w.store) || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
+		if cooling || len(w.permits) >= slotBusyUploads || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
 			inline = 0
 		}
 		for len(buf) > 0 {
@@ -496,7 +505,7 @@ func (w *slotWriter) run() {
 			return
 		case b := <-w.input:
 			if len(buf) == 0 {
-				buf = b
+				buf, bufAt = b, time.Now()
 				d := w.flushInterval
 				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !isCooling(w.store) {
 					d = min(d, 2*time.Millisecond)
@@ -509,6 +518,10 @@ func (w *slotWriter) run() {
 				return
 			}
 		case <-timer.C:
+			if wait := slotBusyGather - time.Since(bufAt); len(w.permits) >= slotBusyUploads && wait > 0 {
+				timer.Reset(wait) // streaming: wait for a full frame
+				continue
+			}
 			if !flush() {
 				return
 			}

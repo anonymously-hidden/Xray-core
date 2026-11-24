@@ -49,14 +49,19 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 
 1. **Gather.** The writer collects caller input for up to 25 ms (2 ms after
    idle for a single small write) or until the current frame size is reached.
+   With 4 or more uploads in flight the writer is streaming: it keeps
+   gathering for up to 200 ms or a full frame.
 2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
    and doubles after each round that filled a whole frame, up to 4 MiB (below
    Drive's 5 MB multipart limit). It halves (not below the start) when an
    upload waited more than 250 ms for ring credit, meaning the reader is
    clearly struggling, or when Drive throttles.
-3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH,
-   24 inline uploads per wave). Larger frames are one multipart PATCH: the
-   description holds `XDRVSL02`, sequence, mode and length; the body is an
+3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH;
+   an idle writer may split a burst into up to 24 inline frames, a streaming
+   writer never does, because the reader finds only about 12 frames per round
+   trip and 14 KiB frames would cap throughput near 0.5 MB/s). Larger frames
+   are one multipart PATCH: the description holds `XDRVSL02`, sequence, mode
+   and length; the body is an
    8-byte sequence number followed by the data. At most 32 uploads and
    8 MiB of unfinished uploads run per direction (one frame may exceed it
    alone). All media of a session shares one connection, so without the byte
@@ -179,7 +184,7 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
 | `drive.go` | whole file | 1024 |
-| `slots.go` | whole file | 889 |
+| `slots.go` | whole file | 902 |
 | `client.go` | whole file | 500 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -188,4 +193,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2938** |
+| **Total** | | **2951** |
