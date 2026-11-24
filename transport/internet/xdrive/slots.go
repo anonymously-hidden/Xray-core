@@ -39,6 +39,10 @@ const (
 	slotStrainWait = 250 * time.Millisecond
 	// slotProgressiveMax bounds a frame read by one GET instead of four ranges.
 	slotProgressiveMax = defaultSegmentBytes
+	// slotReadAhead is the reader's prefetch window. Every prefetched slot may
+	// also download its media body, so throughput is not capped at about three
+	// frames per round trip.
+	slotReadAhead = 12
 )
 
 var errWriteStopped = errors.New("write stopped")
@@ -487,7 +491,7 @@ func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
 }
 
 // Inbound: workers discover known IDs concurrently. Only run delivers bytes and moves
-// head. Lookahead media retains at most two whole frames, plus the ordered head.
+// head. Lookahead media retains at most slotReadAhead-1 whole frames, plus the ordered head.
 type slotReader struct {
 	ctx     context.Context
 	setErr  context.CancelCauseFunc
@@ -515,7 +519,7 @@ func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slot
 	r := &slotReader{
 		ctx: ctx, setErr: fail, discard: discard, store: store, table: table, params: p,
 		ch: make(chan []byte, 2), wake: make(chan struct{}, 1),
-		ack: make(chan struct{}, 1), media: make(chan struct{}, 2),
+		ack: make(chan struct{}, 1), media: make(chan struct{}, slotReadAhead-1),
 	}
 	r.frontier.Store(-1)
 	r.Wake()
@@ -739,7 +743,7 @@ func (r *slotReader) run() {
 	next := r.head.Load()
 	for ctx.Err() == nil {
 		head := r.head.Load()
-		window := min(12, len(r.table.Slots))
+		window := min(slotReadAhead, len(r.table.Slots))
 		if head == 0 {
 			window = 1
 		}

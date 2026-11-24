@@ -25,8 +25,9 @@ mean end and error. See "Transport model" below.
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
   12 known descriptions are prefetched. An active head may start one extra
-  metadata GET after 125 ms. Media lookahead has two credits held through frame
-  retirement; the ordered head cannot be blocked waiting for those credits.
+  metadata GET after 125 ms. Media lookahead has 11 credits (the whole
+  prefetch window) held through frame retirement; the ordered head cannot be
+  blocked waiting for those credits.
   Workers can finish out of order; one coordinator alone delivers bytes.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
   use four ranges. Validate the body's sequence header, HTTP range/length
@@ -173,7 +174,7 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
 | `drive.go` | whole file | 1024 |
-| `slots.go` | whole file | 834 |
+| `slots.go` | whole file | 838 |
 | `client.go` | whole file | 500 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -182,4 +183,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2883** |
+| **Total** | | **2887** |
