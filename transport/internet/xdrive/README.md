@@ -25,8 +25,9 @@ mean end and error. See "Transport model" below.
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
   12 known descriptions are prefetched. An active head may start one extra
-  metadata GET after 125 ms. Media lookahead is bounded to 8 MiB of bodies, held
-  through frame retirement; the ordered head cannot be blocked waiting for those credits.
+  metadata GET after 125 ms. Media lookahead is bounded to 4 MiB per media
+  connection, held through frame retirement; the ordered head cannot be blocked
+  waiting for those credits.
   Workers can finish out of order; one coordinator alone delivers bytes.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
   use four ranges. Validate the body's sequence header, HTTP range/length
@@ -65,13 +66,16 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    are one multipart PATCH: the description holds `XDRVSL02`, sequence, mode
    and length; the body is an
    8-byte sequence number followed by the data. At most 32 uploads and
-   8 MiB of unfinished uploads run per direction (one frame may exceed it
-   alone). All media of a session shares one connection, so without the byte
-   bound 32 frames of 4 MiB would make the oldest frame, which every stream
-   waits for, take its turn behind ~128 MiB.
+   4 MiB of unfinished uploads per media connection run per direction (one
+   frame may exceed it alone). Media requests are spread per request over
+   the media connections (XMUX `maxConnections`, default 4): one Google
+   connection carries only a fraction of a link (a measured single-connection
+   client download averaged ~0.22 MB/s). The byte bound,
+   about one 4 MiB frame per connection, keeps the oldest frame, which
+   every stream waits for, from queuing behind many newer ones.
 4. **Discover.** The reader polls the head slot's description (25 ms while
    active; one extra GET after 125 ms) and prefetches up to 12 slots. Bodies
-   ahead of the head download only within an 8 MiB budget; the head never
+   ahead of the head download only within that budget; the head never
    waits for it.
 5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
    four ranges, started after the first range proved the body's sequence.
@@ -96,7 +100,9 @@ Drive requests, quotas, object CRUD, ID allocation, and media verification.
 `client.go` is shared with the URL-template and S3 transports. It retains the
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
-pools. A lease is selected once instead of sampling and rejecting candidates.
+pools. Metadata and priority select a lease once per session; media selects
+one per request from XMUX `maxConnections` connections (default 4); the
+media byte budget follows the same count.
 Peer-supplied IDs are checked for valid syntax and uniqueness. An existing
 object must match its announced session name and configured parent on first
 use. Keep the folder private to the two peers; these checks do not authenticate
@@ -188,13 +194,13 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
 | `drive.go` | whole file | 1024 |
-| `slots.go` | whole file | 913 |
-| `client.go` | whole file | 500 |
+| `slots.go` | whole file | 908 |
+| `client.go` | whole file | 519 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
-| `params.go` | 74–88 | 15 |
+| `params.go` | 75–91 | 17 |
 | `storage.go` | 9, 20–24, 36–63, 65–75 | 45 |
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2962** |
+| **Total** | | **2978** |

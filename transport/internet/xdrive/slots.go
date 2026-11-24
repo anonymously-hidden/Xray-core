@@ -43,11 +43,6 @@ const (
 	slotProgressiveMax = defaultSegmentBytes
 	// slotReadAhead is the reader's prefetch window.
 	slotReadAhead = 12
-	// slotFlightBytes bounds the media bytes in flight per direction: uploads
-	// not yet finished, and bodies downloaded ahead of the ordered head. All of
-	// them share one connection, so this bounds how long the oldest frame,
-	// which every stream waits for, shares bandwidth with newer ones.
-	slotFlightBytes = 2 * slotMaxFrame
 	// With this many uploads in flight the writer is streaming: it gathers up
 	// to slotBusyGather or a full frame and sends media, not inline waves.
 	slotBusyUploads = 4
@@ -262,7 +257,7 @@ func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slot
 		permits: make(chan struct{}, min(len(table.Slots), 32)),
 		stop:    make(chan struct{}), done: make(chan struct{}),
 		first: make(chan []byte, 1), acked: -1, progress: time.Now(),
-		frame: min(p.segmentBytes, slotMaxFrame), flight: newByteBudget(slotFlightBytes),
+		frame: min(p.segmentBytes, slotMaxFrame), flight: newByteBudget(p.flightBytes),
 	}
 	go w.run()
 	return w
@@ -564,7 +559,7 @@ func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
 }
 
 // Inbound: workers discover known IDs concurrently. Only run delivers bytes and moves
-// head. Lookahead media retains at most slotFlightBytes, plus the ordered head.
+// head. Lookahead media retains at most flightBytes, plus the ordered head.
 type slotReader struct {
 	ctx     context.Context
 	setErr  context.CancelCauseFunc
@@ -593,7 +588,7 @@ func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slot
 	r := &slotReader{
 		ctx: ctx, setErr: fail, discard: discard, store: store, table: table, params: p,
 		ch: make(chan []byte, 2), wake: make(chan struct{}, 1),
-		ack: make(chan struct{}, 1), media: newByteBudget(slotFlightBytes),
+		ack: make(chan struct{}, 1), media: newByteBudget(p.flightBytes),
 	}
 	r.frontier.Store(-1)
 	r.Wake()

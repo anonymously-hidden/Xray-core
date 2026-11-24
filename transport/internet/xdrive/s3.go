@@ -147,7 +147,7 @@ func newS3Storage(streamSettings *internet.MemoryStreamConfig, c *Config) (*s3St
 	}
 	s := &s3Storage{
 		s3Shared: &s3Shared{
-			conns:     newConnPool(c.Xmux, newClient),
+			conns:     newConnPool(c.Xmux, 0, newClient),
 			base:      *base,
 			prefix:    strings.TrimSuffix(c.RemoteFolder, "/") + "/",
 			region:    s3Region(c.S3.Region),

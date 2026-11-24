@@ -25,6 +25,7 @@ type params struct {
 	holeTimeout     time.Duration
 	sessionTTL      time.Duration
 	concurrency     int
+	flightBytes     int // Drive media bytes in flight per direction
 }
 
 func millis(value uint32, fallback time.Duration) time.Duration {
@@ -77,6 +78,8 @@ func paramsForStorage(c *Config, storage Storage) params {
 		if c.Concurrency == 0 {
 			p.concurrency = 64
 		}
+		// About one large frame per media connection keeps each one busy.
+		p.flightBytes = int(driveMediaConns(c.Xmux)) * slotMaxFrame
 		if c.FlushIntervalMs == 0 {
 			p.flushInterval = 25 * time.Millisecond
 		}

@@ -414,14 +414,29 @@ func (c *poolConn) Close() error {
 	return nil
 }
 
-func newConnPool(config *splithttp.XmuxConfig, newClient func(context.Context) *http.Client) *connPool {
+// driveMediaConns is the number of Drive media connections: XMUX
+// maxConnections when set, else 4. One Google connection carries only a
+// fraction of a link, so media requests are spread over these.
+func driveMediaConns(x *splithttp.XmuxConfig) int32 {
+	if x != nil && x.MaxConnections != nil && x.MaxConnections.To > 0 {
+		return x.MaxConnections.To
+	}
+	return 4
+}
+
+// conns, when positive, is the connection count used if XMUX sets none.
+func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(context.Context) *http.Client) *connPool {
 	if config == nil {
 		config = &splithttp.XmuxConfig{}
+	}
+	maxConns := config.MaxConnections
+	if maxConns == nil && conns > 0 {
+		maxConns = &splithttp.RangeConfig{From: conns, To: conns}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &connPool{ctx: ctx, cancel: cancel}
 	p.mux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
-		MaxConnections: config.MaxConnections, MaxConcurrency: config.MaxConcurrency,
+		MaxConnections: maxConns, MaxConcurrency: config.MaxConcurrency,
 		CMaxReuseTimes: config.CMaxReuseTimes, HMaxRequestTimes: config.HMaxRequestTimes,
 		HMaxReusableSecs: config.HMaxReusableSecs, HKeepAlivePeriod: config.HKeepAlivePeriod,
 	}, func() splithttp.XmuxConn {
@@ -443,6 +458,8 @@ type sessionTransport struct {
 	pool   *connPool
 	client *splithttp.XmuxClient // guarded by pool.mu
 	closed bool
+	// spread selects a pool connection per request instead of pinning one.
+	spread bool
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -459,7 +476,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, errSessionClosed
 	}
 	c := t.client
-	if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
+	if t.spread {
+		c = p.mux.GetXmuxClient(r.Context())
+	} else if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
 		if c != nil {
 			c.DoneRunning()
 		}

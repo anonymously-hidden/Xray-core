@@ -145,7 +145,7 @@ func newTemplateStorage(streamSettings *internet.MemoryStreamConfig, config *Con
 	client := newServiceClient(context.Background(), h1Hosts, streamSettings, driveTimeout, conc)
 	return &templateStorage{
 		templateShared: &templateShared{
-			conns: newConnPool(config.Xmux, func(connCtx context.Context) *http.Client {
+			conns: newConnPool(config.Xmux, 0, func(connCtx context.Context) *http.Client {
 				return newServiceClient(connCtx, h1Hosts, streamSettings, driveTimeout, conc)
 			}),
 			tmpl:        tmpl,

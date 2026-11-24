@@ -97,7 +97,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 		s.space = s.folder
 	}
 	for i, limit := range [laneCount]int{48, 8, 24} {
-		s.pools[i] = newConnPool(config.Xmux, client)
+		s.pools[i] = newConnPool(config.Xmux, [laneCount]int32{0, 0, driveMediaConns(config.Xmux)}[i], client)
 		s.permits[i] = make(chan struct{}, limit)
 	}
 	s.tokenClient.CheckRedirect = driveRedirect
@@ -115,7 +115,7 @@ func driveRedirect(req *http.Request, via []*http.Request) error {
 
 func (s *driveStorage) openClients() {
 	for i, pool := range s.pools {
-		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool}, CheckRedirect: driveRedirect}
+		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool, spread: driveLane(i) == mediaLane}, CheckRedirect: driveRedirect}
 	}
 }
 
