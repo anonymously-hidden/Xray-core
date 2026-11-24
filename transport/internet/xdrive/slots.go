@@ -35,8 +35,10 @@ const (
 	slotReadChunk = 32 << 10
 	// slotMaxFrame stays below Drive's 5 MB multipart upload limit.
 	slotMaxFrame = 4 << 20
-	// A credit wait this long means the reader is clearly struggling.
-	slotStrainWait = 250 * time.Millisecond
+	// A credit wait this long means the reader is clearly struggling. Routine
+	// credit takes 1-3 s (ACK every depth/6 frames or 1.5 s, then a watermark
+	// PATCH and GET), so a shorter wait only means the ring is a lap ahead.
+	slotStrainWait = 5 * time.Second
 	// slotProgressiveMax bounds a frame read by one GET instead of four ranges.
 	slotProgressiveMax = defaultSegmentBytes
 	// slotReadAhead is the reader's prefetch window.
@@ -374,7 +376,8 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 			return w.stopped()
 		}
 	}
-	for since := time.Now(); ; {
+	since := time.Now()
+	for {
 		ok, err := w.credit(seq)
 		if isAuthError(err) || err == errNotFound || err == errDriveScope || err == errDriveWatermark {
 			return err
@@ -395,6 +398,7 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 	if err := w.ctx.Err(); err != nil {
 		return err
 	}
+	credited := time.Now()
 	if err := w.table.publish(w.ctx, w.store, seq, mode, chunk); err != nil {
 		// A lost reply is not a refusal: never overwrite possibly committed data.
 		if _, refused := err.(refusedPayload); refused && w.ctx.Err() == nil {
@@ -403,6 +407,9 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 			cancel()
 		}
 		return err
+	}
+	if mode == slotStream {
+		errors.LogDebug(w.ctx, "xdrive upload seq ", seq, " bytes ", len(chunk), " credit ", credited.Sub(since), " put ", time.Since(credited))
 	}
 	w.markProgress()
 	return nil
@@ -752,6 +759,7 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 }
 
 func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
+	start := time.Now()
 	f, err := r.lookup(ctx, j)
 	if err != nil || f.mode == slotErr || f.mode == slotEnd {
 		j.err, j.end = err, f.mode == slotEnd
@@ -770,6 +778,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	}
 	// A promoted head must never queue behind a prefetched successor. A tail
 	// holds its credit until retirement, even after a short or failed body.
+	found := time.Now()
 	reserved := false
 	if j.seq != r.head.Load() {
 		reserved = r.media.take(f.size, j.head, ctx.Done())
@@ -781,6 +790,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	}
 	j.data = make(chan []byte, (f.size+slotReadChunk-1)/slotReadChunk+12) // range and retry splits
 	close(j.ready)
+	got := time.Now()
 	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, func(b []byte) error {
 		select {
 		case j.data <- b:
@@ -790,6 +800,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		}
 	})
 	close(j.data)
+	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", f.size, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
 	if reserved {
 		select {
 		case <-j.retired:
