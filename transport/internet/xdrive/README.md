@@ -25,9 +25,8 @@ mean end and error. See "Transport model" below.
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
   12 known descriptions are prefetched. An active head may start one extra
-  metadata GET after 125 ms. Media lookahead has 11 credits (the whole
-  prefetch window) held through frame retirement; the ordered head cannot be
-  blocked waiting for those credits.
+  metadata GET after 125 ms. Media lookahead is bounded to 8 MiB of bodies, held
+  through frame retirement; the ordered head cannot be blocked waiting for those credits.
   Workers can finish out of order; one coordinator alone delivers bytes.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
   use four ranges. Validate the body's sequence header, HTTP range/length
@@ -58,16 +57,22 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH,
    24 inline uploads per wave). Larger frames are one multipart PATCH: the
    description holds `XDRVSL02`, sequence, mode and length; the body is an
-   8-byte sequence number followed by the data. At most 32 uploads run per
-   direction.
+   8-byte sequence number followed by the data. At most 32 uploads and
+   8 MiB of unfinished uploads run per direction (one frame may exceed it
+   alone). All media of a session shares one connection, so without the byte
+   bound 32 frames of 4 MiB would make the oldest frame, which every stream
+   waits for, take its turn behind ~128 MiB.
 4. **Discover.** The reader polls the head slot's description (25 ms while
-   active; one extra GET after 125 ms) and prefetches up to 12 slots.
+   active; one extra GET after 125 ms) and prefetches up to 12 slots. Bodies
+   ahead of the head download only within an 8 MiB budget; the head never
+   waits for it.
 5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
    four ranges, started after the first range proved the body's sequence.
    Bytes are delivered in 32 KiB pieces as they arrive. One retry resumes
    after the delivered bytes; the declared length and exact EOF are checked.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
-   frames or 1.5 s. A slot is rewritten only after that credit.
+   frames or 1.5 s. A slot is rewritten only after that credit. Frame size
+   changes are logged at debug level (`xdrive frame size A -> B`).
 
 There are no CRCs: integrity relies on TLS, the length checks and the body's
 sequence header, and VLESS encryption authenticates the payload. Both peers
@@ -174,7 +179,7 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
 | `drive.go` | whole file | 1024 |
-| `slots.go` | whole file | 838 |
+| `slots.go` | whole file | 889 |
 | `client.go` | whole file | 500 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -183,4 +188,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2887** |
+| **Total** | | **2938** |

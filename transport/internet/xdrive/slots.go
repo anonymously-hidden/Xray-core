@@ -39,11 +39,55 @@ const (
 	slotStrainWait = 250 * time.Millisecond
 	// slotProgressiveMax bounds a frame read by one GET instead of four ranges.
 	slotProgressiveMax = defaultSegmentBytes
-	// slotReadAhead is the reader's prefetch window. Every prefetched slot may
-	// also download its media body, so throughput is not capped at about three
-	// frames per round trip.
+	// slotReadAhead is the reader's prefetch window.
 	slotReadAhead = 12
+	// slotFlightBytes bounds the media bytes in flight per direction: uploads
+	// not yet finished, and bodies downloaded ahead of the ordered head. All of
+	// them share one connection, so this bounds how long the oldest frame,
+	// which every stream waits for, shares bandwidth with newer ones.
+	slotFlightBytes = 2 * slotMaxFrame
 )
+
+// byteBudget bounds bytes in flight. A taker may exceed the limit when nothing
+// else is in flight, so any single frame can always proceed.
+type byteBudget struct {
+	mu          sync.Mutex
+	used, limit int
+	free        chan struct{} // closed and replaced by every give
+}
+
+func newByteBudget(limit int) *byteBudget {
+	return &byteBudget{limit: limit, free: make(chan struct{})}
+}
+
+// take waits until n bytes fit. It returns false if skip or done closes first.
+func (b *byteBudget) take(n int, skip, done <-chan struct{}) bool {
+	for {
+		b.mu.Lock()
+		if b.used == 0 || b.used+n <= b.limit {
+			b.used += n
+			b.mu.Unlock()
+			return true
+		}
+		free := b.free
+		b.mu.Unlock()
+		select {
+		case <-free:
+		case <-skip:
+			return false
+		case <-done:
+			return false
+		}
+	}
+}
+
+func (b *byteBudget) give(n int) {
+	b.mu.Lock()
+	b.used -= n
+	close(b.free)
+	b.free = make(chan struct{})
+	b.mu.Unlock()
+}
 
 var errWriteStopped = errors.New("write stopped")
 
@@ -202,6 +246,7 @@ type slotWriter struct {
 	checked             time.Time
 	frame               int         // current media frame size, owned by run
 	strained            atomic.Bool // set by a worker that waited long for credit
+	flight              *byteBudget // bytes of unfinished uploads
 }
 
 func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params) *slotWriter {
@@ -211,7 +256,7 @@ func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slot
 		permits: make(chan struct{}, min(len(table.Slots), 32)),
 		stop:    make(chan struct{}), done: make(chan struct{}),
 		first: make(chan []byte, 1), acked: -1, progress: time.Now(),
-		frame: min(p.segmentBytes, slotMaxFrame),
+		frame: min(p.segmentBytes, slotMaxFrame), flight: newByteBudget(slotFlightBytes),
 	}
 	go w.run()
 	return w
@@ -370,6 +415,10 @@ func (w *slotWriter) run() {
 		case <-w.ctx.Done():
 			return false
 		}
+		if !w.flight.take(len(chunk), nil, w.ctx.Done()) {
+			<-w.permits
+			return false
+		}
 		n := seq
 		seq++
 		i := n % int64(len(fences))
@@ -385,6 +434,7 @@ func (w *slotWriter) run() {
 		w.workers.Go(func() {
 			defer close(done)
 			defer func() { <-w.permits }()
+			defer w.flight.give(len(chunk))
 			if err := w.publish(n, prev, mode, chunk); err != nil {
 				w.fail(err)
 			}
@@ -405,6 +455,9 @@ func (w *slotWriter) run() {
 			w.frame = max(base, w.frame/2)
 		} else if full {
 			w.frame = min(2*w.frame, slotMaxFrame)
+		}
+		if w.frame != frame {
+			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame)
 		}
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
@@ -491,7 +544,7 @@ func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
 }
 
 // Inbound: workers discover known IDs concurrently. Only run delivers bytes and moves
-// head. Lookahead media retains at most slotReadAhead-1 whole frames, plus the ordered head.
+// head. Lookahead media retains at most slotFlightBytes, plus the ordered head.
 type slotReader struct {
 	ctx     context.Context
 	setErr  context.CancelCauseFunc
@@ -500,7 +553,8 @@ type slotReader struct {
 	table   slotTable
 	params
 	ch                       chan []byte
-	wake, ack, media         chan struct{}
+	wake, ack                chan struct{}
+	media                    *byteBudget // bodies downloaded ahead of the head
 	head, frontier, activeAt atomic.Int64
 	drainCredit              atomic.Pointer[time.Time] // last credit returned during Close
 	probing                  atomic.Bool
@@ -519,7 +573,7 @@ func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slot
 	r := &slotReader{
 		ctx: ctx, setErr: fail, discard: discard, store: store, table: table, params: p,
 		ch: make(chan []byte, 2), wake: make(chan struct{}, 1),
-		ack: make(chan struct{}, 1), media: make(chan struct{}, slotReadAhead-1),
+		ack: make(chan struct{}, 1), media: newByteBudget(slotFlightBytes),
 	}
 	r.frontier.Store(-1)
 	r.Wake()
@@ -705,11 +759,8 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	// holds its credit until retirement, even after a short or failed body.
 	reserved := false
 	if j.seq != r.head.Load() {
-		select {
-		case r.media <- struct{}{}:
-			reserved = true
-		case <-j.head:
-		case <-ctx.Done():
+		reserved = r.media.take(f.size, j.head, ctx.Done())
+		if !reserved && ctx.Err() != nil {
 			j.err = ctx.Err()
 			close(j.ready)
 			return
@@ -731,7 +782,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		case <-j.retired:
 		case <-ctx.Done():
 		}
-		<-r.media
+		r.media.give(f.size)
 	}
 }
 
