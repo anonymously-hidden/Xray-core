@@ -23,10 +23,6 @@ mean end and error. See "Transport model" below.
   the ring depth. For the eager window after a media upload starts (default 2 s),
   later bursts do not split into inline waves even if few uploads remain.
   Reuse requires previous local completion and cumulative remote credit.
-  Inline publications may use four optional fast HTTP permits on the existing
-  priority connection pool, or ordinary metadata permits if those are available.
-  They do not consume the eight priority permits reserved for head reads/ACKs.
-  This is a queueing alternative, not a strict-priority scheduler or extra GET.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
@@ -37,9 +33,7 @@ mean end and error. See "Transport model" below.
   order, bounded to 4 MiB per media connection and held until head promotion.
   Ordinary media has four HTTP permits per connection (capped at 64); head
   media has separate permits (up to four), including queued requests promoted
-  to head. A description GET waiting for an HTTP permit can also promote to
-  the priority permits/pool before sending, without cancellation or duplicate reads.
-  Media still uses its existing connections; the head has its own frame allowance.
+  to head. Both use the same connections; the head has its own frame allowance.
   A prefetched frame returns its local byte reservation when promoted, even if
   its body is still downloading. Completed successors retain theirs until promoted.
   Workers can finish out of order; one coordinator alone delivers bytes.
@@ -131,10 +125,6 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    triggered the one stream resume; successful final reads can hide this error.
    `xdrive request retry seq` exposes retries before headers or buffered success.
    `xdrive cooldown D` records the shared delay after quota/service rejections.
-   `xdrive inline put seq N bytes B credit C put P` records inline publication.
-   `xdrive inline ready seq N bytes B find F admit A` records discovery and
-   ordered-admission waiting, not application delivery or request/response RTT.
-   Finding a future sequence includes time waiting for the peer to publish it.
 
 There are no CRCs: integrity relies on TLS, the length checks and the
 per-block sequence tags, and VLESS encryption authenticates the payload. Both
@@ -221,16 +211,6 @@ No budgets, request limits or wire-format fields changed. Validate with slow
 heads, completed successors, cancellation and unequal Close workloads under race
 detection before attributing a sustained-speed improvement to this change.
 
-The inline-latency refinement keeps batching, polling, 80 requests/s pacing and
-all media budgets unchanged. Its four additional optional inline HTTP permits
-share the priority pool but not the head/ACK permits; bursts can still use the
-ordinary metadata lane. Already-admitted requests are not moved or replayed, and
-small replies never overtake earlier session bytes. Cooldown and pacing still
-apply to every request. This targets queueing under contention, not Drive's RTT
-floor; no live latency improvement has been measured. Check sparse ping-pong,
-concurrent bursts, bulk-plus-small traffic, queued head promotion, retry lane
-selection, cancellation and final ACKs under race detection. No test files added.
-
 The following are **Python model checks against the v7 candidate, not runs of
 this Go package**:
 
@@ -273,8 +253,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1067 |
-| `slots.go` | whole file | 869 |
+| `drive.go` | whole file | 1056 |
+| `slots.go` | whole file | 879 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -283,4 +263,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **3000** |
+| **Total** | | **2999** |

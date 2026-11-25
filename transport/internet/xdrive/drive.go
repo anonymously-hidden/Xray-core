@@ -67,7 +67,7 @@ type driveShared struct {
 	tokenClient                                                   *http.Client
 	pools                                                         [laneCount]*connPool
 	permits                                                       [laneCount]chan struct{}
-	headMedia, inlineFast                                         chan struct{} // separate head and optional inline permits
+	headMedia                                                     chan struct{} // reserved HTTP permits, same media pool
 	cancel                                                        context.CancelFunc
 	sessionGuard                                                  driveSessionGuard
 	mu                                                            sync.Mutex
@@ -94,8 +94,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	s := &driveStorage{driveShared: &driveShared{
 		folder: config.RemoteFolder, space: "drive", clientID: config.Secrets[0], clientSecret: config.Secrets[1], refreshToken: config.Secrets[2],
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
-		headMedia:  make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
-		inlineFast: make(chan struct{}, slotBusyUploads),
+		headMedia: make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
 	}}
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
@@ -432,37 +431,25 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return err
 			}
 		}
-		permits, urgent := s.permits[lane], s.headMedia
-		var fast chan struct{}
-		if ctx.Value(inlineKey{}) != nil {
-			fast = s.inlineFast
-		}
+		permits := s.permits[lane]
 		var head <-chan struct{}
-		if (lane == mediaLane || lane == metadataLane) && method == http.MethodGet {
-			head, _ = ctx.Value(slotHeadKey{}).(<-chan struct{})
-		}
-		if lane == metadataLane {
-			urgent = s.permits[priorityLane]
+		if lane == mediaLane && method == http.MethodGet {
+			head, _ = ctx.Value(mediaHeadKey{}).(<-chan struct{})
 		}
 		if isClosedChan(head) {
-			permits, head = urgent, nil
+			permits, head = s.headMedia, nil
 		}
-		acquired := false
-		for !acquired {
+		select {
+		case permits <- struct{}{}:
+		case <-head: // A queued look-ahead request has become the ordered head.
+			permits = s.headMedia
 			select {
 			case permits <- struct{}{}:
-				acquired = true
-			case fast <- struct{}{}:
-				permits, acquired = fast, true
-			case <-head: // Promote only before sending, without another GET.
-				permits, head = urgent, nil
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		}
-		client := s.clients[lane]
-		if permits == s.permits[priorityLane] || permits == s.inlineFast {
-			client = s.clients[priorityLane]
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-permits }()
@@ -489,7 +476,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			if method == http.MethodPost || method == http.MethodPatch {
 				req.GetBody = nil
 			}
-			resp, err := client.Do(req)
+			resp, err := s.clients[lane].Do(req)
 			if err != nil {
 				return method == http.MethodGet && errors.Cause(err) != errSessionClosed, err
 			}
@@ -565,7 +552,8 @@ func (f driveFile) regular() bool {
 	return f.MimeType != "" && !strings.HasPrefix(f.MimeType, "application/vnd.google-apps.")
 }
 
-// Bind peer IDs to this session; lazy creates bind directly, eager slots on first use.
+// Before using an ID chosen by the peer, bind it to a file in this session.
+// Lazy creates already establish identity; eager slots are verified on first use.
 func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
 	s.boundFolder = s.folder
 	if s.folder == "root" || s.folder == "appDataFolder" {
@@ -653,17 +641,16 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 }
 
 type (
-	headKey     struct{}
-	slotHeadKey struct{} // <-chan struct{}, closed on promotion
-	mediaSeqKey struct{} // int64, for request retry diagnostics
-	inlineKey   struct{}
+	headKey      struct{}
+	mediaHeadKey struct{} // <-chan struct{}, closed on promotion
+	mediaSeqKey  struct{} // int64, for request retry diagnostics
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
 	if body != nil {
 		return mediaLane
 	}
-	if ctx.Value(headKey{}) == true {
+	if ctx.Value(headKey{}) != nil {
 		return priorityLane
 	}
 	return metadataLane
@@ -701,7 +688,8 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	return f.Description, nil
 }
 
-// Verify blocks [lo, hi); one retry resumes unemitted bytes and still proves exact EOF.
+// readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
+// One retry resumes at its first unemitted block and still proves exact EOF.
 func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error, whole func()) error {
 	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
 	const stride = slotBodyHeader + slotTagBlock
@@ -781,7 +769,8 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 	}
 }
 
-// Small frames use one GET; large frames use up to four ranges of at least 512 KiB.
+// Frames through slotProgressiveMax use one progressive GET. Larger frames
+// use up to four block ranges at once, targeting at least 512 KiB per range.
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
 	if f.size <= 0 || f.mode != slotStream {
 		return errors.New("invalid Drive stream frame")
