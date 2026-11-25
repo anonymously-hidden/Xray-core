@@ -394,6 +394,8 @@ var errSessionClosed = errors.New("the session is closed")
 type connPool struct {
 	mu     sync.Mutex
 	mux    *splithttp.XmuxManager
+	media  []*splithttp.XmuxManager // Drive-only, one connection per round-robin lane
+	next   int
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -424,27 +426,38 @@ func driveMediaConns(x *splithttp.XmuxConfig) int32 {
 	return 4
 }
 
-// conns, when positive, is the connection count used if XMUX sets none.
+// Positive conns gives Drive round-robin lanes; other backends keep one manager.
 func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(context.Context) *http.Client) *connPool {
 	if config == nil {
 		config = &splithttp.XmuxConfig{}
 	}
 	maxConns := config.MaxConnections
-	if maxConns == nil && conns > 0 {
-		maxConns = &splithttp.RangeConfig{From: conns, To: conns}
+	if conns > 0 {
+		maxConns = &splithttp.RangeConfig{From: 1, To: 1}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &connPool{ctx: ctx, cancel: cancel}
-	p.mux = splithttp.NewXmuxManager(splithttp.XmuxConfig{
-		MaxConnections: maxConns, MaxConcurrency: config.MaxConcurrency,
-		CMaxReuseTimes: config.CMaxReuseTimes, HMaxRequestTimes: config.HMaxRequestTimes,
-		HMaxReusableSecs: config.HMaxReusableSecs, HKeepAlivePeriod: config.HKeepAlivePeriod,
-	}, func() splithttp.XmuxConn {
+	newConn := func() splithttp.XmuxConn {
 		ctx, cancel := context.WithCancel(p.ctx)
 		c := &poolConn{ctx: ctx, cancel: cancel, transport: newClient(ctx).Transport}
 		c.stop = context.AfterFunc(ctx, func() { closeIdleTransport(c.transport) })
 		return c
-	})
+	}
+	newMux := func() *splithttp.XmuxManager {
+		return splithttp.NewXmuxManager(splithttp.XmuxConfig{
+			MaxConnections: maxConns, MaxConcurrency: config.MaxConcurrency,
+			CMaxReuseTimes: config.CMaxReuseTimes, HMaxRequestTimes: config.HMaxRequestTimes,
+			HMaxReusableSecs: config.HMaxReusableSecs, HKeepAlivePeriod: config.HKeepAlivePeriod,
+		}, newConn)
+	}
+	p.mux = newMux()
+	for i := int32(0); i < conns; i++ {
+		mux := p.mux
+		if i > 0 {
+			mux = newMux()
+		}
+		p.media = append(p.media, mux)
+	}
 	return p
 }
 
@@ -477,7 +490,12 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	c := t.client
 	if t.spread {
-		c = p.mux.GetXmuxClient(r.Context())
+		mux := p.mux
+		if len(p.media) != 0 {
+			mux = p.media[p.next]
+			p.next = (p.next + 1) % len(p.media)
+		}
+		c = mux.GetXmuxClient(r.Context())
 	} else if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
 		if c != nil {
 			c.DoneRunning()

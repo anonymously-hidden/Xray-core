@@ -67,6 +67,7 @@ type driveShared struct {
 	tokenClient                                                   *http.Client
 	pools                                                         [laneCount]*connPool
 	permits                                                       [laneCount]chan struct{}
+	headMedia                                                     chan struct{} // reserved HTTP permits, same media pool
 	cancel                                                        context.CancelFunc
 	sessionGuard                                                  driveSessionGuard
 	mu                                                            sync.Mutex
@@ -92,6 +93,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	s := &driveStorage{driveShared: &driveShared{
 		folder: config.RemoteFolder, space: "drive", clientID: config.Secrets[0], clientSecret: config.Secrets[1], refreshToken: config.Secrets[2],
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
+		headMedia: make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
 	}}
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
@@ -402,13 +404,28 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return err
 			}
 		}
+		permits := s.permits[lane]
+		var head <-chan struct{}
+		if lane == mediaLane && method == http.MethodGet {
+			head, _ = ctx.Value(mediaHeadKey{}).(<-chan struct{})
+		}
+		if isClosedChan(head) {
+			permits, head = s.headMedia, nil
+		}
 		select {
-		case s.permits[lane] <- struct{}{}:
+		case permits <- struct{}{}:
+		case <-head: // A queued look-ahead request has become the ordered head.
+			permits = s.headMedia
+			select {
+			case permits <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 		retry, err := func() (bool, error) {
-			defer func() { <-s.permits[lane] }()
+			defer func() { <-permits }()
 			for {
 				s.mu.Lock()
 				delay := time.Until(s.coolUntil)
@@ -606,6 +623,7 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 }
 
 type headKey struct{}
+type mediaHeadKey struct{} // <-chan struct{}, closed on promotion
 
 func writeLane(ctx context.Context, body []byte) driveLane {
 	if body != nil {
@@ -654,7 +672,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 // a response for another lap is rejected by any range alone. One retry
 // resumes at the block of the first unemitted byte, never replaying emitted
 // bytes, and still has to prove the exact EOF.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error) error {
+func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error, whole func()) error {
 	const stride = slotBodyHeader + slotTagBlock
 	n := slotBlocks(f.size)
 	total := f.size + slotBodyHeader*n
@@ -673,6 +691,13 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			switch resp.StatusCode {
 			case http.StatusOK:
 				from, to, length = 0, n, total
+				if lo == 0 && whole != nil {
+					hi, stop = n, f.size
+					whole() // Keep this response; cancel redundant full-body downloads.
+					if header != "" {
+						errors.LogDebug(ctx, "xdrive media seq ", f.seq, " Range ignored; using one full body")
+					}
+				}
 			case http.StatusPartialContent:
 				if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, total) {
 					return errors.New("Drive returned a different media range")
@@ -729,9 +754,11 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 	}
 	n := slotBlocks(f.size)
 	if f.size <= slotProgressiveMax || s.cooling() {
-		return s.readSpan(ctx, id, f, 0, n, emit)
+		return s.readSpan(ctx, id, f, 0, n, emit, nil)
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	tailCtx, stopTails := context.WithCancel(ctx)
+	defer stopTails()
 	var wg sync.WaitGroup
 	defer func() {
 		cancel()
@@ -740,22 +767,28 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 	type part struct {
 		chunks chan []byte
 		err    error // published by close(chunks)
+		full   bool
 	}
-	parts := make([]part, min(4, n))
+	parts := make([]part, min(cap(s.headMedia), n))
 	for i := range parts {
 		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
 		p := &parts[i]
 		p.chunks = make(chan []byte, (hi-lo)*(slotTagBlock/slotReadChunk)+1)
 		wg.Go(func() {
 			defer close(p.chunks)
-			p.err = s.readSpan(ctx, id, f, lo, hi, func(b []byte) error {
+			spanCtx := tailCtx
+			var whole func()
+			if i == 0 {
+				spanCtx, whole = ctx, func() { p.full = true; stopTails() }
+			}
+			p.err = s.readSpan(spanCtx, id, f, lo, hi, func(b []byte) error {
 				select {
 				case p.chunks <- b:
 					return nil
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-spanCtx.Done():
+					return spanCtx.Err()
 				}
-			})
+			}, whole)
 		})
 	}
 	for i := range parts {
@@ -767,6 +800,9 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		}
 		if p.err != nil {
 			return p.err
+		}
+		if p.full {
+			return nil
 		}
 	}
 	return nil

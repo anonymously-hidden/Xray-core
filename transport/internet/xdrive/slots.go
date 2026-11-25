@@ -368,6 +368,7 @@ func (w *slotWriter) credit(seq int64) (bool, error) {
 	if n > w.acked {
 		w.acked = n
 		w.markProgress()
+		errors.LogDebug(w.ctx, "xdrive credit seq ", seq, " ack ", n)
 	}
 	return w.acked >= need, nil
 }
@@ -637,61 +638,6 @@ func (r *slotReader) Err() error {
 	return io.EOF
 }
 
-// A GET may have sampled an old lap. Allow one later sample of the active
-// head, but never require the second GET when the first one already matches.
-func (r *slotReader) sample(ctx context.Context, id string, seq int64, overlap bool) (slotFrame, bool, error) {
-	type observation struct {
-		f       slotFrame
-		invalid bool
-		err     error
-	}
-	read := func(ctx context.Context) observation {
-		d, err := r.store.readDescription(ctx, id)
-		f, ok := decodeSlot(d)
-		return observation{f, d != "" && !ok, err}
-	}
-	if !overlap {
-		v := read(ctx)
-		return v.f, v.invalid, v.err
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	results := make(chan observation, 2)
-	launch := func() {
-		r.wg.Go(func() { results <- read(ctx) })
-	}
-	launch()
-	t := time.NewTimer(125 * time.Millisecond)
-	defer t.Stop()
-	pending := 1
-	var realErr error
-	var invalid bool
-	for {
-		select {
-		case v := <-results:
-			invalid = invalid || v.invalid
-			if v.err == errDriveScope || isAuthError(v.err) || (v.f.mode != 0 && v.f.seq >= seq && v.err == nil) {
-				return v.f, v.invalid, v.err
-			}
-			if v.err != nil && v.err != errNotFound {
-				realErr = v.err
-			}
-			pending--
-			if pending == 0 {
-				if realErr != nil {
-					return slotFrame{}, false, realErr
-				}
-				return v.f, invalid, v.err
-			}
-		case <-t.C:
-			pending++
-			launch()
-		case <-ctx.Done():
-			return slotFrame{}, false, ctx.Err()
-		}
-	}
-}
-
 func (r *slotReader) observe(n int64) {
 	for old := r.frontier.Load(); old < n && !r.frontier.CompareAndSwap(old, n); old = r.frontier.Load() {
 	}
@@ -710,8 +656,9 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 			if head {
 				readCtx = context.WithValue(ctx, headKey{}, true)
 			}
-			overlap := head && active && !isCooling(r.store)
-			f, invalid, err := r.sample(readCtx, id, job.seq, overlap)
+			d, err := r.store.readDescription(readCtx, id)
+			f, ok := decodeSlot(d)
+			invalid := d != "" && !ok
 			if err == nil && f.seq > job.seq {
 				return slotFrame{}, errors.New("Drive slot ", job.seq, " was overwritten by sequence ", f.seq)
 			}
@@ -787,6 +734,18 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	// A promoted head must never queue behind a prefetched successor. A tail
 	// holds its credit until retirement, even after a short or failed body.
 	found := time.Now()
+	// Four ranges of every large successor would swamp the head's connections.
+	// Prefetch their descriptions, but give only the ordered large frame a body.
+	if f.size > slotProgressiveMax {
+		select {
+		case <-j.head:
+		case <-ctx.Done():
+			j.err = ctx.Err()
+			close(j.ready)
+			return
+		}
+	}
+	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
 	reserved := false
 	if j.seq != r.head.Load() {
 		reserved = r.media.take(f.size, j.head, ctx.Done())
@@ -898,6 +857,7 @@ func (r *slotReader) ackLoop(readDone <-chan struct{}) {
 		}
 		if n := r.head.Load() - 1; n > acked {
 			d := strconv.FormatInt(n, 10)
+			started := time.Now()
 			var err error
 			if r.table.lazy && acked < 0 {
 				err = r.store.createSlot(ctx, r.table.Watermark, r.table.name+"/w", d, nil)
@@ -909,6 +869,7 @@ func (r *slotReader) ackLoop(readDone <-chan struct{}) {
 				return
 			}
 			acked = n
+			errors.LogDebug(ctx, "xdrive watermark seq ", n, " put ", time.Since(started))
 			if isClosedChan(r.discard) {
 				now := time.Now()
 				r.drainCredit.Store(&now)
