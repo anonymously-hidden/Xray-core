@@ -72,7 +72,8 @@ type driveShared struct {
 	sessionGuard                                                  driveSessionGuard
 	mu                                                            sync.Mutex
 	token                                                         string
-	expiry, coolUntil                                             time.Time
+	expiry, coolUntil, nextRequest                                time.Time
+	coolDelay                                                     time.Duration
 	tokenErr                                                      error
 	refreshing                                                    chan struct{}
 	nextDelete                                                    time.Time
@@ -309,11 +310,35 @@ func retryAfter(h http.Header, now time.Time) time.Duration {
 
 func (s *driveStorage) delayRequests(h http.Header) {
 	now := time.Now()
-	until := now.Add(max(jitter(2*time.Second), retryAfter(h, now)))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if until.After(s.coolUntil) {
+	if !now.Before(s.coolUntil) {
+		if now.Sub(s.coolUntil) > time.Minute {
+			s.coolDelay = 0
+		}
+		s.coolDelay = min(30*time.Second, max(2*time.Second, 2*s.coolDelay))
+		s.coolUntil = now.Add(jitter(s.coolDelay))
+	}
+	if until := now.Add(retryAfter(h, now)); until.After(s.coolUntil) {
 		s.coolUntil = until
+	}
+	errors.LogDebug(context.Background(), "xdrive cooldown ", time.Until(s.coolUntil))
+}
+
+// Reserve spaced starts across all lanes; a later cooldown reschedules the turn.
+func (s *driveStorage) waitRequest(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		now := time.Now()
+		delay := max(0, s.coolUntil.Sub(now), s.nextRequest.Sub(now))
+		s.nextRequest = now.Add(delay).Add(time.Second / 80)
+		s.mu.Unlock()
+		if err := sleepContext(ctx, delay); err != nil {
+			return err
+		}
+		if !s.cooling() {
+			return nil
+		}
 	}
 }
 
@@ -395,8 +420,7 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	return b, err
 }
 
-// request owns the response through consume, including the HTTP permit. Only
-// an explicit rejection permits replaying a mutation: a lost reply is ambiguous.
+// request holds its permit through consume; only an explicit rejection permits write replay.
 func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, byteRange string, buffered bool, consume func(*http.Response) error) error {
 	var last error
 	refreshed := false
@@ -429,21 +453,13 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-permits }()
-			for {
-				s.mu.Lock()
-				delay := time.Until(s.coolUntil)
-				s.mu.Unlock()
-				if delay <= 0 {
-					break
-				}
-				if err := sleepContext(ctx, delay); err != nil {
-					return false, err
-				}
-			}
 			token, err := s.accessToken(ctx)
 			if err != nil {
 				_, retry := err.(tokenRetry) // No file request has been sent yet.
 				return retry, err
+			}
+			if err := s.waitRequest(ctx); err != nil {
+				return false, err
 			}
 			req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 			if err != nil {
@@ -488,7 +504,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return retry, authError{"401"}
 			case resp.StatusCode == http.StatusForbidden && rateLimited(detail):
 				s.delayRequests(resp.Header)
-				return true, err
+				return true, fmt.Errorf("Drive %s: quota rate limit (HTTP 403)", method)
 			case resp.StatusCode == http.StatusRequestedRangeNotSatisfiable:
 				return false, errDriveRange
 			case (method == http.MethodPost || method == http.MethodPatch) &&
@@ -586,8 +602,7 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 	if _, refused := err.(refusedPayload); refused || id == "" || isAuthError(err) || ctx.Err() != nil {
 		return err
 	}
-	// Data and watermark files each have one writer. Confirm the exact frame
-	// or cumulative ACK under the original caller's deadline, without replay.
+	// One writer per file: confirm the exact frame or ACK without replay.
 	verify, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	for verify.Err() == nil {
@@ -673,11 +688,8 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 	return f.Description, nil
 }
 
-// readSpan reads tagged blocks [lo, hi) of a media body and emits their data
-// in pieces as they arrive. Each block starts with the frame's sequence, so
-// a response for another lap is rejected by any range alone. One retry
-// resumes at the block of the first unemitted byte, never replaying emitted
-// bytes, and still has to prove the exact EOF.
+// readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
+// One retry resumes at its first unemitted block and still proves exact EOF.
 func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error, whole func()) error {
 	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
 	const stride = slotBodyHeader + slotTagBlock

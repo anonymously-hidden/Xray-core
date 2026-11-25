@@ -27,7 +27,9 @@ mean end and error. See "Transport model" below.
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
   24 known descriptions are prefetched, with one metadata GET per worker at a
-  time. All media sizes may be prefetched; byte admission follows sequence
+  time. Empty-slot polling reaches only four positions beyond the observed
+  frontier (or head); new observations advance that frontier immediately.
+  All media sizes may be prefetched; byte admission follows sequence
   order, bounded to 4 MiB per media connection and held through retirement.
   Ordinary media has four HTTP permits per connection (capped at 64); head
   media has separate permits (up to four), including queued requests promoted
@@ -65,10 +67,10 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
    and doubles after each round that filled a whole frame, up to 4 MiB (below
    Drive's 5 MB multipart limit). It halves (not below the start) when an
-   upload waited more than 5 s for ring credit, meaning the reader is
-   clearly struggling, or when Drive throttles. Routine credit takes 1-3 s,
-   so shorter waits only mean the writer is a ring ahead; bigger frames
-   then carry more bytes per ring position.
+   upload waited more than 5 s for ring credit outside Drive cooldown.
+   Cooldown freezes frame size instead of shrinking it: smaller frames spend
+   more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
+   the writer is a ring ahead. Larger frames carry more bytes per position.
 3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH;
    an idle writer may split a burst into up to 24 inline frames, a streaming
    writer never does, because the reader finds only about 24 frames per round
@@ -86,8 +88,10 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    extra connections. Bounded look-ahead overlaps service latency between frames
    instead of forcing one large frame to finish before starting the next.
 4. **Discover.** The reader polls the head slot's description (25 ms while
-   active; no duplicate hedged GET) and prefetches up to 24 descriptions. Bodies
-   of all sizes download ahead within the byte budget, admitted in sequence
+   active; no duplicate hedged GET) and prefetches up to 24 descriptions. Slots
+   beyond the observed frontier plus four wait without polling; the head always
+   polls, and the existing gap probe still covers otherwise unobserved gaps.
+   Bodies of all sizes download ahead within the byte budget, admitted in sequence
    order so distant successors cannot reserve it before nearer frames. The head
    bypasses that budget, and a queued media request switches to the reserved
    HTTP permits when promoted. Admission waits for the previous frame's ready
@@ -115,6 +119,7 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    `xdrive span retry seq` records emitted payload bytes and the error that
    triggered the one stream resume; successful final reads can hide this error.
    `xdrive request retry seq` exposes retries before headers or buffered success.
+   `xdrive cooldown D` records the shared delay after quota/service rejections.
 
 There are no CRCs: integrity relies on TLS, the length checks and the
 per-block sequence tags, and VLESS encryption authenticates the payload. Both
@@ -167,8 +172,17 @@ persistent exactly-once claim within the TTL. An unprovable gap (no subsequent
 frame) still looks like an idle connection; use a read deadline when one is required.
 
 Transient OAuth transport and service failures can retry before any file operation
-is sent. Drive rate-limit responses and 503 responses with `Retry-After` apply a
-shared cooldown; a 503 is not permission to replay a mutation. Cleanup excludes
+is sent. All Drive file attempts, including retries, reserve spaced starts at
+80 requests/s per shared storage instance, across sessions and lanes. Two peers
+at this ceiling use about 9,600 attempts/minute against the observed 12,000
+quota, leaving headroom, not a guarantee for other processes or profiles sharing
+the project. Queued requests recheck cooldown before proceeding. Cancellation
+may leave unused pacing turns, but releases the request permit.
+Drive rate-limit responses and 503 responses with `Retry-After` apply a shared
+exponential cooldown (jittered 2–30 s base), reset after a minute without a new
+cooldown. Concurrent rejections in one cooldown do not escalate independently;
+a longer `Retry-After` still extends it. A 503 never permits mutation replay.
+Quota retry logs omit the repetitive JSON error body. Cleanup excludes
 folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
@@ -178,8 +192,13 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 This version descends from the v7 candidate, which began as a literal merge
 of v6's four slot files. The per-block CRCs, the checksum table and the
-checksummed media reader are gone here, so the media reader is no longer
-byte-identical to v6; the HTTP retry path is.
+checksummed media reader are gone here. Retry safety rules remain, but media
+reading, request pacing and shared cooldown now differ from v6.
+
+The quota refinement passes `gofmt -l`, `go build ./...` and xdrive `go vet`.
+A Python virtual-clock model checks pacing, cancellation, cooldown extension,
+Retry-After, frontier progression and frame-size freezing; it is not a Go
+HTTP/race workload or a live-Drive throughput benchmark. No test files are added.
 
 The following are **Python model checks against the v7 candidate, not runs of
 this Go package**:
@@ -223,8 +242,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1044 |
-| `slots.go` | whole file | 890 |
+| `drive.go` | whole file | 1056 |
+| `slots.go` | whole file | 880 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -233,4 +252,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2998** |
+| **Total** | | **3000** |

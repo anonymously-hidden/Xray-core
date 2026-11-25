@@ -28,31 +28,24 @@ const (
 	maxSlotIDLen     = 128
 	slotStallTimeout = time.Minute
 
-	// A media body is a run of blocks: an 8-byte sequence number, then up to
-	// slotTagBlock data bytes. Any range of whole blocks can tell an older lap
-	// from the announced frame by itself, without a checksum.
+	// Every block has an 8-byte sequence tag, then up to slotTagBlock data bytes.
+	// Each whole-block range independently rejects an older lap.
 	slotBodyHeader = 8
 	slotTagBlock   = 256 << 10
 	// slotReadChunk is the unit a media body is delivered in while it downloads.
 	slotReadChunk = 32 << 10
 	// slotMaxFrame stays below Drive's 5 MB multipart upload limit.
 	slotMaxFrame = 4 << 20
-	// A credit wait this long means the reader is clearly struggling. Routine
-	// credit takes 1-3 s (ACK every depth/6 frames or 1.5 s, then a watermark
-	// PATCH and GET), so a shorter wait only means the ring is a lap ahead.
+	// Routine credit takes 1-3 s; only longer waits indicate strain.
 	slotStrainWait = 5 * time.Second
 	// Small frames amortize service latency better with one progressive GET.
 	slotProgressiveMax = 1 << 20
-	// slotReadAhead is the reader's prefetch window.
-	slotReadAhead = 24
-	// With this many uploads in flight the writer is streaming: it gathers up
-	// to slotBusyGather, a full frame or an input pause, and sends media, not
-	// inline waves.
+	slotReadAhead      = 24
+	// A busy writer gathers until slotBusyGather, a full frame or input pause.
 	slotBusyUploads = 4
 	slotBusyGather  = 200 * time.Millisecond
 )
 
-// slotBlocks is the number of tagged blocks in a media body of size bytes.
 func slotBlocks(size int) int { return (size + slotTagBlock - 1) / slotTagBlock }
 
 // byteBudget bounds bytes in flight. A taker may exceed the limit when nothing
@@ -469,20 +462,17 @@ func (w *slotWriter) run() {
 	flush := func() bool {
 		timer.Stop()
 		frame, full := w.frame, len(buf) >= w.frame
-		// Each full round doubles the next frame until the reader clearly
-		// struggles (a long credit wait) or Drive throttles; then halve.
+		// Credit strain reduces bytes; request quotas need larger frames, not smaller.
 		strained, cooling := w.strained.Swap(false), isCooling(w.store)
-		if strained || cooling {
+		if strained && !cooling {
 			w.frame = max(base, w.frame/2)
-		} else if full {
+		} else if full && !cooling {
 			w.frame = min(2*w.frame, slotMaxFrame)
 		}
 		if w.frame != frame {
 			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
-		// Inline waves cut latency for an idle writer. A streaming writer must
-		// not spend 64 ring positions on 14 KiB frames: the reader discovers
-		// about 24 frames per round trip, so frame count caps throughput.
+		// Inline waves help idle latency; bulk traffic must not waste ring positions.
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
@@ -655,7 +645,8 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 	for {
 		head := job.seq == r.head.Load()
 		active := time.Since(time.Unix(0, r.activeAt.Load())) < r.eagerWindow
-		if head || active {
+		// Empty distant slots must not spend the quota of useful media and ACKs.
+		if head || active && job.seq <= max(r.frontier.Load(), r.head.Load())+4 {
 			readCtx := ctx
 			if head {
 				readCtx = context.WithValue(ctx, headKey{}, true)
@@ -674,8 +665,7 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 			if err == errDriveScope || isAuthError(err) {
 				return slotFrame{}, err
 			}
-			// A lazy missing head is also a valid idle state. Occasionally inspect a
-			// different description for evidence of a gap, never speculative media.
+			// A lazy missing head may be idle; probe other descriptions for a gap.
 			if head && depth > 1 && time.Now().After(probeAt) && r.frontier.Load() <= job.seq && !isCooling(r.store) && r.probing.CompareAndSwap(false, true) {
 				idx := (job.seq + offset) % depth
 				offset, probeAt = offset%(depth-1)+1, time.Now().Add(slotStallTimeout/12)
