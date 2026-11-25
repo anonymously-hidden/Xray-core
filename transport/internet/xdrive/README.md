@@ -26,15 +26,17 @@ mean end and error. See "Transport model" below.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
-  12 known descriptions are prefetched, with one metadata GET per worker at a
+  24 known descriptions are prefetched, with one metadata GET per worker at a
   time. All media sizes may be prefetched; byte admission follows sequence
   order, bounded to 4 MiB per media connection and held through retirement.
   Ordinary media has four HTTP permits per connection (capped at 64); head
   media has separate permits (up to four), including queued requests promoted
   to head. Both use the same connections; the head bypasses the byte budget.
   Workers can finish out of order; one coordinator alone delivers bytes.
-- **Media:** frames through 512 KiB use one progressive GET; larger frames
-  use up to four block ranges at once, capped by the media connection count.
+  Ordered delivery refreshes the eager timer; speculative body downloads do not.
+- **Media:** frames through 1 MiB use one progressive GET; larger frames
+  use up to four block ranges at once, capped by the media connection count
+  and targeting at least 512 KiB of payload per range.
   If the first range returns a full HTTP 200 body, keep it and cancel the other
   ranges instead of downloading the full body four times. Validate every
   block's sequence tag, HTTP range/length and EOF. One retry can resume an
@@ -69,8 +71,8 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    then carry more bytes per ring position.
 3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH;
    an idle writer may split a burst into up to 24 inline frames, a streaming
-   writer never does, because the reader finds only about 12 frames per round
-   trip and 14 KiB frames would cap throughput near 0.5 MB/s). Larger frames
+   writer never does, because the reader finds only about 24 frames per round
+   trip and 14 KiB frames would cap throughput near 1 MB/s). Larger frames
    are one multipart PATCH: the description holds `XDRVSL03`, sequence, mode
    and length; the body is blocks of an 8-byte sequence tag followed by up to
    256 KiB of data. At most 32 uploads and
@@ -84,15 +86,16 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    extra connections. Bounded look-ahead overlaps service latency between frames
    instead of forcing one large frame to finish before starting the next.
 4. **Discover.** The reader polls the head slot's description (25 ms while
-   active; no duplicate hedged GET) and prefetches up to 12 descriptions. Bodies
+   active; no duplicate hedged GET) and prefetches up to 24 descriptions. Bodies
    of all sizes download ahead within the byte budget, admitted in sequence
    order so distant successors cannot reserve it before nearer frames. The head
    bypasses that budget, and a queued media request switches to the reserved
    HTTP permits when promoted. Admission waits for the previous frame's ready
    signal, not its completed download.
-5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
-   up to four block-aligned ranges (no more than the media connection count),
-   all started at once for each admitted large frame: every block carries
+5. **Fetch.** Media up to 1 MiB uses one streaming GET; larger frames use
+   two to four block-aligned ranges with the default four connections,
+   targeting at least 512 KiB per range and reaching four ranges at 2 MiB.
+   They start together for each admitted frame: every block carries
    the sequence tag, so each range rejects an older lap by itself (before,
    later ranges waited for the first one, costing a second time-to-first-byte,
    ~1 s, per large frame).
@@ -109,6 +112,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    `xdrive credit seq N ack A` records the writer observing newer credit.
    `xdrive span seq` records range status, wire bytes, time waiting for headers
    (including permit wait, retries and service latency), and time after headers.
+   `xdrive span retry seq` records emitted payload bytes and the error that
+   triggered the one stream resume; successful final reads can hide this error.
+   `xdrive request retry seq` exposes retries before headers or buffered success.
 
 There are no CRCs: integrity relies on TLS, the length checks and the
 per-block sequence tags, and VLESS encryption authenticates the payload. Both
@@ -217,8 +223,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1040 |
-| `slots.go` | whole file | 889 |
+| `drive.go` | whole file | 1044 |
+| `slots.go` | whole file | 890 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -227,4 +233,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2993** |
+| **Total** | | **2998** |

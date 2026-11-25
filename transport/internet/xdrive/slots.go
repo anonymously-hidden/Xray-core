@@ -41,10 +41,10 @@ const (
 	// credit takes 1-3 s (ACK every depth/6 frames or 1.5 s, then a watermark
 	// PATCH and GET), so a shorter wait only means the ring is a lap ahead.
 	slotStrainWait = 5 * time.Second
-	// slotProgressiveMax bounds a frame read by one GET instead of four ranges.
-	slotProgressiveMax = defaultSegmentBytes
+	// Small frames amortize service latency better with one progressive GET.
+	slotProgressiveMax = 1 << 20
 	// slotReadAhead is the reader's prefetch window.
-	slotReadAhead = 12
+	slotReadAhead = 24
 	// With this many uploads in flight the writer is streaming: it gathers up
 	// to slotBusyGather, a full frame or an input pause, and sends media, not
 	// inline waves.
@@ -482,7 +482,7 @@ func (w *slotWriter) run() {
 		}
 		// Inline waves cut latency for an idle writer. A streaming writer must
 		// not spend 64 ring positions on 14 KiB frames: the reader discovers
-		// about 12 frames per round trip, so frame count caps throughput.
+		// about 24 frames per round trip, so frame count caps throughput.
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
@@ -817,6 +817,7 @@ func (r *slotReader) run() {
 				case <-ctx.Done():
 					return
 				}
+				r.activeAt.Store(time.Now().UnixNano()) // ordered input keeps look-ahead eager
 			}
 		}
 		close(j.retired)

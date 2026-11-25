@@ -402,6 +402,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 	refreshed := false
 	for attempt := 0; attempt < driveMaxAttempts; attempt++ {
 		if attempt > 0 {
+			errors.LogDebug(ctx, "xdrive request retry seq ", ctx.Value(mediaSeqKey{}), " method ", method, " attempt ", attempt+1, " err ", last)
 			if err := sleepContext(ctx, jitter(min(driveMaxBackoff, driveInitialBackoff<<uint(attempt-1)))); err != nil {
 				return err
 			}
@@ -627,6 +628,7 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 type (
 	headKey      struct{}
 	mediaHeadKey struct{} // <-chan struct{}, closed on promotion
+	mediaSeqKey  struct{} // int64, for request retry diagnostics
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
@@ -677,6 +679,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 // resumes at the block of the first unemitted byte, never replaying emitted
 // bytes, and still has to prove the exact EOF.
 func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error, whole func()) error {
+	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
 	const stride = slotBodyHeader + slotTagBlock
 	n := slotBlocks(f.size)
 	total := f.size + slotBodyHeader*n
@@ -747,6 +750,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 		if err == nil || attempt != 0 || (!bodyFailed && err != errNotFound && err != errDriveRange) || ctx.Err() != nil {
 			return err
 		}
+		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " err ", err)
 		if err := sleepContext(ctx, driveInitialBackoff); err != nil {
 			return err
 		}
@@ -754,7 +758,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 }
 
 // Frames through slotProgressiveMax use one progressive GET. Larger frames
-// use up to four block ranges at once; each range proves its own lap.
+// use up to four block ranges at once, targeting at least 512 KiB per range.
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
 	if f.size <= 0 || f.mode != slotStream {
 		return errors.New("invalid Drive stream frame")
@@ -776,7 +780,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		err    error // published by close(chunks)
 		full   bool
 	}
-	parts := make([]part, min(cap(s.headMedia), n))
+	parts := make([]part, min(cap(s.headMedia), f.size/(2*slotTagBlock)))
 	for i := range parts {
 		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
 		p := &parts[i]
