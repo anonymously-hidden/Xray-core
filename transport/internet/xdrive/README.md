@@ -33,9 +33,10 @@ mean end and error. See "Transport model" below.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
    use up to four block ranges at once, capped by the media connection count.
    If the first range returns a full HTTP 200 body, keep it and cancel the other
-   ranges instead of downloading the full body four times. Validate every block's sequence tag,
-  HTTP range/length and EOF. One retry can resume an incomplete span
-  without delivering the same bytes twice. There is no speculative media GET.
+   ranges instead of downloading the full body four times. Validate every
+   block's sequence tag, HTTP range/length and EOF. One retry can resume an
+   incomplete span without delivering the same bytes twice. There is no
+   speculative media GET.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
   then flushes any remaining verified watermark. The peer may still have a full

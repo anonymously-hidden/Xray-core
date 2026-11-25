@@ -622,8 +622,10 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 	return err
 }
 
-type headKey struct{}
-type mediaHeadKey struct{} // <-chan struct{}, closed on promotion
+type (
+	headKey      struct{}
+	mediaHeadKey struct{} // <-chan struct{}, closed on promotion
+)
 
 func writeLane(ctx context.Context, body []byte) driveLane {
 	if body != nil {
