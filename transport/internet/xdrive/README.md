@@ -30,10 +30,12 @@ mean end and error. See "Transport model" below.
   time. Empty-slot polling reaches only four positions beyond the observed
   frontier (or head); new observations advance that frontier immediately.
   All media sizes may be prefetched; byte admission follows sequence
-  order, bounded to 4 MiB per media connection and held through retirement.
+  order, bounded to 4 MiB per media connection and held until head promotion.
   Ordinary media has four HTTP permits per connection (capped at 64); head
   media has separate permits (up to four), including queued requests promoted
-  to head. Both use the same connections; the head bypasses the byte budget.
+  to head. Both use the same connections; the head has its own frame allowance.
+  A prefetched frame returns its local byte reservation when promoted, even if
+  its body is still downloading. Completed successors retain theirs until promoted.
   Workers can finish out of order; one coordinator alone delivers bytes.
   Ordered delivery refreshes the eager timer; speculative body downloads do not.
 - **Media:** frames through 1 MiB use one progressive GET; larger frames
@@ -96,6 +98,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    bypasses that budget, and a queued media request switches to the reserved
    HTTP permits when promoted. Admission waits for the previous frame's ready
    signal, not its completed download.
+   Promotion releases any existing look-ahead reservation, not remote ring credit.
+   Thus a head discovered in advance no longer consumes both its own allowance
+   and the successors' budget. Cancellation also releases each reservation once.
 5. **Fetch.** Media up to 1 MiB uses one streaming GET; larger frames use
    two to four block-aligned ranges with the default four connections,
    targeting at least 512 KiB per range and reaching four ranges at 2 MiB.
@@ -200,6 +205,12 @@ A Python virtual-clock model checks pacing, cancellation, cooldown extension,
 Retry-After, frontier progression and frame-size freezing; it is not a Go
 HTTP/race workload or a live-Drive throughput benchmark. No test files are added.
 
+The receive-credit refinement releases local look-ahead bytes on head promotion;
+watermarks still advance only after verified ordered delivery and exact EOF.
+No budgets, request limits or wire-format fields changed. Validate with slow
+heads, completed successors, cancellation and unequal Close workloads under race
+detection before attributing a sustained-speed improvement to this change.
+
 The following are **Python model checks against the v7 candidate, not runs of
 this Go package**:
 
@@ -243,7 +254,7 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
 | `drive.go` | whole file | 1056 |
-| `slots.go` | whole file | 880 |
+| `slots.go` | whole file | 879 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -252,4 +263,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **3000** |
+| **Total** | | **2999** |

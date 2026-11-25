@@ -584,12 +584,12 @@ type slotReader struct {
 }
 
 type readSlot struct {
-	seq                  int64
-	prior                <-chan struct{} // previous frame's ready: ordered body admission
-	head, retired, ready chan struct{}
-	data                 chan []byte // published by ready; closed after the last verified block
-	end                  bool
-	err                  error // published by closing ready (no data) or data
+	seq         int64
+	prior       <-chan struct{} // previous frame's ready: ordered body admission
+	head, ready chan struct{}
+	data        chan []byte // published by ready; closed after the last verified block
+	end         bool
+	err         error // published by closing ready (no data) or data
 }
 
 func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
@@ -737,16 +737,23 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		close(j.ready)
 		return
 	}
-	// A promoted head must never queue behind a prefetched successor. A tail
-	// holds its credit until retirement, even after a short or failed body.
+	// The ordered head has its own allowance; only successors use look-ahead bytes.
 	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
-	reserved := false
 	if j.seq != r.head.Load() {
-		reserved = r.media.take(f.size, j.head, ctx.Done())
+		reserved := r.media.take(f.size, j.head, ctx.Done())
 		if !reserved && ctx.Err() != nil {
 			j.err = ctx.Err()
 			close(j.ready)
 			return
+		}
+		if reserved {
+			r.wg.Go(func() {
+				select {
+				case <-j.head:
+				case <-ctx.Done():
+				}
+				r.media.give(f.size)
+			})
 		}
 	}
 	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
@@ -762,13 +769,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	})
 	close(j.data)
 	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", f.size, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
-	if reserved {
-		select {
-		case <-j.retired:
-		case <-ctx.Done():
-		}
-		r.media.give(f.size)
-	}
 }
 
 func (r *slotReader) run() {
@@ -784,7 +784,7 @@ func (r *slotReader) run() {
 			window = 1
 		}
 		for next < head+int64(window) {
-			j := &readSlot{seq: next, head: make(chan struct{}), retired: make(chan struct{}), ready: make(chan struct{})}
+			j := &readSlot{seq: next, head: make(chan struct{}), ready: make(chan struct{})}
 			if prior := jobs[next-1]; prior != nil {
 				j.prior = prior.ready
 			}
@@ -810,7 +810,6 @@ func (r *slotReader) run() {
 				r.activeAt.Store(time.Now().UnixNano()) // ordered input keeps look-ahead eager
 			}
 		}
-		close(j.retired)
 		delete(jobs, head)
 		if j.err != nil {
 			if ctx.Err() == nil {
