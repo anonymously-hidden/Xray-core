@@ -424,6 +424,7 @@ func (w *slotWriter) run() {
 	defer close(w.done)
 	defer w.workers.Wait()
 	var seq int64
+	var mediaAt time.Time // keep bulk bursts out of inline waves between uploads
 	fences := make([]chan struct{}, len(w.table.Slots))
 	launch := func(chunk []byte) bool {
 		select {
@@ -446,6 +447,8 @@ func (w *slotWriter) run() {
 			if n == 0 {
 				w.first <- chunk
 			}
+		} else {
+			mediaAt = time.Now()
 		}
 		w.workers.Go(func() {
 			defer close(done)
@@ -483,7 +486,7 @@ func (w *slotWriter) run() {
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
-		if cooling || len(w.permits) >= slotBusyUploads || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
+		if cooling || len(w.permits) >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
 			inline = 0
 		}
 		for len(buf) > 0 {
@@ -592,6 +595,7 @@ type slotReader struct {
 
 type readSlot struct {
 	seq                  int64
+	prior                <-chan struct{} // previous frame's ready: ordered body admission
 	head, retired, ready chan struct{}
 	data                 chan []byte // published by ready; closed after the last verified block
 	end                  bool
@@ -716,6 +720,18 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	start := time.Now()
 	f, err := r.lookup(ctx, j)
+	found := time.Now()
+	// Discover concurrently, but reserve body bytes in sequence order.
+	if j.prior != nil {
+		select {
+		case <-j.prior:
+		case <-j.head:
+		case <-ctx.Done():
+			j.err = ctx.Err()
+			close(j.ready)
+			return
+		}
+	}
 	if err != nil || f.mode == slotErr || f.mode == slotEnd {
 		j.err, j.end = err, f.mode == slotEnd
 		if f.mode == slotErr {
@@ -733,18 +749,6 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	}
 	// A promoted head must never queue behind a prefetched successor. A tail
 	// holds its credit until retirement, even after a short or failed body.
-	found := time.Now()
-	// Four ranges of every large successor would swamp the head's connections.
-	// Prefetch their descriptions, but give only the ordered large frame a body.
-	if f.size > slotProgressiveMax {
-		select {
-		case <-j.head:
-		case <-ctx.Done():
-			j.err = ctx.Err()
-			close(j.ready)
-			return
-		}
-	}
 	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
 	reserved := false
 	if j.seq != r.head.Load() {
@@ -791,6 +795,9 @@ func (r *slotReader) run() {
 		}
 		for next < head+int64(window) {
 			j := &readSlot{seq: next, head: make(chan struct{}), retired: make(chan struct{}), ready: make(chan struct{})}
+			if prior := jobs[next-1]; prior != nil {
+				j.prior = prior.ready
+			}
 			jobs[next] = j
 			r.wg.Go(func() { r.fetch(ctx, j) })
 			next++

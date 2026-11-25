@@ -17,26 +17,29 @@ Mode 1 carries up to 14 KiB in metadata, mode 5 a media body, modes 3 and 4
 mean end and error. See "Transport model" below.
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
-  Input is gathered for 25 ms; after idle, a small write has a 2 ms window. The planner uses up to 24
-  available inline positions; larger bursts can use media. There are at most
-  32 upload workers per direction and never more than the ring depth. Reuse
-  requires both previous local completion and cumulative remote credit.
+  Input is gathered for 25 ms; after idle, a small write has a 2 ms window.
+  The planner uses up to 24 available inline positions; larger bursts can use
+  media. There are at most 32 upload workers per direction and never more than
+  the ring depth. For the eager window after a media upload starts (default 2 s),
+  later bursts do not split into inline waves even if few uploads remain.
+  Reuse requires previous local completion and cumulative remote credit.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
-   12 known descriptions are prefetched, with one metadata GET per worker at a
-   time. Only bodies through 512 KiB are prefetched, bounded to 4 MiB per media
-   connection and held through frame retirement. Larger bodies wait for their
-   ordered turn. Head media has separate HTTP permits (up to four), including
-   requests promoted while queued; it still uses the same media connections.
+  12 known descriptions are prefetched, with one metadata GET per worker at a
+  time. All media sizes may be prefetched; byte admission follows sequence
+  order, bounded to 4 MiB per media connection and held through retirement.
+  Ordinary media has four HTTP permits per connection (capped at 64); head
+  media has separate permits (up to four), including queued requests promoted
+  to head. Both use the same connections; the head bypasses the byte budget.
   Workers can finish out of order; one coordinator alone delivers bytes.
 - **Media:** frames through 512 KiB use one progressive GET; larger frames
-   use up to four block ranges at once, capped by the media connection count.
-   If the first range returns a full HTTP 200 body, keep it and cancel the other
-   ranges instead of downloading the full body four times. Validate every
-   block's sequence tag, HTTP range/length and EOF. One retry can resume an
-   incomplete span without delivering the same bytes twice. There is no
-   speculative media GET.
+  use up to four block ranges at once, capped by the media connection count.
+  If the first range returns a full HTTP 200 body, keep it and cancel the other
+  ranges instead of downloading the full body four times. Validate every
+  block's sequence tag, HTTP range/length and EOF. One retry can resume an
+  incomplete span without delivering the same bytes twice. No media GET runs
+  before discovering its frame description.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
   then flushes any remaining verified watermark. The peer may still have a full
@@ -78,15 +81,18 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    client download averaged ~0.22 MB/s). The byte bound,
    about one 4 MiB frame per connection, bounds payload bytes, not request count
    or duplicated network traffic. Head reads have separate HTTP permits, not
-   extra connections; only small look-ahead bodies compete with the head.
+   extra connections. Bounded look-ahead overlaps service latency between frames
+   instead of forcing one large frame to finish before starting the next.
 4. **Discover.** The reader polls the head slot's description (25 ms while
    active; no duplicate hedged GET) and prefetches up to 12 descriptions. Bodies
-   through 512 KiB download ahead within the byte budget; larger bodies wait for
-   the head. The head bypasses that budget, and a queued media request switches
-   to the reserved HTTP permits when promoted.
+   of all sizes download ahead within the byte budget, admitted in sequence
+   order so distant successors cannot reserve it before nearer frames. The head
+   bypasses that budget, and a queued media request switches to the reserved
+   HTTP permits when promoted. Admission waits for the previous frame's ready
+   signal, not its completed download.
 5. **Fetch.** Media up to 512 KiB uses one streaming GET; larger frames use
    up to four block-aligned ranges (no more than the media connection count),
-   all started at once for the ordered large frame: every block carries
+   all started at once for each admitted large frame: every block carries
    the sequence tag, so each range rejects an older lap by itself (before,
    later ranges waited for the first one, costing a second time-to-first-byte,
    ~1 s, per large frame).
@@ -98,9 +104,11 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    frames or 1.5 s. A slot is rewritten only after that credit. Frame size
    changes are logged at debug level (`xdrive frame size A -> B`), as is
    each media frame: `xdrive upload seq` (credit wait, PUT time) and
-   `xdrive read seq` (time to find, ordered-turn/byte-budget wait, body time).
+   `xdrive read seq` (time to find, admission/byte-budget wait, body time).
    `xdrive watermark seq N put P` records successful ACK publications, and
    `xdrive credit seq N ack A` records the writer observing newer credit.
+   `xdrive span seq` records range status, wire bytes, time waiting for headers
+   (including permit wait, retries and service latency), and time after headers.
 
 There are no CRCs: integrity relies on TLS, the length checks and the
 per-block sequence tags, and VLESS encryption authenticates the payload. Both
@@ -209,8 +217,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1033 |
-| `slots.go` | whole file | 882 |
+| `drive.go` | whole file | 1040 |
+| `slots.go` | whole file | 889 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -219,4 +227,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2979** |
+| **Total** | | **2993** |

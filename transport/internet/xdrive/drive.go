@@ -98,7 +98,9 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
-	for i, limit := range [laneCount]int{48, 8, 24} {
+	// Four ordinary media requests per connection hide request latency;
+	// the byte budget and separate head permits bound speculative load.
+	for i, limit := range [laneCount]int{48, 8, min(driveMaxInflight, 4*int(driveMediaConns(config.Xmux)))} {
 		s.pools[i] = newConnPool(config.Xmux, [laneCount]int32{0, 0, driveMediaConns(config.Xmux)}[i], client)
 		s.permits[i] = make(chan struct{}, limit)
 	}
@@ -687,7 +689,9 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
 		}
 		bodyFailed := false
+		started := time.Now()
 		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, false, func(resp *http.Response) error {
+			headers := time.Now()
 			bodyFailed = true
 			from, to, length := first, hi, end-start
 			switch resp.StatusCode {
@@ -737,6 +741,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
 				return errors.New("Drive media did not end at the declared length").Base(err)
 			}
+			errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
 			return nil
 		})
 		if err == nil || attempt != 0 || (!bodyFailed && err != errNotFound && err != errDriveRange) || ctx.Err() != nil {
