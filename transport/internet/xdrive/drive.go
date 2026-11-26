@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xtls/xray-core/common/dice"
@@ -428,20 +429,18 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 		}
 		permits := s.permits[lane]
 		head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{}) // only frame GETs carry this
-		if isClosedChan(head) {
-			permits, head = s.headMedia, nil
-		}
-		select {
-		case permits <- struct{}{}:
-		case <-head: // A queued look-ahead request has become the ordered head.
-			permits = s.headMedia
+	acquire:
+		for {
+			if isClosedChan(head) {
+				permits, head = s.headMedia, nil
+			}
 			select {
 			case permits <- struct{}{}:
+				break acquire
+			case <-head: // Promotion switches the queue without restarting the GET.
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-		case <-ctx.Done():
-			return ctx.Err()
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-permits }()
@@ -641,6 +640,7 @@ type (
 	watermarkWrite struct{} // headKey value for the sole cumulative ACK writer
 	mediaHeadKey   struct{} // <-chan struct{}, closed on promotion
 	mediaSeqKey    struct{} // int64, for request retry diagnostics
+	spanRescueKey  struct{} // func() bool, installed only for the first range's first attempt
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
@@ -760,7 +760,8 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 		if err == nil || attempt != 0 || (!bodyFailed && err != errNotFound && err != errDriveRange) || ctx.Err() != nil {
 			return err
 		}
-		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " err ", err)
+		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " elapsed ", time.Since(started), " err ", err)
+		ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // One shortened timeout, never on the resume.
 		if err := sleepContext(ctx, driveInitialBackoff); err != nil {
 			return err
 		}
@@ -770,47 +771,40 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 // Frames through slotProgressiveMax use one progressive GET. Larger frames
 // use up to four block ranges at once, targeting at least 512 KiB per range.
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
-	if f.size <= 0 || f.mode != slotStream {
-		return errors.New("invalid Drive stream frame")
-	}
 	n := slotBlocks(f.size)
-	if f.size <= slotProgressiveMax || s.cooling() {
+	count := min(cap(s.headMedia), f.size/(2*slotTagBlock))
+	if f.size <= slotProgressiveMax || count < 2 || s.cooling() {
 		return s.readSpan(ctx, id, f, 0, n, emit, nil)
 	}
-	ctx, cancel := context.WithCancel(ctx)
 	tailCtx, stopTails := context.WithCancel(ctx)
-	defer stopTails()
 	var wg sync.WaitGroup
-	defer func() {
-		cancel()
-		wg.Wait()
-	}()
+	defer wg.Wait()
+	defer stopTails()
 	type part struct {
-		chunks chan []byte
+		chunks slotChunks
 		err    error // published by close(chunks)
-		full   bool
 	}
-	parts := make([]part, min(cap(s.headMedia), f.size/(2*slotTagBlock)))
+	parts := make([]part, count-1) // Only successors need a reorder buffer.
+	var tailReady atomic.Bool
 	for i := range parts {
-		lo, hi := i*n/len(parts), (i+1)*n/len(parts)
+		lo, hi := (i+1)*n/count, (i+2)*n/count
 		p := &parts[i]
 		p.chunks = make(chan []byte, (hi-lo)*(slotTagBlock/slotReadChunk)+1)
 		wg.Go(func() {
 			defer close(p.chunks)
-			spanCtx := tailCtx
-			var whole func()
-			if i == 0 {
-				spanCtx, whole = ctx, func() { p.full = true; stopTails() }
+			p.err = s.readSpan(tailCtx, id, f, lo, hi, p.chunks.emit, nil)
+			if p.err == nil {
+				tailReady.Store(true)
 			}
-			p.err = s.readSpan(spanCtx, id, f, lo, hi, func(b []byte) error {
-				select {
-				case p.chunks <- b:
-					return nil
-				case <-spanCtx.Done():
-					return spanCtx.Err()
-				}
-			}, whole)
 		})
+	}
+	head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{})
+	ctx = context.WithValue(ctx, spanRescueKey{}, func() bool { return tailReady.Load() && isClosedChan(head) && !s.cooling() })
+	if err := s.readSpan(ctx, id, f, 0, n/count, emit, stopTails); err != nil {
+		return err
+	}
+	if tailCtx.Err() != nil { // Full-body fallback unless the parent was canceled.
+		return ctx.Err()
 	}
 	for i := range parts {
 		p := &parts[i]
@@ -821,9 +815,6 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		}
 		if p.err != nil {
 			return p.err
-		}
-		if p.full {
-			return nil
 		}
 	}
 	return nil

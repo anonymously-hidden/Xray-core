@@ -42,20 +42,27 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	ctx, cancel := context.WithCancelCause(r.Context())
 	var timerMu sync.Mutex
 	ended := false
-	deadline := time.Now().Add(t.stall)
-	timer := time.AfterFunc(t.stall, func() {
+	rescue, _ := ctx.Value(spanRescueKey{}).(func() bool)
+	gap := t.stall
+	last := time.Now()
+	var timer *time.Timer
+	timer = time.AfterFunc(gap, func() {
 		timerMu.Lock()
 		defer timerMu.Unlock()
-		if !ended && !time.Now().Before(deadline) {
-			cancel(errStalled)
+		if idle := time.Since(last); !ended && idle >= gap {
+			if idle >= t.stall || rescue != nil && rescue() {
+				cancel(errStalled)
+			} else {
+				timer.Reset(min(gap, t.stall-idle))
+			}
 		}
 	})
 	alive := func() {
 		timerMu.Lock()
 		defer timerMu.Unlock()
 		if !ended {
-			deadline = time.Now().Add(t.stall)
-			timer.Reset(t.stall)
+			last = time.Now()
+			timer.Reset(gap)
 		}
 	}
 	end := func() {
@@ -88,6 +95,11 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		err = stalled(ctx, err)
 		end()
 		return nil, err
+	}
+	if rescue != nil && resp.StatusCode == http.StatusPartialContent {
+		timerMu.Lock()
+		gap = min(gap, 5*time.Second) // Only a head 206 body with a verified successor can resume early.
+		timerMu.Unlock()
 	}
 	alive()
 	resp.Body = &progressBody{ReadCloser: resp.Body, alive: alive, end: end, ctx: ctx}

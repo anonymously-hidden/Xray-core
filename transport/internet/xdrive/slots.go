@@ -587,10 +587,15 @@ type readSlot struct {
 	seq         int64
 	prior       <-chan struct{} // previous frame's ready: ordered body admission
 	head, ready chan struct{}
-	data        chan []byte // published by ready; closed after the last verified block
+	data        slotChunks // published by ready; closed after the last verified block
 	end         bool
 	err         error // published by closing ready (no data) or data
 }
+
+// Each queue fits its entire verified span, including a short first piece. Resumes skip emitted bytes.
+type slotChunks chan []byte
+
+func (ch slotChunks) emit(b []byte) error { ch <- b; return nil }
 
 func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
 	r := &slotReader{
@@ -757,14 +762,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
 	close(j.ready)
 	got := time.Now()
-	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, func(b []byte) error {
-		select {
-		case j.data <- b:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	})
+	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data.emit)
 	close(j.data)
 	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", f.size, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
 }

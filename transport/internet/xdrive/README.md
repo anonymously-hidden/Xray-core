@@ -112,6 +112,13 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    are canceled before any of their bytes are delivered. Bytes are delivered
    in pieces of up to 4 KiB at offset zero, then up to 32 KiB. One retry resumes
    after the delivered bytes; the declared length and exact EOF are checked.
+   For a multi-range frame, the first range streams straight into the frame queue.
+   On its first HTTP 206 body, five seconds without a successful body read triggers
+   a check: if this frame is the ordered head, a later range has already verified
+   through EOF, and Drive is not cooling down, cancel this GET and use its existing
+   resume. Otherwise keep waiting and recheck. Every positive body read restarts
+   the idle clock, even one smaller than a payload piece. Waiting for headers,
+   full-body fallbacks, and resumed reads retain the ordinary stall timeout.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
    frames or 1.5 s. A slot is rewritten only after that credit. Frame size
    changes are logged at debug level (`xdrive frame size A -> B`), as is
@@ -121,7 +128,7 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    `xdrive credit seq N ack A` records the writer observing newer credit.
    `xdrive span seq` records range status, wire bytes, time waiting for headers
    (including permit wait, retries and service latency), and time after headers.
-   `xdrive span retry seq` records emitted payload bytes and the error that
+   `xdrive span retry seq` records emitted payload bytes, attempt duration and the error that
    triggered the one stream resume; successful final reads can hide this error.
    `xdrive request retry seq` exposes retries before headers or buffered success.
    `xdrive cooldown D` records the shared delay after quota/service rejections.
@@ -200,6 +207,14 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
+Against a local TLS Drive mock, two Go peers transferred four 12 MiB + 581 byte
+responses on one session. With a blocked first range and a verified successor,
+the receiver issued one resume after 5.2 s, starting at the next tagged block
+(wire offset 262,152). A steadily trickling first body, a silent first body
+without a verified successor, and a first range answered with a full HTTP 200
+all completed without a resume. All four payloads matched byte-for-byte.
+This measures the injected stall, not live Drive latency.
+
 The ACK recovery check used two Go peers and a local TLS Drive mock. A committed
 watermark PATCH lost its reply; its readback was delayed 3.5 s. One session
 delivered a 5 MiB + 301 byte response and 21 small responses byte-for-byte,
@@ -273,9 +288,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1054 |
-| `slots.go` | whole file | 877 |
-| `client.go` | whole file | 541 |
+| `drive.go` | whole file | 1045 |
+| `slots.go` | whole file | 875 |
+| `client.go` | whole file | 553 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
 | `params.go` | 75–91 | 17 |
@@ -283,4 +298,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2999** |
+| **Total** | | **3000** |
