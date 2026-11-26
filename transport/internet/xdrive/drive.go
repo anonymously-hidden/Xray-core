@@ -469,6 +469,9 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			}
 			resp, err := s.clients[lane].Do(req)
 			if err != nil {
+				if errors.Cause(err) == errStalled {
+					ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // Ordinary timeout on subsequent HTTP attempts.
+				}
 				return method == http.MethodGet && errors.Cause(err) != errSessionClosed, err
 			}
 			defer resp.Body.Close()
@@ -640,7 +643,7 @@ type (
 	watermarkWrite struct{} // headKey value for the sole cumulative ACK writer
 	mediaHeadKey   struct{} // <-chan struct{}, closed on promotion
 	mediaSeqKey    struct{} // int64, for request retry diagnostics
-	spanRescueKey  struct{} // func() bool, installed only for the first range's first attempt
+	spanRescueKey  struct{} // func() bool for a multi-range GET, cleared on span resume
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
@@ -687,7 +690,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 
 // readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
 // One retry resumes at its first unemitted block and still proves exact EOF.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, emit func([]byte) error, whole func()) error {
+func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole func()) error {
 	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
 	const stride = slotBodyHeader + slotTagBlock
 	n := slotBlocks(f.size)
@@ -741,10 +744,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 						return err
 					}
 					if at+len(b) > pos && at < stop { // skip bytes already emitted
-						if err := emit(b[max(pos-at, 0):min(len(b), stop-at)]); err != nil {
-							bodyFailed = false
-							return err
-						}
+						out <- b[max(pos-at, 0):min(len(b), stop-at)] // Queue fits the entire verified span.
 						pos = min(at+len(b), stop)
 					}
 					at += len(b)
@@ -761,7 +761,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			return err
 		}
 		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " elapsed ", time.Since(started), " err ", err)
-		ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // One shortened timeout, never on the resume.
+		ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // Never shorten the resume.
 		if err := sleepContext(ctx, driveInitialBackoff); err != nil {
 			return err
 		}
@@ -770,48 +770,51 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 
 // Frames through slotProgressiveMax use one progressive GET. Larger frames
 // use up to four block ranges at once, targeting at least 512 KiB per range.
-func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, emit func([]byte) error) error {
+func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, out chan<- []byte) error {
 	n := slotBlocks(f.size)
 	count := min(cap(s.headMedia), f.size/(2*slotTagBlock))
 	if f.size <= slotProgressiveMax || count < 2 || s.cooling() {
-		return s.readSpan(ctx, id, f, 0, n, emit, nil)
+		return s.readSpan(ctx, id, f, 0, n, out, nil)
 	}
 	tailCtx, stopTails := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer stopTails()
 	type part struct {
-		chunks slotChunks
+		chunks chan []byte
 		err    error // published by close(chunks)
 	}
-	parts := make([]part, count-1) // Only successors need a reorder buffer.
-	var tailReady atomic.Bool
+	parts := make([]part, count-1)       // Only successors need a reorder buffer.
+	var draining, verified atomic.Uint32 // Current range index and bitmap of fully verified successors.
+	head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{})
+	forRange := func(ctx context.Context, i uint32) context.Context {
+		return context.WithValue(ctx, spanRescueKey{}, func() bool {
+			return isClosedChan(head) && draining.Load() == i && verified.Load()>>(i+1) != 0 && !s.cooling()
+		})
+	}
 	for i := range parts {
 		lo, hi := (i+1)*n/count, (i+2)*n/count
 		p := &parts[i]
 		p.chunks = make(chan []byte, (hi-lo)*(slotTagBlock/slotReadChunk)+1)
 		wg.Go(func() {
 			defer close(p.chunks)
-			p.err = s.readSpan(tailCtx, id, f, lo, hi, p.chunks.emit, nil)
+			p.err = s.readSpan(forRange(tailCtx, uint32(i+1)), id, f, lo, hi, p.chunks, nil)
 			if p.err == nil {
-				tailReady.Store(true)
+				verified.Or(1 << (i + 1))
 			}
 		})
 	}
-	head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{})
-	ctx = context.WithValue(ctx, spanRescueKey{}, func() bool { return tailReady.Load() && isClosedChan(head) && !s.cooling() })
-	if err := s.readSpan(ctx, id, f, 0, n/count, emit, stopTails); err != nil {
+	if err := s.readSpan(forRange(ctx, 0), id, f, 0, n/count, out, stopTails); err != nil {
 		return err
 	}
 	if tailCtx.Err() != nil { // Full-body fallback unless the parent was canceled.
 		return ctx.Err()
 	}
 	for i := range parts {
+		draining.Store(uint32(i + 1))
 		p := &parts[i]
 		for b := range p.chunks {
-			if err := emit(b); err != nil {
-				return err
-			}
+			out <- b
 		}
 		if p.err != nil {
 			return p.err

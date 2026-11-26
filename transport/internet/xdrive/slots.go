@@ -96,7 +96,7 @@ type slotStore interface {
 	createSlot(context.Context, string, string, string, []byte) error
 	setSlot(context.Context, string, string, []byte) error
 	readDescription(context.Context, string) (string, error)
-	readFrameStream(context.Context, string, slotFrame, func([]byte) error) error
+	readFrameStream(context.Context, string, slotFrame, chan<- []byte) error
 }
 
 // A slot description identifies its sequence and either carries the payload
@@ -383,9 +383,6 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 		if ok {
 			break
 		}
-		if time.Since(since) > slotStrainWait {
-			w.strained.Store(true)
-		}
 		if time.Since(since) > slotStallTimeout && time.Since(w.closeProgress()) > slotStallTimeout {
 			return errors.New("timed out waiting for receiver watermark").Base(err)
 		}
@@ -397,6 +394,9 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 		return err
 	}
 	credited := time.Now()
+	if credited.Sub(since) > slotStrainWait {
+		w.strained.Store(true) // Signal once when this wait ends, not on every poll while blocked.
+	}
 	if err := w.table.publish(w.ctx, w.store, seq, mode, chunk); err != nil {
 		// A lost reply is not a refusal: never overwrite possibly committed data.
 		if _, refused := err.(refusedPayload); refused && w.ctx.Err() == nil {
@@ -476,7 +476,8 @@ func (w *slotWriter) run() {
 		unit := min(frame, slotInlineLimit)
 		wave := min(24, cap(w.permits)-len(w.permits))
 		inline := min(len(buf), wave*unit)
-		if cooling || len(w.permits) >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
+		pair := wave >= 2 && len(buf) <= 2*unit && len(w.permits) < 2*slotBusyUploads
+		if cooling || !pair && (len(w.permits) >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow) || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
 			inline = 0
 		}
 		for len(buf) > 0 {
@@ -587,15 +588,10 @@ type readSlot struct {
 	seq         int64
 	prior       <-chan struct{} // previous frame's ready: ordered body admission
 	head, ready chan struct{}
-	data        slotChunks // published by ready; closed after the last verified block
+	data        chan []byte // published by ready; closed after the last verified block
 	end         bool
 	err         error // published by closing ready (no data) or data
 }
-
-// Each queue fits its entire verified span, including a short first piece. Resumes skip emitted bytes.
-type slotChunks chan []byte
-
-func (ch slotChunks) emit(b []byte) error { ch <- b; return nil }
 
 func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
 	r := &slotReader{
@@ -762,7 +758,7 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
 	close(j.ready)
 	got := time.Now()
-	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data.emit)
+	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data)
 	close(j.data)
 	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", f.size, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
 }

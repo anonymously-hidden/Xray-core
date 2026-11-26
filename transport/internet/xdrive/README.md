@@ -69,14 +69,19 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
    and doubles after each round that filled a whole frame, up to 4 MiB (below
    Drive's 5 MB multipart limit). It halves (not below the start) when an
-   upload waited more than 5 s for ring credit outside Drive cooldown.
+   upload acquired credit after waiting more than 5 s outside Drive cooldown.
+   A blocked worker reports strain once on acquiring credit, not every poll.
    Cooldown freezes frame size instead of shrinking it: smaller frames spend
    more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
    the writer is a ring ahead. Larger frames carry more bytes per position.
 3. **Publish.** Up to 14 KiB goes inline in a file description. Idle bursts
    can use several available inline positions, avoiding a media GET. The
-   planner suppresses inline waves while streaming, during cooldown and for
-   the eager window after a media upload starts (2 s by default). A media frame
+   planner suppresses large inline waves while streaming and for the eager
+   window after a media upload starts (2 s by default). A whole burst that
+   fits in two inline slots (up to 28 KiB at the defaults) can still split if
+   two upload permits are free and fewer than eight uploads are in flight.
+   This exchanges one extra slot publication for avoiding a dependent media GET.
+   During cooldown the writer does not split bursts into inline waves. A media frame
    is one multipart create or PATCH: the description holds `XDRVSL03`, sequence, mode
    and length; the body is blocks of an 8-byte sequence tag followed by up to
    256 KiB of data. At most 32 uploads and
@@ -113,12 +118,14 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    in pieces of up to 4 KiB at offset zero, then up to 32 KiB. One retry resumes
    after the delivered bytes; the declared length and exact EOF are checked.
    For a multi-range frame, the first range streams straight into the frame queue.
-   On its first HTTP 206 body, five seconds without a successful body read triggers
-   a check: if this frame is the ordered head, a later range has already verified
-   through EOF, and Drive is not cooling down, cancel this GET and use its existing
-   resume. Otherwise keep waiting and recheck. Every positive body read restarts
-   the idle clock, even one smaller than a payload piece. Waiting for headers,
-   full-body fallbacks, and resumed reads retain the ordinary stall timeout.
+   Each range checks after five seconds without headers or new HTTP 206 body bytes.
+   It can restart early only if its frame is the ordered head, the coordinator is
+   draining this specific range, a **later** range has verified through EOF, and
+   Drive is not cooling down. This also covers a middle range once its predecessors
+   finish. An interrupted header wait uses the existing HTTP GET retry budget;
+   a partial body uses the existing single offset-aware resume. After a stall
+   triggers a retry, subsequent attempts use the ordinary timeout. Any positive
+   body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
    frames or 1.5 s. A slot is rewritten only after that credit. Frame size
    changes are logged at debug level (`xdrive frame size A -> B`), as is
@@ -207,6 +214,14 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
+Two race-instrumented Go peers against a loopback TLS Drive mock delivered an
+18,000-byte browsing response tail after a media upload via two inline descriptions
+(14,336 and 3,841 transport bytes). Five 12 MiB + 581 byte responses on the
+same session then exercised a blocked middle range before headers (one retry at
+5.11 s) and after a partial body (one block-aligned resume at 5.20 s), no
+verified later range, steady body progress and HTTP 200 fallback. The latter
+three needed no early retry; all payloads matched. These are not live Drive timings.
+
 Against a local TLS Drive mock, two Go peers transferred four 12 MiB + 581 byte
 responses on one session. With a blocked first range and a verified successor,
 the receiver issued one resume after 5.2 s, starting at the next tagged block
@@ -288,9 +303,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1045 |
-| `slots.go` | whole file | 875 |
-| `client.go` | whole file | 553 |
+| `drive.go` | whole file | 1048 |
+| `slots.go` | whole file | 871 |
+| `client.go` | whole file | 554 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
 | `params.go` | 75–91 | 17 |

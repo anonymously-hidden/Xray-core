@@ -38,14 +38,17 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if r.URL.Scheme == "https" {
 		next = t.secure
 	}
-
 	ctx, cancel := context.WithCancelCause(r.Context())
 	var timerMu sync.Mutex
 	ended := false
 	rescue, _ := ctx.Value(spanRescueKey{}).(func() bool)
 	gap := t.stall
+	if rescue != nil {
+		gap = min(gap, 5*time.Second) // Includes the network wait for headers; admission and pacing precede RoundTrip.
+	}
 	last := time.Now()
 	var timer *time.Timer
+	timerMu.Lock()
 	timer = time.AfterFunc(gap, func() {
 		timerMu.Lock()
 		defer timerMu.Unlock()
@@ -57,10 +60,14 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 			}
 		}
 	})
-	alive := func() {
+	timerMu.Unlock()
+	alive := func(ordinary bool) {
 		timerMu.Lock()
 		defer timerMu.Unlock()
 		if !ended {
+			if ordinary {
+				gap = t.stall
+			}
 			last = time.Now()
 			timer.Reset(gap)
 		}
@@ -96,12 +103,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		end()
 		return nil, err
 	}
-	if rescue != nil && resp.StatusCode == http.StatusPartialContent {
-		timerMu.Lock()
-		gap = min(gap, 5*time.Second) // Only a head 206 body with a verified successor can resume early.
-		timerMu.Unlock()
-	}
-	alive()
+	alive(resp.StatusCode != http.StatusPartialContent)
 	resp.Body = &progressBody{ReadCloser: resp.Body, alive: alive, end: end, ctx: ctx}
 	return resp, nil
 }
@@ -127,11 +129,10 @@ func stalled(ctx context.Context, err error) error {
 
 type progressBody struct {
 	io.ReadCloser
-	alive  func()
+	alive  func(bool)
 	end    func()
 	upload bool
-	// ctx is that of the request, for the body of its response
-	ctx context.Context
+	ctx    context.Context // response request context
 }
 
 func (b *progressBody) Read(p []byte) (int, error) {
@@ -141,7 +142,7 @@ func (b *progressBody) Read(p []byte) (int, error) {
 	}
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {
-		b.alive()
+		b.alive(false)
 	}
 	if err != nil && err != io.EOF && b.ctx != nil {
 		err = stalled(b.ctx, err)
