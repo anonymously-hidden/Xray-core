@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	slotMagic        = "XDRVSL03"
+	slotMagic        = "XDRVSL04"
 	slotHeaderLen    = len(slotMagic) + 13
 	slotInlineLimit  = 14 << 10
 	slotInline       = 1
@@ -125,7 +125,8 @@ func decodeSlot(description string) (slotFrame, bool) {
 		f.data = b[slotHeaderLen:]
 		return f, f.size > 0 && f.size <= slotInlineLimit && len(f.data) == f.size
 	case slotStream:
-		return f, f.size > 0 && len(b) == slotHeaderLen
+		f.data = b[slotHeaderLen:] // Optional leading payload; the tagged body carries the rest.
+		return f, len(f.data) < f.size && len(f.data) <= slotInlineLimit
 	case slotEnd, slotErr:
 		return f, f.size == 0 && len(b) == slotHeaderLen
 	}
@@ -190,6 +191,9 @@ func (t slotTable) publish(ctx context.Context, store *driveStorage, seq int64, 
 	f := slotFrame{seq: seq, mode: mode, size: len(data)}
 	var body []byte
 	if mode == slotStream {
+		if len(data) <= slotTagBlock {
+			f.data, data = data[:slotInlineLimit], data[slotInlineLimit:]
+		}
 		body = make([]byte, 0, len(data)+slotBodyHeader*slotBlocks(len(data)))
 		for block := range slices.Chunk(data, slotTagBlock) {
 			body = binary.BigEndian.AppendUint64(body, uint64(seq))
@@ -198,10 +202,11 @@ func (t slotTable) publish(ctx context.Context, store *driveStorage, seq int64, 
 	} else if mode == slotInline {
 		f.data = data
 	}
+	name := ""
 	if t.lazy && seq < int64(len(t.Slots)) {
-		return store.createSlot(ctx, t.Slots[idx], t.name+"/s"+strconv.Itoa(idx), f.encode(), body)
+		name = t.name + "/s" + strconv.Itoa(idx)
 	}
-	return store.setSlot(ctx, t.Slots[idx], f.encode(), body)
+	return store.writeFile(ctx, t.Slots[idx], name, f.encode(), body)
 }
 
 // Outbound: run assigns sequence numbers and owns the coalescing buffer.
@@ -218,8 +223,7 @@ type slotWriter struct {
 	first               chan []byte
 	closeOnce           sync.Once
 	workers             sync.WaitGroup
-	mu                  sync.Mutex
-	progress            time.Time
+	progress            atomic.Pointer[time.Time]
 	wmMu                sync.Mutex
 	acked               int64
 	checked             time.Time
@@ -234,21 +238,17 @@ func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store *dri
 		input: make(chan []byte), writeToken: make(chan struct{}, 1),
 		permits: make(chan struct{}, min(len(table.Slots), 32)),
 		stop:    make(chan struct{}), done: make(chan struct{}),
-		first: make(chan []byte, 1), acked: -1, progress: time.Now(),
+		first: make(chan []byte, 1), acked: -1,
 		frame: min(p.segmentBytes, slotMaxFrame), flight: newByteBudget(p.flightBytes),
 	}
+	w.markProgress()
 	go w.run()
 	return w
 }
 
-// Both directions observe the first fatal error, but END leaves the other half open.
-func (w *slotWriter) Err() error { return context.Cause(w.ctx) }
-
 func (w *slotWriter) stopped() error {
-	return cmp.Or(w.Err(), io.ErrClosedPipe)
+	return cmp.Or(context.Cause(w.ctx), io.ErrClosedPipe)
 }
-
-func (w *slotWriter) Write(p []byte) (int, error) { return w.writeUntil(p, nil, nil) }
 
 func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error) {
 	select {
@@ -290,15 +290,8 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 }
 
 func (w *slotWriter) markProgress() {
-	w.mu.Lock()
-	w.progress = time.Now()
-	w.mu.Unlock()
-}
-
-func (w *slotWriter) closeProgress() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.progress
+	now := time.Now()
+	w.progress.Store(&now)
 }
 
 var errDriveWatermark = errors.New("invalid receiver watermark")
@@ -356,7 +349,7 @@ func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chu
 		if ok {
 			break
 		}
-		if time.Since(since) > slotStallTimeout && time.Since(w.closeProgress()) > slotStallTimeout {
+		if time.Since(since) > slotStallTimeout && time.Since(*w.progress.Load()) > slotStallTimeout {
 			return errors.New("timed out waiting for receiver watermark").Base(err)
 		}
 		if err := sleepContext(w.ctx, 30*time.Millisecond); err != nil {
@@ -434,7 +427,7 @@ func (w *slotWriter) run() {
 	base := w.frame
 	flush := func() bool {
 		timer.Stop()
-		frame, full := w.frame, len(buf) >= w.frame
+		frame, full := w.frame, len(buf) == w.frame
 		// Credit strain reduces bytes; request quotas need larger frames, not smaller.
 		strained, cooling := w.strained.Swap(false), w.store.cooling()
 		if strained && !cooling {
@@ -446,17 +439,22 @@ func (w *slotWriter) run() {
 			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
 		busy := len(w.permits)
-		inline := inlinePrefix(len(buf), frame, busy, cap(w.permits)-busy, time.Since(mediaAt) < w.eagerWindow, cooling)
-		for len(buf) > 0 {
-			n := min(len(buf), frame)
-			if inline > 0 {
-				n = min(inline, n, slotInlineLimit)
-				inline -= n
-			}
-			if !launch(buf[:n:n]) {
+		wave := min(slotReadAhead, cap(w.permits)-busy)
+		if busy >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow {
+			wave = min(wave, 4)
+		}
+		// Only a partial frame with a full idle wave may send an inline lead.
+		inline := min(len(buf), wave*slotInlineLimit)
+		if cooling || busy >= 2*slotBusyUploads || inline < len(buf) && (full || wave < slotReadAhead) {
+			inline = 0
+		}
+		for chunk := range slices.Chunk(buf[:inline], slotInlineLimit) {
+			if !launch(chunk) {
 				return false
 			}
-			buf = buf[n:]
+		}
+		if inline < len(buf) && !launch(buf[inline:]) {
+			return false
 		}
 		buf = nil // the upload workers own their slices
 		return true
@@ -478,18 +476,23 @@ func (w *slotWriter) run() {
 			return
 		case b := <-w.input:
 			lastIn = time.Now()
-			if len(buf) == 0 {
-				buf, bufAt = b, lastIn
-				d := w.flushInterval
-				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !w.store.cooling() {
-					d = min(d, 2*time.Millisecond)
+			for len(b) > 0 {
+				// Carry overflow into the next gather instead of publishing a tiny tail at every boundary.
+				n := min(len(b), w.frame-len(buf))
+				if len(buf) == 0 {
+					buf, bufAt = b[:n:n], lastIn
+					d := w.flushInterval
+					if len(w.permits) == 0 && n <= slotInlineLimit && !w.store.cooling() {
+						d = min(d, 2*time.Millisecond)
+					}
+					timer.Reset(d)
+				} else {
+					buf = append(buf, b[:n]...)
 				}
-				timer.Reset(d)
-			} else {
-				buf = append(buf, b...)
-			}
-			if len(buf) >= w.frame && !flush() {
-				return
+				b = b[n:]
+				if len(buf) == w.frame && !flush() {
+					return
+				}
 			}
 		case <-timer.C:
 			// Streaming: keep gathering toward a full frame while input keeps
@@ -506,24 +509,10 @@ func (w *slotWriter) run() {
 	}
 }
 
-// inlinePrefix is the part of a burst to send as inline slots. Busy large
-// transfers use media; modest bursts can spend spare slots to avoid a body GET.
-func inlinePrefix(size, frame, busy, free int, recentMedia, cooling bool) int {
-	unit, wave := min(frame, slotInlineLimit), min(slotReadAhead, free)
-	capacity := wave * unit
-	if cooling || size > capacity && (wave < slotReadAhead || size > frame) {
-		return 0
-	}
-	if (busy >= slotBusyUploads || recentMedia) && (busy >= 2*slotBusyUploads || size > min(wave, 4)*unit) {
-		return 0
-	}
-	return min(size, capacity)
-}
-
 func (w *slotWriter) Close() error {
 	w.closeOnce.Do(func() { close(w.stop) })
 	<-w.done // Conn.Close owns the watchdog for the entire shutdown.
-	return w.Err()
+	return context.Cause(w.ctx)
 }
 
 func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
@@ -552,13 +541,13 @@ type slotReader struct {
 	store   *driveStorage
 	table   slotTable
 	params
-	ch                       chan []byte
-	wake, ack                chan struct{}
-	media                    *byteBudget // bodies downloaded ahead of the head
-	head, frontier, activeAt atomic.Int64
-	drainCredit              atomic.Pointer[time.Time] // last credit returned during Close
-	probing                  atomic.Bool
-	wg                       sync.WaitGroup
+	ch                                 chan []byte
+	wake, ack                          chan struct{}
+	media                              *byteBudget // bodies downloaded ahead of the head
+	head, frontier, verified, activeAt atomic.Int64
+	drainCredit                        atomic.Pointer[time.Time] // last credit returned during Close
+	probing                            atomic.Bool
+	wg                                 sync.WaitGroup
 }
 
 type readSlot struct {
@@ -569,13 +558,6 @@ type readSlot struct {
 	reserved    int         // published by ready; returned by the ordered reader
 	end         bool
 	err         error // published by closing ready (no data) or data
-}
-
-func (j *readSlot) release(b *byteBudget) {
-	if j.reserved > 0 {
-		b.give(j.reserved)
-		j.reserved = 0
-	}
 }
 
 func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store *driveStorage, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
@@ -615,8 +597,8 @@ func (r *slotReader) Err() error {
 	return cmp.Or(context.Cause(r.ctx), io.EOF)
 }
 
-func (r *slotReader) observe(n int64) {
-	for old := r.frontier.Load(); old < n && !r.frontier.CompareAndSwap(old, n); old = r.frontier.Load() {
+func advance(counter *atomic.Int64, n int64) {
+	for old := counter.Load(); old < n && !counter.CompareAndSwap(old, n); old = counter.Load() {
 	}
 }
 
@@ -642,7 +624,7 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 			}
 			if err == nil && ok && f.seq == job.seq {
 				r.activeAt.Store(time.Now().UnixNano())
-				r.observe(f.seq)
+				advance(&r.frontier, f.seq)
 				return f, nil
 			}
 			if err == errDriveScope || isAuthError(err) {
@@ -658,7 +640,7 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 					defer cancel()
 					d, err := r.store.readDescription(probe, r.table.Slots[idx])
 					if f, ok := decodeSlot(d); err == nil && ok && f.seq > job.seq && f.seq%depth == idx {
-						r.observe(f.seq)
+						advance(&r.frontier, f.seq)
 						r.Wake()
 					}
 				})
@@ -703,22 +685,16 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 		close(j.ready)
 		return
 	}
-	switch f.mode {
-	case slotInline:
-		j.data = make(chan []byte, 1)
-		j.data <- f.data
-		close(j.data)
-	case slotErr:
-		err = errors.New("peer could not store segment ", j.seq)
-	}
-	if f.mode != slotStream {
+	if f.size == 0 {
 		j.err, j.end = err, f.mode == slotEnd
+		if f.mode == slotErr {
+			j.err = errors.New("peer could not store segment ", j.seq)
+		}
 		close(j.ready)
 		return
 	}
 	// The ordered head has its own allowance; only successors use look-ahead bytes.
-	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
-	if j.seq != r.head.Load() {
+	if f.mode == slotStream && j.seq != r.head.Load() {
 		if r.media.take(f.size, j.head, ctx.Done()) {
 			j.reserved = f.size
 		} else if ctx.Err() != nil {
@@ -727,25 +703,31 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 			return
 		}
 	}
-	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
+	total := f.size // Media offsets exclude the prefix in the description.
+	f.size -= len(f.data)
+	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+2) // prefix, tagged pieces and short first read
+	if len(f.data) != 0 {
+		j.data <- f.data
+	}
 	close(j.ready)
+	defer close(j.data)
+	if f.size == 0 {
+		return
+	}
 	got := time.Now()
-	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data)
-	close(j.data)
-	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", f.size, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
+	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
+	j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data, &r.verified)
+	if j.err == nil {
+		advance(&r.verified, j.seq)
+	}
+	errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", total, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
 }
 
 func (r *slotReader) run() {
 	ctx, cancel := context.WithCancel(r.ctx)
+	defer close(r.ch)
+	defer cancel() // Wakes every waiter; the look-ahead budget belongs only to this reader.
 	jobs := make(map[int64]*readSlot)
-	defer func() {
-		cancel()
-		close(r.ch)
-		for _, j := range jobs {
-			<-j.ready
-			j.release(r.media)
-		}
-	}()
 	next := r.head.Load()
 	for ctx.Err() == nil {
 		head := r.head.Load()
@@ -766,7 +748,9 @@ func (r *slotReader) run() {
 		close(j.head)
 		select {
 		case <-j.ready:
-			j.release(r.media) // The head now uses its own allowance, even if its download is unfinished.
+			if j.reserved != 0 {
+				r.media.give(j.reserved) // The head now uses its own allowance.
+			}
 		case <-ctx.Done():
 			return
 		}
@@ -826,13 +810,11 @@ func (r *slotReader) ackLoop(readDone <-chan struct{}) {
 		if n := r.head.Load() - 1; n > acked {
 			d := strconv.FormatInt(n, 10)
 			started := time.Now()
-			var err error
+			name := ""
 			if r.table.lazy && acked < 0 {
-				err = r.store.createSlot(ctx, r.table.Watermark, r.table.name+"/w", d, nil)
-			} else {
-				err = r.store.setSlot(ctx, r.table.Watermark, d, nil)
+				name = r.table.name + "/w"
 			}
-			if err != nil {
+			if err := r.store.writeFile(ctx, r.table.Watermark, name, d, nil); err != nil {
 				r.setErr(errors.New("cannot publish Drive watermark").Base(err))
 				return
 			}

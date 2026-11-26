@@ -34,7 +34,7 @@ type Conn struct {
 }
 
 type connWriter interface {
-	io.WriteCloser
+	io.Closer
 	// writeUntil returns errWriteStopped, with the bytes it took, once either
 	// channel is closed
 	writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error)
@@ -143,7 +143,7 @@ func (c *Conn) Close() error {
 			writer.markProgress()
 			reader := c.reader.(*slotReader)
 			progress = func() time.Time {
-				last := writer.closeProgress()
+				last := *writer.progress.Load()
 				// Inbound activity must not hide a stalled outbound writer.
 				if credit := reader.drainCredit.Load(); isClosedChan(writer.done) && credit != nil && credit.After(last) {
 					return *credit

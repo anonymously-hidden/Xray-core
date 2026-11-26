@@ -380,7 +380,7 @@ func (c *ctxConn) Close() error {
 
 // Use one h2 connection per host, but allow parallel h1 connections.
 type secureTransport struct {
-	h2, h1  http.RoundTripper
+	h2, h1  *http.Transport
 	h1Hosts *sync.Map
 }
 
@@ -396,8 +396,8 @@ func (t *secureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func (t *secureTransport) CloseIdleConnections() {
-	closeIdleTransport(t.h2)
-	closeIdleTransport(t.h1)
+	t.h2.CloseIdleConnections()
+	t.h1.CloseIdleConnections()
 }
 
 var errSessionClosed = errors.New("the session is closed")
@@ -406,8 +406,8 @@ var errSessionClosed = errors.New("the session is closed")
 // Running references cover both the session and any response bodies still open.
 type connPool struct {
 	mu     sync.Mutex
-	mux    *splithttp.XmuxManager
-	media  []*splithttp.XmuxManager // Drive-only, one connection per round-robin lane
+	lanes  []*splithttp.XmuxManager // One pinned manager, or one per Drive media connection.
+	spread bool
 	next   int
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -444,32 +444,24 @@ func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(conte
 	if config == nil {
 		config = &splithttp.XmuxConfig{}
 	}
-	maxConns := config.MaxConnections
-	if conns > 0 {
-		maxConns = &splithttp.RangeConfig{From: 1, To: 1}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &connPool{ctx: ctx, cancel: cancel}
+	p := &connPool{ctx: ctx, cancel: cancel, spread: conns > 0}
 	newConn := func() splithttp.XmuxConn {
 		ctx, cancel := context.WithCancel(p.ctx)
 		c := &poolConn{ctx: ctx, cancel: cancel, transport: newClient(ctx).Transport}
 		c.stop = context.AfterFunc(ctx, func() { closeIdleTransport(c.transport) })
 		return c
 	}
-	newMux := func() *splithttp.XmuxManager {
-		return splithttp.NewXmuxManager(splithttp.XmuxConfig{
-			MaxConnections: maxConns, MaxConcurrency: config.MaxConcurrency,
+	maxConnections := config.MaxConnections
+	if p.spread {
+		maxConnections = &splithttp.RangeConfig{From: 1, To: 1}
+	}
+	for range max(1, conns) {
+		p.lanes = append(p.lanes, splithttp.NewXmuxManager(splithttp.XmuxConfig{
+			MaxConnections: maxConnections, MaxConcurrency: config.MaxConcurrency,
 			CMaxReuseTimes: config.CMaxReuseTimes, HMaxRequestTimes: config.HMaxRequestTimes,
 			HMaxReusableSecs: config.HMaxReusableSecs, HKeepAlivePeriod: config.HKeepAlivePeriod,
-		}, newConn)
-	}
-	p.mux = newMux()
-	for i := int32(0); i < conns; i++ {
-		mux := p.mux
-		if i > 0 {
-			mux = newMux()
-		}
-		p.media = append(p.media, mux)
+		}, newConn))
 	}
 	return p
 }
@@ -484,8 +476,6 @@ type sessionTransport struct {
 	pool   *connPool
 	client *splithttp.XmuxClient // guarded by pool.mu
 	closed bool
-	// spread selects a pool connection per request instead of pinning one.
-	spread bool
 }
 
 func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -502,18 +492,14 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, errSessionClosed
 	}
 	c := t.client
-	if t.spread {
-		mux := p.mux
-		if len(p.media) != 0 {
-			mux = p.media[p.next]
-			p.next = (p.next + 1) % len(p.media)
-		}
-		c = mux.GetXmuxClient(r.Context())
+	if p.spread {
+		c = p.lanes[p.next].GetXmuxClient(r.Context())
+		p.next = (p.next + 1) % len(p.lanes)
 	} else if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
 		if c != nil {
 			c.DoneRunning()
 		}
-		c = p.mux.GetXmuxClient(r.Context())
+		c = p.lanes[0].GetXmuxClient(r.Context())
 		c.AddRunning()
 		t.client = c
 	}

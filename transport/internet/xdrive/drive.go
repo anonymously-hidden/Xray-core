@@ -92,18 +92,19 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	client := func(ctx context.Context) *http.Client {
 		return newServiceClient(ctx, hosts, settings, driveTimeout, driveMaxInflight)
 	}
+	mediaConns := driveMediaConns(config.Xmux)
 	s := &driveStorage{driveShared: &driveShared{
 		folder: config.RemoteFolder, space: "drive", clientID: config.Secrets[0], clientSecret: config.Secrets[1], refreshToken: config.Secrets[2],
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
-		headMedia: make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
+		headMedia: make(chan struct{}, min(4, mediaConns)),
 	}}
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
 	// Four ordinary media requests per connection hide request latency;
 	// the byte budget and separate head permits bound speculative load.
-	for i, limit := range [laneCount]int{48, 8, min(driveMaxInflight, 4*int(driveMediaConns(config.Xmux)))} {
-		s.pools[i] = newConnPool(config.Xmux, [laneCount]int32{0, 0, driveMediaConns(config.Xmux)}[i], client)
+	for i, limit := range [laneCount]int{48, 8, min(driveMaxInflight, 4*int(mediaConns))} {
+		s.pools[i] = newConnPool(config.Xmux, [laneCount]int32{0, 0, mediaConns}[i], client)
 		s.permits[i] = make(chan struct{}, limit)
 	}
 	s.tokenClient.CheckRedirect = driveRedirect
@@ -120,7 +121,7 @@ func driveRedirect(req *http.Request, via []*http.Request) error {
 
 func (s *driveStorage) openClients() *driveStorage {
 	for i, pool := range s.pools {
-		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool, spread: driveLane(i) == mediaLane}, CheckRedirect: driveRedirect}
+		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool}, CheckRedirect: driveRedirect}
 	}
 	return s
 }
@@ -574,7 +575,19 @@ func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
 	return nil
 }
 
-func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id string, f driveFile, payload []byte) error {
+// A name creates the file; subsequent publications patch its reserved ID.
+func (s *driveStorage) writeFile(ctx context.Context, id, name, description string, payload []byte) error {
+	f := driveFile{Description: description}
+	method, path := http.MethodPatch, "/"+url.PathEscape(id)
+	if name != "" {
+		method, path = http.MethodPost, ""
+		f.ID, f.Name = id, flatten(name)
+		f.MimeType, f.Parents = "application/octet-stream", []string{s.folder}
+	} else if _, pending := s.unchecked.Load(id); pending {
+		if _, err := s.readDescription(ctx, id); err != nil {
+			return err
+		}
+	}
 	md, err := json.Marshal(f)
 	if err != nil {
 		return err
@@ -584,15 +597,11 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 		target, query = uploadURL, query+"&uploadType=multipart"
 		md, typ = multipartBody(md, payload)
 	}
-	if id != "" {
-		target += "/" + url.PathEscape(id)
-	} else {
-		id = f.ID // ID reserved before the create
-	}
-	data, err := s.bytes(ctx, lane, method, target+query, typ, md, 4096)
+	data, err := s.bytes(ctx, writeLane(ctx, payload), method, target+path+query, typ, md, 4096)
 	if err == nil {
 		var reply driveFile
 		if json.Unmarshal(data, &reply) == nil && reply.ID != "" && (id == "" || reply.ID == id) {
+			s.unchecked.Delete(id)
 			return nil
 		}
 		err = errors.New("unexpected Drive file ID in write response")
@@ -629,20 +638,11 @@ var (
 
 type refusedPayload struct{ error }
 
-func (s *driveStorage) createSlot(ctx context.Context, id, name, description string, body []byte) error {
-	f := driveFile{ID: id, Name: flatten(name), MimeType: "application/octet-stream", Parents: []string{s.folder}, Description: description}
-	err := s.writeFile(ctx, writeLane(ctx, body), http.MethodPost, "", f, body)
-	if err == nil {
-		s.unchecked.Delete(id)
-	}
-	return err
-}
-
 type (
 	headKey       struct{}
 	mediaHeadKey  struct{} // <-chan struct{}, closed on promotion
 	mediaSeqKey   struct{} // int64, for request retry diagnostics
-	spanRescueKey struct{} // func() bool for a multi-range GET, cleared on span resume
+	spanRescueKey struct{} // func() bool for the ordered span, cleared on resume
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
@@ -653,15 +653,6 @@ func writeLane(ctx context.Context, body []byte) driveLane {
 		return priorityLane
 	}
 	return metadataLane
-}
-
-func (s *driveStorage) setSlot(ctx context.Context, id, description string, body []byte) error {
-	if _, pending := s.unchecked.Load(id); pending {
-		if _, err := s.readDescription(ctx, id); err != nil {
-			return err
-		}
-	}
-	return s.writeFile(ctx, writeLane(ctx, body), http.MethodPatch, id, driveFile{Description: description}, body)
 }
 
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
@@ -775,11 +766,19 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 
 // Frames through slotProgressiveMax use one progressive GET. Larger frames
 // use up to four block ranges at once, targeting at least 512 KiB per range.
-func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, out chan<- []byte) error {
+func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, out chan<- []byte, verifiedFrame *atomic.Int64) error {
 	n := slotBlocks(f.size)
 	count := min(cap(s.headMedia), f.size/(2*slotTagBlock))
+	var draining, verified atomic.Uint32 // Current range index and bitmap of fully verified successors.
+	head := ctx.Value(mediaHeadKey{}).(<-chan struct{})
+	forRange := func(ctx context.Context, i uint32) context.Context {
+		return context.WithValue(ctx, spanRescueKey{}, func() bool {
+			later := verifiedFrame.Load() > f.seq || verified.Load()>>(i+1) != 0
+			return later && isClosedChan(head) && draining.Load() == i && !s.cooling()
+		})
+	}
 	if f.size <= slotProgressiveMax || count < 2 || s.cooling() {
-		return s.readSpan(ctx, id, f, 0, n, out, nil)
+		return s.readSpan(forRange(ctx, 0), id, f, 0, n, out, nil)
 	}
 	tailCtx, stopTails := context.WithCancel(ctx)
 	var wg sync.WaitGroup
@@ -789,14 +788,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 		chunks chan []byte
 		err    error // published by close(chunks)
 	}
-	parts := make([]part, count-1)       // Only successors need a reorder buffer.
-	var draining, verified atomic.Uint32 // Current range index and bitmap of fully verified successors.
-	head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{})
-	forRange := func(ctx context.Context, i uint32) context.Context {
-		return context.WithValue(ctx, spanRescueKey{}, func() bool {
-			return isClosedChan(head) && draining.Load() == i && verified.Load()>>(i+1) != 0 && !s.cooling()
-		})
-	}
+	parts := make([]part, count-1) // Only successors need a reorder buffer.
 	for i := range parts {
 		lo, hi := (i+1)*n/count, (i+2)*n/count
 		p := &parts[i]
@@ -871,7 +863,7 @@ func (s *driveStorage) putObject(ctx context.Context, id, name string, payload [
 		description = base64.StdEncoding.EncodeToString(payload)
 		payload = nil
 	}
-	return s.createSlot(ctx, id, name, description, payload)
+	return s.writeFile(ctx, id, name, description, payload)
 }
 
 func (s *driveStorage) find(ctx context.Context, query string, describe, dateEntries bool) ([]driveFile, error) {

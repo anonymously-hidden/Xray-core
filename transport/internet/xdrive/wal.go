@@ -78,10 +78,6 @@ func newWALWriter(ctx context.Context, storage Storage, prefix string, p params)
 	return w
 }
 
-func (w *walWriter) Write(p []byte) (int, error) {
-	return w.writeUntil(p, nil, nil)
-}
-
 // writeUntil is Write that gives up with errWriteStopped, having returned the
 // bytes it took into buf, once either channel is closed
 func (w *walWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error) {
