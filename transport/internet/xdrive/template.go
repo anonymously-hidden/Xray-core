@@ -162,7 +162,7 @@ func newTemplateStorage(streamSettings *internet.MemoryStreamConfig, config *Con
 
 // session returns a storage for one session, over the connections of XMUX
 // until Close, with the token of s
-func (s *templateStorage) session() Storage {
+func (s *templateStorage) session() backend {
 	transport := &sessionTransport{pool: s.conns}
 	return &templateStorage{
 		templateShared: s.templateShared,

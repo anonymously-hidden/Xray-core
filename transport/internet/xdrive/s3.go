@@ -166,7 +166,7 @@ func newS3Storage(streamSettings *internet.MemoryStreamConfig, c *Config) (*s3St
 
 func s3NoRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 
-func (s *s3Storage) session() Storage {
+func (s *s3Storage) session() backend {
 	transport := &sessionTransport{pool: s.conns}
 	return &s3Storage{
 		s3Shared: s.s3Shared,

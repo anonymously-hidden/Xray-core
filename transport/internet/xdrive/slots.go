@@ -8,14 +8,17 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"io"
+	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/semaphore"
+
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/signal"
 )
 
 const (
@@ -26,75 +29,26 @@ const (
 	slotEnd          = 3
 	slotErr          = 4
 	slotStream       = 5
-	maxSlotIDLen     = 128
 	slotStallTimeout = time.Minute
 
-	// Every block has an 8-byte sequence tag, then up to slotTagBlock data bytes.
-	// Each whole-block range independently rejects an older lap.
-	slotBodyHeader = 8
-	slotTagBlock   = 256 << 10
-	// slotReadChunk is the unit a media body is delivered in while it downloads.
-	slotReadChunk = 32 << 10
-	// slotMaxFrame stays below Drive's 5 MB multipart upload limit.
-	slotMaxFrame = 4 << 20
-	// Routine credit takes 1-3 s; only longer waits indicate strain.
-	slotStrainWait = 5 * time.Second
-	// Small frames amortize service latency better with one progressive GET.
-	slotProgressiveMax = 1 << 20
+	// Every block starts with a sequence tag so each range can reject an older lap.
+	slotBodyHeader     = 8
+	slotTagBlock       = 256 << 10
+	slotReadChunk      = 32 << 10        // Payload delivery granularity.
+	slotMaxFrame       = 4 << 20         // Below Drive's 5 MB multipart upload limit.
+	slotStrainWait     = 5 * time.Second // Routine credit takes 1–3 s.
+	slotProgressiveMax = 1 << 20         // One progressive GET amortizes latency for small frames.
 	slotReadAhead      = 24
 	slotPollAhead      = 4 // Empty positions polled beyond the observed frontier.
-	// A busy writer gathers until slotBusyGather, a full frame or input pause.
-	slotBusyUploads = 4
-	slotBusyGather  = 200 * time.Millisecond
+	slotBusyUploads    = 4
+	slotBusyGather     = 200 * time.Millisecond // A full frame or input pause ends gathering sooner.
 )
 
 func slotBlocks(size int) int { return (size + slotTagBlock - 1) / slotTagBlock }
 
-// byteBudget bounds bytes in flight. A taker may exceed the limit when nothing
-// else is in flight, so any single frame can always proceed.
-type byteBudget struct {
-	mu          sync.Mutex
-	used, limit int
-	free        chan struct{} // closed and replaced by every give
-}
-
-func newByteBudget(limit int) *byteBudget {
-	return &byteBudget{limit: limit, free: make(chan struct{})}
-}
-
-// take waits until n bytes fit. It returns false if skip or done closes first.
-func (b *byteBudget) take(n int, skip, done <-chan struct{}) bool {
-	for {
-		b.mu.Lock()
-		if b.used == 0 || b.used+n <= b.limit {
-			b.used += n
-			b.mu.Unlock()
-			return true
-		}
-		free := b.free
-		b.mu.Unlock()
-		select {
-		case <-free:
-		case <-skip:
-			return false
-		case <-done:
-			return false
-		}
-	}
-}
-
-func (b *byteBudget) give(n int) {
-	b.mu.Lock()
-	b.used -= n
-	close(b.free)
-	b.free = make(chan struct{})
-	b.mu.Unlock()
-}
-
 var errWriteStopped = errors.New("write stopped")
 
-// A slot description identifies its sequence and either carries the payload
-// (inline) or the length of a media body stored in the same file.
+// A slot description carries the sequence, total payload length and any inline bytes.
 type slotFrame struct {
 	seq  int64
 	mode byte
@@ -103,25 +57,22 @@ type slotFrame struct {
 }
 
 func (f slotFrame) encode() string {
-	b := make([]byte, slotHeaderLen+len(f.data))
-	copy(b, slotMagic)
-	binary.BigEndian.PutUint64(b[8:], uint64(f.seq))
-	b[16] = f.mode
-	binary.BigEndian.PutUint32(b[17:], uint32(f.size))
-	copy(b[slotHeaderLen:], f.data)
-	return base64.StdEncoding.EncodeToString(b)
+	b := append(make([]byte, 0, slotHeaderLen+len(f.data)), slotMagic...)
+	b = binary.BigEndian.AppendUint64(b, uint64(f.seq))
+	b = append(b, f.mode)
+	b = binary.BigEndian.AppendUint32(b, uint32(f.size))
+	return base64.StdEncoding.EncodeToString(append(b, f.data...))
 }
 
 func decodeSlot(description string) (slotFrame, bool) {
 	b, err := base64.StdEncoding.DecodeString(description)
-	if err != nil || len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
+	if err != nil || len(b) < slotHeaderLen || !bytes.HasPrefix(b, []byte(slotMagic)) {
 		return slotFrame{}, false
 	}
-	f := slotFrame{seq: int64(binary.BigEndian.Uint64(b[8:])), mode: b[16], size: int(binary.BigEndian.Uint32(b[17:]))}
-	if f.seq < 0 || f.size < 0 || f.size > maxSegmentBytes {
+	f := slotFrame{seq: int64(binary.BigEndian.Uint64(b[8:])), mode: b[16], size: int(binary.BigEndian.Uint32(b[17:])), data: b[slotHeaderLen:]}
+	if f.seq < 0 || uint(f.size) > maxSegmentBytes {
 		return slotFrame{}, false
 	}
-	f.data = b[slotHeaderLen:]
 	switch f.mode {
 	case slotInline:
 		return f, f.size > 0 && f.size <= slotInlineLimit && len(f.data) == f.size
@@ -152,141 +103,135 @@ type ring struct {
 }
 
 // IDs are single opaque URL path components, never paths or special segments.
-func validSlotIDs(seen map[string]bool, ids ...string) bool {
-	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
-	for _, id := range ids {
-		if id == "" || len(id) > maxSlotIDLen || strings.Trim(id, alphabet) != "" || seen[id] {
-			return false
-		}
-		seen[id] = true
-	}
-	return true
-}
+var slotIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
-func decodeRing(b []byte) (ring, bool) {
+// The session owns unchecked exclusively until admission succeeds.
+func decodeRing(b []byte, session string, unchecked *sync.Map) *ring {
 	var r ring
 	if json.Unmarshal(b, &r) != nil || len(r.First) > slotInlineLimit {
-		return ring{}, false
+		return nil
 	}
-	seen := make(map[string]bool)
-	for _, t := range []slotTable{r.Up, r.Down} {
-		if len(t.Slots) == 0 || len(t.Slots) > maxConcurrency || !validSlotIDs(seen, t.Watermark) || !validSlotIDs(seen, t.Slots...) {
-			return ring{}, false
+	r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
+	for _, t := range []*slotTable{&r.Up, &r.Down} {
+		t.lazy = r.Lazy
+		if len(t.Slots) == 0 || len(t.Slots) > maxConcurrency {
+			return nil
+		}
+		for i, id := range append(slices.Clip(t.Slots), t.Watermark) {
+			name := t.name + "/w"
+			if i < len(t.Slots) {
+				name = t.name + "/s" + strconv.Itoa(i)
+			}
+			if _, duplicate := unchecked.LoadOrStore(id, flatten(name)); duplicate || !slotIDPattern.MatchString(id) {
+				return nil
+			}
 		}
 	}
-	return r, true
+	return &r
 }
 
 // IDs are allocated in direction order: slots, watermark, slots, watermark.
 func lazyRing(session string, depth int, ids []string) ring {
 	table := func(name string, batch []string) slotTable {
-		return slotTable{Slots: slices.Clone(batch[:depth]), Watermark: batch[depth], name: name, lazy: true}
+		return slotTable{Slots: batch[:depth:depth], Watermark: batch[depth], name: name, lazy: true}
 	}
 	return ring{Lazy: true, Up: table(uplinkPrefix(session), ids), Down: table(downlinkPrefix(session), ids[depth+1:])}
 }
 
-// Each object has one writer. Only its first publication in a lazy ring is a create.
-func (t slotTable) publish(ctx context.Context, store *driveStorage, seq int64, mode byte, data []byte) error {
-	idx := int(seq % int64(len(t.Slots)))
-	f := slotFrame{seq: seq, mode: mode, size: len(data), data: data}
+// Only the first publication of a lazy slot is a create. Inline data and the
+// progressive prefix live in the description; every media block carries seq.
+func (d *slotDirection) writeFrame(ctx context.Context, f slotFrame) error {
+	t := d.table
+	idx := int(f.seq % int64(len(t.Slots)))
 	var body, tag []byte
-	if mode == slotStream {
-		f.data, body = nil, data
-		if len(data) <= slotProgressiveMax {
-			f.data, body = data[:slotInlineLimit], data[slotInlineLimit:]
+	if f.mode == slotStream {
+		body, f.data = f.data, nil
+		if f.size <= slotProgressiveMax {
+			f.data, body = body[:slotInlineLimit], body[slotInlineLimit:]
 		}
-		tag = binary.BigEndian.AppendUint64(nil, uint64(seq))
+		tag = binary.BigEndian.AppendUint64(nil, uint64(f.seq))
 	}
 	name := ""
-	if t.lazy && seq < int64(len(t.Slots)) {
+	if t.lazy && f.seq < int64(len(t.Slots)) {
 		name = t.name + "/s" + strconv.Itoa(idx)
 	}
-	return store.writeFile(ctx, t.Slots[idx], name, f.encode(), body, tag)
+	return d.store.writeFile(ctx, t.Slots[idx], name, f.encode(), body, tag)
+}
+
+// Each direction has its own table and byte allowance; both share the session's failure cause.
+type slotDirection struct {
+	*Conn
+	store  *driveStorage
+	table  slotTable
+	flight *semaphore.Weighted
+	limit  int64
+	params
 }
 
 // Outbound: run assigns sequence numbers and owns the coalescing buffer.
 // Uploads may finish out of order. Each physical position has a completion fence.
 type slotWriter struct {
-	ctx   context.Context
-	fail  context.CancelCauseFunc
-	store *driveStorage
-	table slotTable
-	params
+	slotDirection
 	input               chan []byte
 	writeToken, permits chan struct{}
-	stop, done          chan struct{}
+	done                chan struct{}
 	first               chan []byte
-	closeOnce           sync.Once
-	workers             sync.WaitGroup
-	progress            atomic.Pointer[time.Time]
 	wmMu                sync.Mutex
 	acked               int64
 	checked             time.Time
-	frame               int         // current media frame size, owned by run
 	strained            atomic.Bool // set by a worker that waited long for credit
-	flight              *byteBudget // bytes of unfinished uploads
 }
 
-func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store *driveStorage, table slotTable, p params) *slotWriter {
+func newSlotWriter(dir slotDirection) *slotWriter {
 	w := &slotWriter{
-		ctx: ctx, fail: fail, store: store, table: table, params: p,
-		input: make(chan []byte), writeToken: make(chan struct{}, 1),
-		permits: make(chan struct{}, min(len(table.Slots), 32)),
-		stop:    make(chan struct{}), done: make(chan struct{}),
-		first: make(chan []byte, 1), acked: -1,
-		frame: min(p.segmentBytes, slotMaxFrame), flight: newByteBudget(p.flightBytes),
+		slotDirection: dir,
+		input:         make(chan []byte), writeToken: make(chan struct{}, 1),
+		permits: make(chan struct{}, min(len(dir.table.Slots), 32)),
+		done:    make(chan struct{}),
+		first:   make(chan []byte, 1), acked: -1,
 	}
 	w.markProgress()
 	go w.run()
 	return w
 }
 
-func (w *slotWriter) stopped() error {
-	return cmp.Or(context.Cause(w.ctx), io.ErrClosedPipe)
+// Both writer admission and the input handoff observe the same stop signals.
+func sendSlotInput[T any](w *slotWriter, dst chan<- T, value T, deadline <-chan struct{}) error {
+	select {
+	case dst <- value:
+		return nil
+	case <-w.ctx.Done():
+		return context.Cause(w.ctx)
+	case <-deadline:
+	case <-w.closing:
+	}
+	return errWriteStopped
 }
 
-func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (int, error) {
-	select {
-	case w.writeToken <- struct{}{}:
-		defer func() { <-w.writeToken }()
-	case <-deadline:
-		return 0, errWriteStopped
-	case <-closing:
-		return 0, errWriteStopped
-	case <-w.ctx.Done():
-		return 0, w.stopped()
-	case <-w.stop:
-		return 0, io.ErrClosedPipe
+func (w *slotWriter) writeUntil(p []byte, deadline, _ <-chan struct{}) (int, error) {
+	if err := sendSlotInput(w, w.writeToken, struct{}{}, deadline); err != nil {
+		return 0, err
 	}
+	defer func() { <-w.writeToken }()
 	n := 0
-	for len(p) > 0 {
-		if isClosedChan(deadline) || isClosedChan(closing) {
+	for chunk := range slices.Chunk(p, w.segmentBytes) {
+		if isClosedChan(deadline) || isClosedChan(w.closing) {
 			return n, errWriteStopped
 		}
-		if w.ctx.Err() != nil || isClosedChan(w.stop) {
-			return n, w.stopped()
+		if err := context.Cause(w.ctx); err != nil {
+			return n, err
 		}
-		k := min(len(p), w.segmentBytes)
-		select {
-		case w.input <- bytes.Clone(p[:k]):
-			n += k
-			p = p[k:]
-		case <-deadline:
-			return n, errWriteStopped
-		case <-closing:
-			return n, errWriteStopped
-		case <-w.ctx.Done():
-			return n, w.stopped()
-		case <-w.stop:
-			return n, io.ErrClosedPipe
+		if err := sendSlotInput(w, w.input, bytes.Clone(chunk), deadline); err != nil {
+			return n, err
 		}
+		n += len(chunk)
 	}
 	return n, nil
 }
 
-func (w *slotWriter) markProgress() {
+func (c *Conn) markProgress() {
 	now := time.Now()
-	w.progress.Store(&now)
+	c.progress.Store(&now)
 }
 
 var errDriveWatermark = errors.New("invalid receiver watermark")
@@ -294,25 +239,25 @@ var errDriveWatermark = errors.New("invalid receiver watermark")
 // Only one watermark GET per refresh interval, even when a wave wraps together.
 func (w *slotWriter) credit(seq int64) (bool, error) {
 	need := seq - int64(len(w.table.Slots))
-	if need < 0 {
+	if need < 0 { // First-lap slots require no watermark.
 		return true, nil
 	}
 	w.wmMu.Lock()
 	defer w.wmMu.Unlock()
-	if w.acked >= seq {
+	switch {
+	case w.acked >= seq:
 		return false, errDriveWatermark
-	}
-	if w.acked >= need || time.Since(w.checked) < 100*time.Millisecond {
+	case w.acked >= need || time.Since(w.checked) < 100*time.Millisecond:
 		return w.acked >= need, nil
 	}
 	ctx, cancel := context.WithTimeout(context.WithValue(w.ctx, headKey{}, true), 15*time.Second)
 	defer cancel()
 	d, err := w.store.readDescription(ctx, w.table.Watermark)
 	w.checked = time.Now()
-	if (err == errNotFound && w.table.lazy) || (err == nil && d == "") {
+	if err == errNotFound && w.table.lazy {
 		return false, nil
 	}
-	if err != nil {
+	if err != nil || d == "" {
 		return false, err
 	}
 	n, err := strconv.ParseInt(d, 10, 64)
@@ -327,229 +272,193 @@ func (w *slotWriter) credit(seq int64) (bool, error) {
 	return w.acked >= need, nil
 }
 
-func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chunk []byte) error {
-	if previous != nil {
-		select {
-		case <-previous:
-		case <-w.ctx.Done():
-			return w.stopped()
-		}
+// Publishing an error cancels the session before releasing this slot's fence.
+func (w *slotWriter) publish(f slotFrame, previous <-chan struct{}) {
+	if previous != nil && waitFor(w.ctx, previous, nil) != nil {
+		return
 	}
 	since := time.Now()
-	for {
-		ok, err := w.credit(seq)
-		if isAuthError(err) || err == errNotFound || err == errDriveScope || err == errDriveWatermark {
-			return err
+	for ok, err := w.credit(f.seq); !ok; ok, err = w.credit(f.seq) {
+		switch {
+		case isAuthError(err), err == errNotFound, err == errDriveScope, err == errDriveWatermark:
+			w.fail(err)
+			return
+		case time.Since(since) > slotStallTimeout && time.Since(*w.progress.Load()) > slotStallTimeout:
+			w.fail(errors.New("timed out waiting for receiver watermark").Base(err))
+			return
 		}
-		if ok {
-			break
-		}
-		if time.Since(since) > slotStallTimeout && time.Since(*w.progress.Load()) > slotStallTimeout {
-			return errors.New("timed out waiting for receiver watermark").Base(err)
-		}
-		if err := sleepContext(w.ctx, 30*time.Millisecond); err != nil {
-			return err
+		if sleepContext(w.ctx, 30*time.Millisecond) != nil {
+			return
 		}
 	}
-	if err := w.ctx.Err(); err != nil {
-		return err
+	if w.ctx.Err() != nil {
+		return
 	}
 	credited := time.Now()
 	if credited.Sub(since) > slotStrainWait {
 		w.strained.Store(true) // Signal once when this wait ends, not on every poll while blocked.
 	}
-	if err := w.table.publish(w.ctx, w.store, seq, mode, chunk); err != nil {
+	if err := w.writeFrame(w.ctx, f); err != nil {
 		// A lost reply is not a refusal: never overwrite possibly committed data.
 		if _, refused := err.(refusedPayload); refused && w.ctx.Err() == nil {
 			ctx, cancel := context.WithTimeout(w.ctx, 2*time.Second)
-			_ = w.table.publish(ctx, w.store, seq, slotErr, nil)
+			_ = w.writeFrame(ctx, slotFrame{seq: f.seq, mode: slotErr})
 			cancel()
 		}
-		return err
+		w.fail(err)
+		return
 	}
-	if mode == slotStream {
-		errors.LogDebug(w.ctx, "xdrive upload seq ", seq, " bytes ", len(chunk), " credit ", credited.Sub(since), " put ", time.Since(credited))
+	if f.mode == slotStream {
+		errors.LogDebug(w.ctx, "xdrive upload seq ", f.seq, " bytes ", f.size, " credit ", credited.Sub(since), " put ", time.Since(credited))
 	}
 	w.markProgress()
-	return nil
 }
 
-func (w *slotWriter) run() {
-	defer close(w.done)
-	defer w.workers.Wait()
-	var seq int64
-	fences := make([]chan struct{}, len(w.table.Slots))
-	launch := func(chunk []byte) bool {
-		select {
-		case w.permits <- struct{}{}:
-		case <-w.ctx.Done():
-			return false
-		}
-		if !w.flight.take(len(chunk), nil, w.ctx.Done()) {
-			<-w.permits
-			return false
-		}
-		n := seq
-		seq++
-		i := n % int64(len(fences))
-		prev, done := fences[i], make(chan struct{})
-		fences[i] = done
-		mode := byte(slotStream)
-		if len(chunk) <= slotInlineLimit {
-			mode = slotInline
-			if n == 0 {
-				w.first <- chunk
-			}
-		}
-		w.workers.Go(func() {
-			defer close(done)
-			defer func() { <-w.permits }()
-			defer w.flight.give(len(chunk))
-			if err := w.publish(n, prev, mode, chunk); err != nil {
-				w.fail(err)
-			}
-		})
-		return true
-	}
-	var buf []byte
-	var bufAt, lastIn time.Time // arrival of the oldest and the newest buffered byte
+// gather yields immutable chunks synchronously: a blocked upload admission also
+// holds back the next input handoff. Overflow keeps its original arrival time.
+func (w *slotWriter) gather(yield func([]byte) bool) {
+	var buf, pending []byte
+	var bufAt, lastIn time.Time // arrival of the oldest and newest buffered byte
+	base := min(w.segmentBytes, slotMaxFrame)
+	frame := base
 	timer := time.NewTimer(w.flushInterval)
 	timer.Stop()
 	defer timer.Stop()
-	base := w.frame
-	flush := func() bool {
+	closing := false
+	for !closing {
+		if len(pending) == 0 {
+			pending = nil // Release the last handoff before waiting on an idle stream.
+			select {
+			case <-w.ctx.Done():
+				return
+			case <-w.closing:
+				closing = true
+			case pending = <-w.input:
+				lastIn = time.Now()
+			case <-timer.C:
+				// Busy streams gather until a full frame, a pause or the oldest byte's deadline.
+				wait := min(w.flushInterval-time.Since(lastIn), slotBusyGather-time.Since(bufAt))
+				if len(w.permits) >= slotBusyUploads && wait > 0 {
+					timer.Reset(wait)
+					continue
+				}
+			}
+		}
+		if len(pending) != 0 {
+			n := min(len(pending), frame-len(buf))
+			if len(buf) == 0 {
+				buf, bufAt = pending[:n:n], lastIn
+				d := w.flushInterval
+				if len(w.permits) == 0 && n <= slotInlineLimit && !w.store.cooling() {
+					d = min(d, 2*time.Millisecond)
+				}
+				timer.Reset(d)
+			} else {
+				buf = append(buf, pending[:n]...)
+			}
+			pending = pending[n:]
+			if len(buf) < frame {
+				continue
+			}
+		}
 		timer.Stop()
-		frame, full := w.frame, len(buf) == w.frame
 		// Credit strain reduces bytes; request quotas need larger frames, not smaller.
+		size := frame
 		strained, cooling := w.strained.Swap(false), w.store.cooling()
 		if strained && !cooling {
-			w.frame = max(base, w.frame/2)
-		} else if full && !cooling {
-			w.frame = min(2*w.frame, slotMaxFrame)
+			frame = max(base, frame/2)
+		} else if len(buf) == frame && !cooling {
+			frame = min(2*frame, slotMaxFrame)
 		}
-		if w.frame != frame {
-			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
+		if frame != size {
+			errors.LogDebug(w.ctx, "xdrive frame size ", size, " -> ", frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
 		busy := len(w.permits)
 		// An inline burst should fit in one discovery wave; otherwise use one publication.
-		size := frame
 		if !cooling && busy < 2*slotBusyUploads && len(buf) <= min(slotPollAhead, cap(w.permits)-busy)*slotInlineLimit {
 			size = slotInlineLimit
 		}
 		for chunk := range slices.Chunk(buf, size) {
-			if !launch(chunk) {
-				return false
+			if !yield(chunk) {
+				return
 			}
 		}
-		buf = nil // the upload workers own their slices
-		return true
+		buf = nil // The upload workers now own the backing array.
 	}
-	for {
-		select {
-		case <-w.ctx.Done():
-			return
-		case <-w.stop:
-			if !flush() {
-				return
-			}
-			w.workers.Wait()
-			if w.ctx.Err() == nil {
-				if err := w.publish(seq, fences[seq%int64(len(fences))], slotEnd, nil); err != nil {
-					w.fail(err)
-				}
-			}
-			return
-		case b := <-w.input:
-			lastIn = time.Now()
-			for len(b) > 0 {
-				// Carry overflow into the next gather instead of publishing a tiny tail at every boundary.
-				n := min(len(b), w.frame-len(buf))
-				if len(buf) == 0 {
-					buf, bufAt = b[:n:n], lastIn
-					d := w.flushInterval
-					if len(w.permits) == 0 && n <= slotInlineLimit && !w.store.cooling() {
-						d = min(d, 2*time.Millisecond)
-					}
-					timer.Reset(d)
-				} else {
-					buf = append(buf, b[:n]...)
-				}
-				b = b[n:]
-				if len(buf) == w.frame && !flush() {
-					return
-				}
-			}
-		case <-timer.C:
-			// Streaming: keep gathering toward a full frame while input keeps
-			// coming, but send a burst once input pauses for flushInterval.
-			quiet := w.flushInterval - time.Since(lastIn)
-			if wait := slotBusyGather - time.Since(bufAt); len(w.permits) >= slotBusyUploads && wait > 0 && quiet > 0 {
-				timer.Reset(min(wait, quiet))
-				continue
-			}
-			if !flush() {
-				return
+}
+
+func (w *slotWriter) run() {
+	defer close(w.done)
+	var workers sync.WaitGroup
+	var seq int64
+	fences := make([]chan struct{}, len(w.table.Slots))
+	for chunk := range w.gather {
+		if acquirePermit(w.ctx, w.permits) != nil {
+			break
+		}
+		charge := int64(len(chunk)) // Outbound frames never exceed one lane's allowance.
+		if w.flight.Acquire(w.ctx, charge) != nil {
+			<-w.permits
+			break
+		}
+		f := slotFrame{seq: seq, mode: slotStream, size: len(chunk), data: chunk}
+		seq++
+		i := f.seq % int64(len(fences))
+		prev, done := fences[i], make(chan struct{})
+		fences[i] = done
+		if f.size <= slotInlineLimit {
+			f.mode = slotInline
+			if f.seq == 0 {
+				w.first <- chunk
 			}
 		}
+		workers.Go(func() {
+			defer close(done)
+			defer func() { <-w.permits }()
+			defer w.flight.Release(charge)
+			w.publish(f, prev)
+		})
+	}
+	workers.Wait()
+	if w.ctx.Err() == nil {
+		w.publish(slotFrame{seq: seq, mode: slotEnd}, nil)
 	}
 }
 
 func (w *slotWriter) Close() error {
-	w.closeOnce.Do(func() { close(w.stop) })
 	<-w.done // Conn.Close owns the watchdog for the entire shutdown.
 	return context.Cause(w.ctx)
 }
 
-func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
-	for {
-		remaining := slotStallTimeout - time.Since(progress())
-		if remaining <= 0 {
-			if isClosedChan(done) {
-				return nil
-			}
-			return context.DeadlineExceeded
-		}
-		select {
-		case <-done:
-			return nil
-		case <-time.After(remaining):
-		}
-	}
-}
-
 // Inbound: workers discover known IDs concurrently. Only run delivers bytes and moves
-// head. Lookahead media retains at most flightBytes, plus the ordered head.
+// head. Lookahead media uses the shared byte allowance; the head has its own.
 type slotReader struct {
-	ctx     context.Context
-	setErr  context.CancelCauseFunc
-	discard <-chan struct{}
-	store   *driveStorage
-	table   slotTable
-	params
+	slotDirection
 	ch                                 chan []byte
-	wake, ack                          chan struct{}
-	media                              *byteBudget // bodies downloaded ahead of the head
+	wake                               *signal.Notifier
+	ack                                chan struct{} // buffered wakeup; the ordered reader closes it for the final snapshot
 	head, frontier, verified, activeAt atomic.Int64
-	drainCredit                        atomic.Pointer[time.Time] // last credit returned during Close
+	writerDone                         <-chan struct{}
 	probing                            atomic.Bool
 	wg                                 sync.WaitGroup
 }
 
 type readSlot struct {
-	seq         int64
-	prior       <-chan struct{} // previous frame's ready: ordered body admission
-	head, ready chan struct{}
-	data        chan []byte // published by ready; closed after the last verified block
-	reserved    int         // published by ready; returned by the ordered reader
-	end         bool
-	err         error // published by closing ready (no data) or data
+	seq       int64
+	prior     <-chan struct{} // ready fence of the preceding frame
+	lookahead context.Context // canceled on head promotion or reader shutdown
+	promote   context.CancelFunc
+	ready     chan struct{}
+	data      chan []byte // published by ready; closed after the last verified block
+	reserved  int64       // published by ready; returned by the ordered reader
+	end       bool
+	err       error // final after data closes
 }
 
-func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store *driveStorage, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
+func newSlotReader(dir slotDirection, first []byte, writerDone <-chan struct{}) *slotReader {
 	r := &slotReader{
-		ctx: ctx, setErr: fail, discard: discard, store: store, table: table, params: p,
-		ch: make(chan []byte, 2), wake: make(chan struct{}, 1),
-		ack: make(chan struct{}, 1), media: newByteBudget(p.flightBytes),
+		slotDirection: dir, writerDone: writerDone,
+		ch: make(chan []byte, 2), wake: signal.NewNotifier(), ack: make(chan struct{}, 1),
 	}
 	r.frontier.Store(-1)
 	r.Wake()
@@ -558,28 +467,18 @@ func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store *dri
 		r.head.Store(1)
 		r.ack <- struct{}{}
 	}
-	readDone := make(chan struct{})
-	r.wg.Go(func() {
-		defer close(readDone)
-		r.run()
-	})
-	r.wg.Go(func() { r.ackLoop(readDone) })
+	r.wg.Go(r.run)
+	r.wg.Go(r.ackLoop)
 	return r
 }
 
 func (r *slotReader) chunks() <-chan []byte { return r.ch }
 func (r *slotReader) wait()                 { r.wg.Wait() }
+func (r *slotReader) Err() error            { return cmp.Or(context.Cause(r.ctx), io.EOF) }
 
 func (r *slotReader) Wake() {
 	r.activeAt.Store(time.Now().UnixNano())
-	select {
-	case r.wake <- struct{}{}:
-	default:
-	}
-}
-
-func (r *slotReader) Err() error {
-	return cmp.Or(context.Cause(r.ctx), io.EOF)
+	r.wake.Signal()
 }
 
 func advance(counter *atomic.Int64, n int64) {
@@ -587,158 +486,143 @@ func advance(counter *atomic.Int64, n int64) {
 	}
 }
 
-func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, error) {
+// A lazy missing head may be idle. A valid successor at its own ring position
+// is evidence of a gap. Run at most one probe without delaying the head poll.
+func (r *slotReader) probe(ctx context.Context, seq, idx, depth int64) {
+	defer r.probing.Store(false)
+	ctx, cancel := context.WithTimeout(ctx, slotStallTimeout)
+	defer cancel()
+	d, err := r.store.readDescription(ctx, r.table.Slots[idx])
+	if f, ok := decodeSlot(d); err == nil && ok && f.seq > seq && f.seq%depth == idx {
+		advance(&r.frontier, f.seq)
+		r.Wake()
+	}
+}
+
+func (r *slotReader) lookup(ctx context.Context, job *readSlot, id string) (slotFrame, error) {
 	depth := int64(len(r.table.Slots))
-	id := r.table.Slots[job.seq%depth]
 	probeAt, offset := time.Now().Add(slotStallTimeout), int64(1)
-	var unhealthy time.Time
+	var gapDeadline time.Time
+	priority := context.WithValue(ctx, headKey{}, true)
 	for {
 		head := job.seq == r.head.Load()
 		active := time.Since(time.Unix(0, r.activeAt.Load())) < r.eagerWindow
+		readCtx, wake, delay := ctx, job.lookahead.Done(), 40*time.Millisecond
+		if head {
+			readCtx, wake, delay = priority, r.wake.Wait(), 25*time.Millisecond
+		}
 		// Empty distant slots must not spend the quota of useful media and ACKs.
 		if head || active && job.seq <= max(r.frontier.Load(), r.head.Load())+slotPollAhead {
-			readCtx := ctx
-			if head {
-				readCtx = context.WithValue(ctx, headKey{}, true)
-			}
 			d, err := r.store.readDescription(readCtx, id)
 			f, ok := decodeSlot(d)
-			invalid := d != "" && !ok
-			if err == nil && ok && f.seq > job.seq {
+			switch {
+			case err == errDriveScope || isAuthError(err):
+				return slotFrame{}, err
+			case err == nil && ok && f.seq > job.seq:
 				return slotFrame{}, errors.New("Drive slot ", job.seq, " was overwritten by sequence ", f.seq)
-			}
-			if err == nil && ok && f.seq == job.seq {
+			case err == nil && ok && f.seq == job.seq:
 				r.activeAt.Store(time.Now().UnixNano())
 				advance(&r.frontier, f.seq)
 				return f, nil
 			}
-			if err == errDriveScope || isAuthError(err) {
-				return slotFrame{}, err
-			}
-			// A lazy missing head may be idle; probe other descriptions for a gap.
 			if head && depth > 1 && time.Now().After(probeAt) && r.frontier.Load() <= job.seq && !r.store.cooling() && r.probing.CompareAndSwap(false, true) {
 				idx := (job.seq + offset) % depth
 				offset, probeAt = offset%(depth-1)+1, time.Now().Add(slotStallTimeout/12)
-				r.wg.Go(func() {
-					defer r.probing.Store(false)
-					probe, cancel := context.WithTimeout(ctx, slotStallTimeout)
-					defer cancel()
-					d, err := r.store.readDescription(probe, r.table.Slots[idx])
-					if f, ok := decodeSlot(d); err == nil && ok && f.seq > job.seq && f.seq%depth == idx {
-						advance(&r.frontier, f.seq)
-						r.Wake()
-					}
-				})
+				r.wg.Go(func() { r.probe(ctx, job.seq, idx, depth) })
 			}
-			missing := err == errNotFound && (!r.table.lazy || job.seq >= depth)
-			if head && (missing || (err != nil && err != errNotFound) || invalid || r.frontier.Load() > job.seq) {
-				if unhealthy.IsZero() {
-					unhealthy = time.Now()
-				} else if time.Since(unhealthy) >= slotStallTimeout {
-					return slotFrame{}, errors.New("Drive slot ", job.seq, " did not become readable").Base(err)
-				}
-			} else {
-				unhealthy = time.Time{}
+			idle := err == errNotFound && r.table.lazy && job.seq < depth
+			gap := err != nil && !idle || d != "" && !ok || r.frontier.Load() > job.seq
+			switch {
+			case !head || !gap:
+				gapDeadline = time.Time{}
+			case gapDeadline.IsZero():
+				gapDeadline = time.Now().Add(slotStallTimeout)
+			case !time.Now().Before(gapDeadline):
+				return slotFrame{}, errors.New("Drive slot ", job.seq, " did not become readable").Base(err)
 			}
-		}
-		wake, delay := job.head, 40*time.Millisecond
-		if head {
-			wake, delay = r.wake, 25*time.Millisecond
 		}
 		if !active {
 			delay = r.maxPollInterval
 		}
-		select {
-		case <-ctx.Done():
-			return slotFrame{}, ctx.Err()
-		case <-wake:
-		case <-time.After(delay):
+		if err := waitFor(ctx, time.After(delay), wake); err != nil {
+			return slotFrame{}, err
 		}
 	}
 }
 
 func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	start := time.Now()
-	f, err := r.lookup(ctx, j)
+	id := r.table.Slots[j.seq%int64(len(r.table.Slots))]
+	f, err := r.lookup(ctx, j, id)
 	found := time.Now()
 	j.end = f.mode == slotEnd
 	if f.mode == slotErr {
 		err = errors.New("peer could not store segment ", j.seq)
 	}
 	// Discover concurrently, but reserve body bytes in sequence order.
-	select {
-	case <-j.prior:
-	case <-j.head: // Includes the first job, which has no predecessor.
-	case <-ctx.Done():
-		err = ctx.Err()
+	err = cmp.Or(waitFor(ctx, j.prior, j.lookahead.Done()), err) // The first job has no predecessor.
+	charge := min(int64(f.size), r.limit)                        // A larger peer-supplied frame can run alone.
+	if err == nil && f.mode == slotStream && j.seq != r.head.Load() && r.flight.Acquire(j.lookahead, charge) == nil {
+		j.reserved = charge
 	}
-	if err == nil && f.mode == slotStream && j.seq != r.head.Load() && r.media.take(f.size, j.head, ctx.Done()) {
-		j.reserved = f.size
-	}
-	if j.err = cmp.Or(err, ctx.Err()); j.err != nil || f.size == 0 {
-		close(j.ready)
-		return
-	}
-	total := f.size // Media offsets exclude the prefix in the description.
-	f.size -= len(f.data)
-	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+2) // prefix, tagged pieces and short first read
-	if len(f.data) != 0 {
+	j.err = cmp.Or(err, ctx.Err())
+	media := f.size - len(f.data) // Media offsets exclude the prefix in the description.
+	j.data = make(chan []byte, media/slotReadChunk+slotBlocks(media)+2)
+	defer close(j.data)
+	if j.err == nil && len(f.data) != 0 {
 		j.data <- f.data
 	}
 	close(j.ready)
-	defer close(j.data)
-	if f.size > 0 {
+	if j.err == nil && media > 0 {
 		got := time.Now()
-		ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
-		j.err = r.store.readFrameStream(ctx, r.table.Slots[j.seq%int64(len(r.table.Slots))], f, j.data, &r.verified)
-		errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", total, " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
+		ctx = context.WithValue(ctx, mediaHeadKey{}, j.lookahead.Done())
+		f.size = media
+		j.err = r.store.readFrameStream(ctx, id, f, j.data, &r.verified)
+		errors.LogDebug(ctx, "xdrive read seq ", j.seq, " bytes ", media+len(f.data), " find ", found.Sub(start), " budget ", got.Sub(found), " body ", time.Since(got), " err ", j.err)
 	}
-	if j.err == nil {
-		advance(&r.verified, j.seq) // An inline frame was already verified in full by decodeSlot.
+	if j.err == nil && !j.end {
+		advance(&r.verified, j.seq)
 	}
 }
 
 func (r *slotReader) run() {
 	ctx, cancel := context.WithCancel(r.ctx)
+	defer close(r.ack)
 	defer close(r.ch)
 	defer cancel() // Wakes every waiter; the look-ahead budget belongs only to this reader.
 	jobs := make(chan *readSlot, min(slotReadAhead, len(r.table.Slots)))
 	var prior <-chan struct{}
 	for head := r.head.Load(); ctx.Err() == nil; head++ {
 		for len(jobs) < cap(jobs) {
-			j := &readSlot{seq: head + int64(len(jobs)), prior: prior, head: make(chan struct{}), ready: make(chan struct{})}
+			lookahead, promote := context.WithCancel(ctx)
+			j := &readSlot{seq: head + int64(len(jobs)), prior: prior,
+				lookahead: lookahead, promote: promote, ready: make(chan struct{})}
 			jobs <- j
 			prior = j.ready
 			r.wg.Go(func() { r.fetch(ctx, j) })
-			if head == 0 { // Establish the first frame before probing ahead.
+			if head == 0 { // Establish frame zero before probing ahead.
 				break
 			}
 		}
 		j := <-jobs
-		close(j.head)
-		select {
-		case <-j.ready:
-			if j.reserved != 0 {
-				r.media.give(j.reserved) // The head now uses its own allowance.
-			}
-		case <-ctx.Done():
+		j.promote()
+		if waitFor(ctx, j.ready, nil) != nil {
 			return
 		}
-		if j.data != nil {
-			for b := range j.data {
-				select {
-				case r.ch <- b:
-				case <-r.discard: // Close abandons input but must keep returning verified ring credit.
-				case <-ctx.Done():
-					return
-				}
-				r.activeAt.Store(time.Now().UnixNano()) // ordered input keeps look-ahead eager
+		if j.reserved != 0 {
+			r.flight.Release(j.reserved) // The head now uses its own allowance.
+		}
+		for b := range j.data {
+			select {
+			case r.ch <- b:
+			case <-r.closing: // Close abandons input but must keep returning verified ring credit.
+			case <-ctx.Done():
+				return
 			}
+			r.activeAt.Store(time.Now().UnixNano()) // ordered input keeps look-ahead eager
 		}
 		if j.err != nil {
-			if ctx.Err() == nil {
-				r.setErr(j.err)
-			}
+			r.fail(j.err) // A prior cancellation keeps its original cause.
 			return
 		}
 		if j.end {
@@ -754,48 +638,41 @@ func (r *slotReader) run() {
 
 // This goroutine is the only watermark writer. END triggers one last snapshot
 // after the ordered reader has stopped, including credit below the batch size.
-func (r *slotReader) ackLoop(readDone <-chan struct{}) {
+func (r *slotReader) ackLoop() {
 	ctx := context.WithValue(r.ctx, headKey{}, true)
 	t := time.NewTicker(1500 * time.Millisecond)
 	defer t.Stop()
 	acked := int64(-1)
 	batch := max(int64(1), int64(len(r.table.Slots))/6)
-	for {
-		final := false
+	open := true
+	for open && ctx.Err() == nil {
+		threshold := int64(1)
 		select {
 		case <-ctx.Done():
 			return
-		case <-readDone:
-			final = true
-		case <-r.ack:
-			if r.head.Load()-1-acked < batch {
-				continue
+		case _, open = <-r.ack:
+			if open {
+				threshold = batch
 			}
 		case <-t.C:
 		}
-		if ctx.Err() != nil {
+		n := r.head.Load() - 1
+		if n-acked < threshold || ctx.Err() != nil {
+			continue
+		}
+		started := time.Now()
+		name := ""
+		if r.table.lazy && acked < 0 {
+			name = r.table.name + "/w"
+		}
+		if err := r.store.writeFile(ctx, r.table.Watermark, name, strconv.FormatInt(n, 10), nil, nil); err != nil {
+			r.fail(errors.New("cannot publish Drive watermark").Base(err))
 			return
 		}
-		if n := r.head.Load() - 1; n > acked {
-			d := strconv.FormatInt(n, 10)
-			started := time.Now()
-			name := ""
-			if r.table.lazy && acked < 0 {
-				name = r.table.name + "/w"
-			}
-			if err := r.store.writeFile(ctx, r.table.Watermark, name, d, nil, nil); err != nil {
-				r.setErr(errors.New("cannot publish Drive watermark").Base(err))
-				return
-			}
-			acked = n
-			errors.LogDebug(ctx, "xdrive watermark seq ", n, " put ", time.Since(started))
-			if isClosedChan(r.discard) {
-				now := time.Now()
-				r.drainCredit.Store(&now)
-			}
-		}
-		if final {
-			return
+		acked = n
+		errors.LogDebug(ctx, "xdrive watermark seq ", n, " put ", time.Since(started))
+		if isClosedChan(r.writerDone) { // Only ACKs after our writer finishes extend the close watchdog.
+			r.markProgress()
 		}
 	}
 }

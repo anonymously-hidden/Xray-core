@@ -119,6 +119,8 @@ func (s *localStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 	return found, nil
 }
 
+func (s *localStorage) session() backend { return s }
+
 func (s *localStorage) Close() error {
 	return nil
 }

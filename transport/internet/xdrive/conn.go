@@ -5,7 +5,10 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 
 	"github.com/xtls/xray-core/common/net"
 )
@@ -16,7 +19,7 @@ var placeholderAddr = &net.TCPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0}
 // slotWriter and slotReader
 type Conn struct {
 	ctx     context.Context
-	cancel  context.CancelFunc
+	fail    context.CancelCauseFunc // first transport error wins; nil means ordinary cancellation
 	writer  connWriter
 	reader  chunkReader
 	onClose func()
@@ -27,6 +30,7 @@ type Conn struct {
 	readDeadline  *pipeDeadline
 	writeDeadline *pipeDeadline
 	closing       chan struct{}
+	progress      atomic.Pointer[time.Time] // Last outbound or graceful drain progress.
 
 	publishWG sync.WaitGroup // registered before Dial exposes the connection
 	closeOnce sync.Once
@@ -49,24 +53,28 @@ type chunkReader interface {
 }
 
 func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, discard bool, onClose func()) *Conn {
-	ctx, cancel := context.WithCancel(ctx)
-	c := baseConn(ctx, cancel, onClose)
-	c.writer = newWALWriter(ctx, storage, writePrefix, p)
-	c.reader = newWALReader(ctx, storage, readPrefix, p, discard)
+	c := baseConn(ctx, onClose)
+	c.writer = newWALWriter(c.ctx, storage, writePrefix, p)
+	c.reader = newWALReader(c.ctx, storage, readPrefix, p, discard)
 	return c
 }
 
 func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, first []byte, onClose func()) *Conn {
-	ctx, fail := context.WithCancelCause(ctx)
-	c := baseConn(ctx, func() { fail(context.Canceled) }, onClose)
-	c.writer = newSlotWriter(ctx, fail, store, write, p)
-	c.reader = newSlotReader(ctx, fail, store, read, p, first, c.closing)
+	c := baseConn(ctx, onClose)
+	// Each direction has one full frame of speculative bytes per configured media lane.
+	limit := int64(len(store.pools[mediaLane].lanes)) * slotMaxFrame
+	direction := func(t slotTable) slotDirection {
+		return slotDirection{Conn: c, store: store, table: t, params: p, flight: semaphore.NewWeighted(limit), limit: limit}
+	}
+	w := newSlotWriter(direction(write))
+	c.writer, c.reader = w, newSlotReader(direction(read), first, w.done)
 	return c
 }
 
-func baseConn(ctx context.Context, cancel context.CancelFunc, onClose func()) *Conn {
+func baseConn(ctx context.Context, onClose func()) *Conn {
+	ctx, fail := context.WithCancelCause(ctx)
 	return &Conn{
-		ctx: ctx, cancel: cancel, onClose: onClose, closing: make(chan struct{}),
+		ctx: ctx, fail: fail, onClose: onClose, closing: make(chan struct{}),
 		readDeadline: newPipeDeadline(), writeDeadline: newPipeDeadline(),
 	}
 }
@@ -135,52 +143,44 @@ func (c *Conn) Close() error {
 		close(c.closing)
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
-		done := make(chan struct{})
-		var result error
-		started := time.Now()
-		progress := func() time.Time { return started }
-		if writer, ok := c.writer.(*slotWriter); ok {
-			writer.markProgress()
-			reader := c.reader.(*slotReader)
-			progress = func() time.Time {
-				last := *writer.progress.Load()
-				// Inbound activity must not hide a stalled outbound writer.
-				if credit := reader.drainCredit.Load(); isClosedChan(writer.done) && credit != nil && credit.After(last) {
-					return *credit
-				}
-				return last
+		done := make(chan error, 1)
+		c.markProgress()
+		go func() { done <- c.closeOrdered() }()
+		defer c.fail(nil)
+		for wait := slotStallTimeout; wait > 0; wait = slotStallTimeout - time.Since(*c.progress.Load()) {
+			select {
+			case c.closeErr = <-done:
+				return
+			case <-time.After(wait):
 			}
 		}
-		go func() {
-			result = c.closeOrdered(c.writer.Close())
-			close(done)
-		}()
-		c.closeErr = waitCloseProgress(done, progress)
-		if c.closeErr == nil {
-			c.closeErr = result
+		select { // Prefer completion if it raced the last timer tick.
+		case c.closeErr = <-done:
+		default:
+			c.closeErr = context.DeadlineExceeded
 		}
-		c.cancel()
 	})
 	return c.closeErr
 }
 
-func (c *Conn) closeOrdered(err error) error {
+func (c *Conn) closeOrdered() error {
+	err := c.writer.Close()
 	c.publishWG.Wait()
-	if _, slots := c.writer.(*slotWriter); slots && err == nil {
-		// Keep the discard reader and ACK worker alive through peer END or cancellation.
-		c.reader.wait()
-		err = context.Cause(c.ctx)
+	_, slots := c.writer.(*slotWriter)
+	if !slots || err != nil {
+		c.fail(nil) // Only a healthy Drive reader drains through the peer's END.
 	}
-	c.cancel()
-	c.reader.wait() // writer.Close has already joined its workers.
-	if c.onClose != nil {
-		c.onClose()
+	c.reader.wait()
+	if slots && err == nil {
+		err = context.Cause(c.ctx) // Includes failure of the final watermark.
 	}
+	c.fail(nil)
+	c.onClose()
 	return err
 }
 
 func (c *Conn) Interrupt() {
-	c.cancel()
+	c.fail(nil)
 	c.Close()
 }
 

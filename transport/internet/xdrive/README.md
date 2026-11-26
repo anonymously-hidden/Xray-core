@@ -157,9 +157,13 @@ peers must use the `XDRVSL04` format; upgrade them together from `.100`.
 ## Implementation and trade-offs
 
 `slots.go` contains the frame codec, ring announcement and
-publication, outbound writer, and inbound reader, in that order. One reader
-ACK loop owns both periodic and final watermark writes. `drive.go` owns OAuth,
-Drive requests, quotas, object CRUD, ID allocation, and media verification.
+publication, outbound writer, and inbound reader, in that order. Gathering
+yields immutable chunks to the uploader. Each direction has a byte allowance;
+promotion releases the head's reservation without canceling its media GET.
+One reader ACK loop owns both periodic and final watermark writes. `drive.go`
+owns OAuth, Drive requests, quotas, file operations, ID allocation, and media
+verification. A storage profile tracks its open sessions, so a second listener
+cannot collect their files while either peer still holds the profile locally.
 `client.go` is shared with the URL-template and S3 transports. It retains the
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
@@ -195,7 +199,10 @@ A fatal upload, media-read or watermark error cancels both halves of a Drive
 connection with the first error as the cause. A normal END only closes its
 own direction. Readers reject an overwritten sequence; a writer verifies that
 a cumulative ACK cannot cover its own unpublished sequence before reusing a slot.
-Buffered GETs can retry an interrupted response body. Streamed media resumes
+Buffered GETs can retry an interrupted response body. A media announcement
+is fetched by the file ID from the same listing that established its age and
+uniqueness. Both admission and ambiguous-write confirmation require a whole
+HTTP 200 response for that object. Streamed media resumes
 by delivered offset, and an ambiguous mutation is not replayed. Listing and ID allocation
 use the app-data space when `remoteFolder` is `appDataFolder`. Drive announcement
 age is seeded from `createdTime` and the listing response’s `Date`, so an expired
@@ -204,7 +211,9 @@ persistent exactly-once claim within the TTL. An unprovable gap (no subsequent
 frame) still looks like an idle connection; use a read deadline when one is required.
 
 Transient OAuth transport and service failures can retry before any file operation
-is sent. All Drive file attempts, including retries, reserve spaced starts at
+is sent. A token refresh has its own 30-second HTTP timeout; a stalled media
+span cannot shorten it. Refreshes honor the shared cooldown and `Retry-After`.
+All Drive file attempts and token refreshes, including retries, reserve spaced starts at
 80 requests/s per shared storage instance, across sessions and lanes. Two peers
 at this ceiling use about 9,600 attempts/minute against the observed 12,000
 quota, leaving headroom, not a guarantee for other processes or profiles sharing
@@ -224,6 +233,62 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
+The source inventory below uses the same counting rules as the 2,703-line
+candidate and the 2,903-line `.102` release. The wire format remains `XDRVSL04`.
+
+Race-instrumented peers transferred four concurrent reverse echoes on an
+eight-slot ring. A stalled GET retried after 5.125 s with a later inline
+frame; without a successor, a 6.1 s delay completed on the original GET.
+A 16 MiB + 587 byte download matched after two cuts at GET wire offsets
+0, 262,152, 262,152. Full HTTP 200 range fallback and readback after a lost
+PATCH reply were byte-exact; a persistently wrong tag was rejected.
+
+The first side-by-side HTTP/2 run compared the 2,703-line build with this
+one, five measured responses per size per build. With 220 ms metadata delay,
+the 179,017-byte median was 0.875 s and 0.781 s respectively. With one of
+four media connections delayed by 550 ms and the others by 70 ms, the
+32 MiB + 587 byte median was 1.657 s and 1.813 s. All 20 responses matched
+the origin through EOF. These are loopback timings.
+
+A repeat bulk comparison alternated build order across four blocks. With a
+slow connection selected afresh for each response, the pooled medians (32
+responses per build) were 1.7965 s and 1.7865 s. With the same connection
+held slow across four consecutive responses, aggregate throughput over four
+sequences per build was 17.682 and 17.379 MiB/s: the refactor was 1.7% lower
+on that workload. All 96 responses in this comparison were byte-exact. Live
+Google Drive throughput and browser latency were not measured.
+
+On the final race build, an OAuth endpoint returning `Retry-After: 6` received
+its next POST after 6.015 s for both 429 and 503. A seven-second refresh with
+a verified successor completed once, and its token fetched the ordered head.
+A matching HTTP 206 prefix neither admitted a media announcement nor confirmed
+a lost write reply. Persistent 206s exhausted the 15 s confirmation window
+without a second announcement POST.
+
+Two listeners sharing a storage profile preserved active session files through
+cleanup and listener replacement. A 1.84 s delayed ACK at application close
+still allowed both Drive peers to publish END before collection. Local,
+template and S3 WAL peers each echoed 255,540 bytes in each direction across
+overlapping sessions and listener restart. No XDrive race was reported.
+
+### Earlier release and candidate checks
+
+The 2,703-line candidate kept `.102`'s wire format and transfer policies. Two
+race-instrumented peers on a loopback HTTPS Drive mock delivered four concurrent
+bidirectional payloads byte-for-byte through an eight-slot ring. With only a
+later inline frame, a stalled GET retried after 5.17 s; without a successor,
+a 6.1 s delay completed without retry. A 16 MiB + 587 byte download matched
+after two cuts in a prefixed frame (wire offsets 0, 262,152, 262,152).
+The same run exercised full HTTP 200 range fallback, exact readback after a
+lost PATCH reply without replay, and rejection of a persistently wrong tag.
+
+A separate HTTP/2 mock compared `.102` and the refactor with five measured
+responses per size per version. With 220 ms metadata latency, the 179,017-byte
+response took a median 0.766 s and 0.750 s respectively. With four media
+connections (550 ms header delay on one, 70 ms on the others), a 32 MiB + 587
+byte response took 1.735 s and 1.734 s. All 20 responses matched the origin.
+These timings measure the loopback workload, not live Google Drive.
+
 Two race-instrumented peers used a loopback HTTP/2 Drive mock. With a 220 ms
 metadata delay, one 179,017-byte idle response used 14 downlink publications on
 `.101` and five on `.102`; completion was 1.50 s and 0.83 s respectively.
@@ -240,8 +305,6 @@ wrong tag, ring reuse and concurrent bidirectional transfers over Drive, local,
 template and S3 stores. In a separate HTTP/1.1 run, a 14 MiB + 661 byte response
 matched after two cuts in the same prefixed media frame: the three GETs began
 at wire offsets 0, 262,152 and 262,152. No test files were added.
-
-### Earlier release checks
 
 Two race-instrumented peers ran against a loopback TLS Drive mock. With a
 1.2 s delay before media headers, the first 6,000 application bytes of a
@@ -350,7 +413,8 @@ bidirectional transfer with a dedicated live Drive folder.
 
 ## Drive source budget (physical lines, including comments and blanks)
 
-The cap is **2,914** physical lines.
+The original cap is **2,914** physical lines; the review target for this
+refactor is **2,500**.
 
 Count all three implementation files in full, including the shared HTTP client.
 For mixed files, the following inventory charges whole integration functions
@@ -361,14 +425,14 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1055 |
-| `slots.go` | whole file | 801 |
-| `client.go` | whole file | 546 |
-| `conn.go` | 59–65, 67–72, 133–165, 167–180 | 60 |
-| `xdrive.go` | 9, 112–190, 205, 216, 240, 275–361, 419–430, 432–449, 466–498, 508–588 | 314 |
-| `params.go` | 75–91 | 17 |
-| `storage.go` | 9, 20–24, 36–56 | 27 |
-| `storage_lease.go` | whole file | 58 |
+| `drive.go` | whole file | 921 |
+| `slots.go` | whole file | 678 |
+| `client.go` | whole file | 435 |
+| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–180 | 60 |
+| `xdrive.go` | 4, 7, 11, 114–178, 188–189, 197, 199–202, 222–223, 260–286, 288–333, 341–346, 366–394, 397–413, 415–434, 436–473 | 260 |
+| `params.go` | 74–82 | 9 |
+| `storage.go` | 9, 20–25, 29–34, 45–77 | 46 |
+| `storage_lease.go` | whole file | 66 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2903** |
+| **Total** | | **2500** |

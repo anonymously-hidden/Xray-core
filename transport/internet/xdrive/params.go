@@ -25,7 +25,6 @@ type params struct {
 	holeTimeout     time.Duration
 	sessionTTL      time.Duration
 	concurrency     int
-	flightBytes     int // Drive media bytes in flight per direction
 }
 
 func millis(value uint32, fallback time.Duration) time.Duration {
@@ -72,20 +71,12 @@ func paramsFromConfig(c *Config) params {
 // paramsForStorage applies the Drive slot-path defaults only where the storage
 // uses Drive slots and only to fields the config leaves at 0; WAL backends
 // keep the defaults above because their concurrency and flush mean other things
-func paramsForStorage(c *Config, storage Storage) params {
+func paramsForStorage(c *Config, storage backend) params {
 	p := paramsFromConfig(c)
 	if _, ok := storage.(*driveStorage); ok {
-		if c.Concurrency == 0 {
-			p.concurrency = 64
-		}
-		// About one large frame per media connection keeps each one busy.
-		p.flightBytes = int(driveMediaConns(c.Xmux)) * slotMaxFrame
-		if c.FlushIntervalMs == 0 {
-			p.flushInterval = 25 * time.Millisecond
-		}
-		if c.MaxPollIntervalMs == 0 {
-			p.maxPollInterval = max(200*time.Millisecond, p.minPollInterval)
-		}
+		p.concurrency = capped(c.Concurrency, 64, maxConcurrency)
+		p.flushInterval = millis(c.FlushIntervalMs, 25*time.Millisecond)
+		p.maxPollInterval = max(p.minPollInterval, millis(c.MaxPollIntervalMs, 200*time.Millisecond))
 	}
 	return p
 }
