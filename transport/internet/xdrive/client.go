@@ -1,6 +1,7 @@
 package xdrive
 
 import (
+	"cmp"
 	"context"
 	gotls "crypto/tls"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apernet/quic-go"
@@ -27,14 +29,17 @@ import (
 var errStalled = errors.New("the request made no progress")
 
 type serviceTransport struct {
-	plain  http.RoundTripper
-	secure http.RoundTripper
-	stall  time.Duration
+	plain  *http.Transport
+	secure interface {
+		http.RoundTripper
+		CloseIdleConnections()
+	}
+	stall time.Duration
 }
 
 // Cancel stalled requests, not long transfers that continue to make progress.
 func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	next := t.plain
+	var next http.RoundTripper = t.plain
 	if r.URL.Scheme == "https" {
 		next = t.secure
 	}
@@ -89,7 +94,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if body == nil || body == http.NoBody {
 			return body
 		}
-		return &progressBody{ReadCloser: body, alive: alive, upload: true}
+		return &progressBody{ReadCloser: body, alive: alive}
 	}
 	r.Body = upload(r.Body)
 	// Rewinds performed by the transport must also reset the stall timer.
@@ -112,14 +117,8 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func (t *serviceTransport) CloseIdleConnections() {
-	closeIdleTransport(t.plain)
-	closeIdleTransport(t.secure)
-}
-
-func closeIdleTransport(t http.RoundTripper) {
-	if closer, ok := t.(interface{ CloseIdleConnections() }); ok {
-		closer.CloseIdleConnections()
-	}
+	t.plain.CloseIdleConnections()
+	t.secure.CloseIdleConnections()
 }
 
 // HTTP/2 can report the stall timeout as an ordinary cancellation.
@@ -132,15 +131,14 @@ func stalled(ctx context.Context, err error) error {
 
 type progressBody struct {
 	io.ReadCloser
-	alive  func(bool)
-	end    func()
-	upload bool
-	ctx    context.Context // response request context
+	alive func(bool)
+	end   func()
+	ctx   context.Context // response request context; nil for uploads
 }
 
 func (b *progressBody) Read(p []byte) (int, error) {
 	// Short upload reads keep the stall timer meaningful on slow connections.
-	if b.upload {
+	if b.ctx == nil {
 		p = p[:min(len(p), 16<<10)]
 	}
 	n, err := b.ReadCloser.Read(p)
@@ -176,17 +174,15 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		sockopt = streamSettings.SocketSettings
 		fronting = streamSettings.Destination
 		config, _ := streamSettings.ProtocolSettings.(*Config)
-		if config != nil && (config.Service == "google-drive" || config.Service == "Google Drive") {
+		if config.GetService() == "google-drive" || config.GetService() == "Google Drive" {
 			h2PingWait = 0 // Use net/http's 15 s ping grace on Drive's shared h2 connections.
 		}
-		if config != nil && config.Xmux != nil {
-			switch period := config.Xmux.HKeepAlivePeriod; {
-			case period > 0:
-				h3KeepAlive = time.Duration(period) * time.Second
-				h2Idle, h2PingWait = h3KeepAlive, 0
-			case period < 0:
-				h2Idle, h2PingWait = 0, 0
-			}
+		switch period := config.GetXmux().GetHKeepAlivePeriod(); {
+		case period > 0:
+			h3KeepAlive = time.Duration(period) * time.Second
+			h2Idle, h2PingWait = h3KeepAlive, 0
+		case period < 0:
+			h2Idle, h2PingWait = 0, 0
 		}
 	}
 	if tlsConfig == nil {
@@ -281,7 +277,8 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		return t
 	}
 
-	var https http.RoundTripper = &secureTransport{h2: secure(1), h1: secure(maxConns), h1Hosts: h1Hosts}
+	t := &serviceTransport{plain: transport(maxConns), stall: stall}
+	t.plain.DialContext = dialPlain
 	// no server offers h3 by ALPN over TCP, so it is used only when asked for alone
 	if slices.Equal(tlsConfig.NextProtocol, []string{"h3"}) {
 		quicParams := streamSettings.QuicParams
@@ -304,7 +301,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 			quicConfig.KeepAlivePeriod = h3KeepAlive
 		}
 
-		https = &http3.Transport{
+		t.secure = &http3.Transport{
 			QUICConfig: quicConfig,
 			Dial: func(ctx context.Context, addr string, _ *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				ctx, cancel := context.WithCancel(ctx)
@@ -360,11 +357,10 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 				return qconn, nil
 			},
 		}
+	} else {
+		t.secure = &secureTransport{h2: secure(1), h1: secure(maxConns), h1Hosts: h1Hosts}
 	}
-
-	plain := transport(maxConns)
-	plain.DialContext = dialPlain
-	return &http.Client{Transport: &serviceTransport{plain: plain, secure: https, stall: stall}}
+	return &http.Client{Transport: t}
 }
 
 // Closing the socket unregisters the owner-context callback.
@@ -406,18 +402,23 @@ var errSessionClosed = errors.New("the session is closed")
 // Running references cover both the session and any response bodies still open.
 type connPool struct {
 	mu     sync.Mutex
-	lanes  []*splithttp.XmuxManager // One pinned manager, or one per Drive media connection.
+	lanes  []connLane // One pinned manager, or one per Drive media connection.
 	spread bool
 	next   int
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
+type connLane struct {
+	manager *splithttp.XmuxManager
+	active  atomic.Int32 // Includes open response bodies, even across XMUX lease rotation.
+}
+
 type poolConn struct {
-	transport http.RoundTripper
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stop      func() bool
+	*http.Client
+	ctx    context.Context
+	cancel context.CancelFunc
+	stop   func() bool
 }
 
 func (c *poolConn) IsClosed() bool { return c.ctx.Err() != nil }
@@ -425,7 +426,7 @@ func (c *poolConn) IsClosed() bool { return c.ctx.Err() != nil }
 func (c *poolConn) Close() error {
 	c.cancel()
 	c.stop()
-	closeIdleTransport(c.transport)
+	c.CloseIdleConnections()
 	return nil
 }
 
@@ -433,35 +434,33 @@ func (c *poolConn) Close() error {
 // maxConnections when set, else 4. One Google connection carries only a
 // fraction of a link, so media requests are spread over these.
 func driveMediaConns(x *splithttp.XmuxConfig) int32 {
-	if x != nil && x.MaxConnections != nil && x.MaxConnections.To > 0 {
-		return x.MaxConnections.To
+	if n := x.GetMaxConnections().GetTo(); n > 0 {
+		return n
 	}
 	return 4
 }
 
-// Positive conns gives Drive round-robin lanes; other backends keep one manager.
+// Positive conns spreads Drive media requests; other backends keep one manager.
 func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(context.Context) *http.Client) *connPool {
-	if config == nil {
-		config = &splithttp.XmuxConfig{}
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &connPool{ctx: ctx, cancel: cancel, spread: conns > 0}
 	newConn := func() splithttp.XmuxConn {
 		ctx, cancel := context.WithCancel(p.ctx)
-		c := &poolConn{ctx: ctx, cancel: cancel, transport: newClient(ctx).Transport}
-		c.stop = context.AfterFunc(ctx, func() { closeIdleTransport(c.transport) })
+		c := &poolConn{ctx: ctx, cancel: cancel, Client: newClient(ctx)}
+		c.stop = context.AfterFunc(ctx, c.CloseIdleConnections)
 		return c
 	}
-	maxConnections := config.MaxConnections
+	maxConnections := config.GetMaxConnections()
 	if p.spread {
 		maxConnections = &splithttp.RangeConfig{From: 1, To: 1}
 	}
 	for range max(1, conns) {
-		p.lanes = append(p.lanes, splithttp.NewXmuxManager(splithttp.XmuxConfig{
-			MaxConnections: maxConnections, MaxConcurrency: config.MaxConcurrency,
-			CMaxReuseTimes: config.CMaxReuseTimes, HMaxRequestTimes: config.HMaxRequestTimes,
-			HMaxReusableSecs: config.HMaxReusableSecs, HKeepAlivePeriod: config.HKeepAlivePeriod,
-		}, newConn))
+		manager := splithttp.NewXmuxManager(splithttp.XmuxConfig{
+			MaxConnections: maxConnections, MaxConcurrency: config.GetMaxConcurrency(),
+			CMaxReuseTimes: config.GetCMaxReuseTimes(), HMaxRequestTimes: config.GetHMaxRequestTimes(),
+			HMaxReusableSecs: config.GetHMaxReusableSecs(), HKeepAlivePeriod: config.GetHKeepAlivePeriod(),
+		}, newConn)
+		p.lanes = append(p.lanes, connLane{manager: manager})
 	}
 	return p
 }
@@ -486,32 +485,43 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		if r.Body != nil {
 			r.Body.Close()
 		}
-		if err := r.Context().Err(); err != nil {
-			return nil, err
-		}
-		return nil, errSessionClosed
+		return nil, cmp.Or[error](r.Context().Err(), errSessionClosed)
 	}
 	c := t.client
+	lane := &p.lanes[0]
 	if p.spread {
-		c = p.lanes[p.next].GetXmuxClient(r.Context())
-		p.next = (p.next + 1) % len(p.lanes)
+		// Rotate ties, but avoid stacking new requests on a slow connection while peers are free.
+		best := p.next
+		for off := 1; off < len(p.lanes) && p.lanes[best].active.Load() != 0; off++ {
+			i := (p.next + off) % len(p.lanes)
+			if p.lanes[i].active.Load() < p.lanes[best].active.Load() {
+				best = i
+			}
+		}
+		lane, p.next = &p.lanes[best], (best+1)%len(p.lanes)
+		c = lane.manager.GetXmuxClient(r.Context())
 	} else if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
 		if c != nil {
 			c.DoneRunning()
 		}
-		c = p.lanes[0].GetXmuxClient(r.Context())
+		c = lane.manager.GetXmuxClient(r.Context())
 		c.AddRunning()
 		t.client = c
 	}
 	c.LeftRequests.Add(-1)
 	c.AddRunning()
+	lane.active.Add(1)
 	p.mu.Unlock()
-	resp, err := c.XmuxConn.(*poolConn).transport.RoundTrip(r)
-	if err != nil {
+	release := func() {
+		lane.active.Add(-1)
 		c.DoneRunning()
+	}
+	resp, err := c.XmuxConn.(*poolConn).Transport.RoundTrip(r)
+	if err != nil {
+		release()
 		return nil, err
 	}
-	resp.Body = &leasedBody{ReadCloser: resp.Body, release: sync.OnceFunc(c.DoneRunning)}
+	resp.Body = &leasedBody{ReadCloser: resp.Body, release: sync.OnceFunc(release)}
 	return resp, nil
 }
 

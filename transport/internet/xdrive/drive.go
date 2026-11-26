@@ -343,19 +343,27 @@ func (s *driveStorage) waitRequest(ctx context.Context) error {
 	}
 }
 
-func multipartBody(metadata, data []byte) ([]byte, string) {
-	boundary := rand.Text()
-	for bytes.Contains(metadata, []byte(boundary)) || bytes.Contains(data, []byte(boundary)) {
-		boundary = rand.Text()
-	}
+// Write tags directly into the upload buffer. A nil tag leaves an announcement body unchanged.
+func multipartBody(metadata, data, tag []byte) ([]byte, string) {
 	var body bytes.Buffer
-	body.Grow(len(metadata) + len(data) + 3*len(boundary) + 256)
-	fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", boundary)
-	body.Write(metadata)
-	fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", boundary)
-	body.Write(data)
-	fmt.Fprintf(&body, "\r\n--%s--\r\n", boundary)
-	return body.Bytes(), "multipart/related; boundary=" + boundary
+	for {
+		boundary := rand.Text()
+		body.Reset()
+		body.Grow(len(metadata) + len(data) + len(tag)*slotBlocks(len(data)) + 3*len(boundary) + 256)
+		fmt.Fprintf(&body, "--%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n", boundary)
+		body.Write(metadata)
+		fmt.Fprintf(&body, "\r\n--%s\r\nContent-Type: application/octet-stream\r\n\r\n", boundary)
+		start := body.Len()
+		for block := range slices.Chunk(data, slotTagBlock) {
+			body.Write(tag)
+			body.Write(block)
+		}
+		if bytes.Contains(metadata, []byte(boundary)) || bytes.Contains(body.Bytes()[start:], []byte(boundary)) {
+			continue // A boundary could cross a block tag.
+		}
+		fmt.Fprintf(&body, "\r\n--%s--\r\n", boundary)
+		return body.Bytes(), "multipart/related; boundary=" + boundary
+	}
 }
 
 // A canceled caller does not strand other waiters or poison the token cache.
@@ -556,12 +564,11 @@ func (f driveFile) regular() bool {
 func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
 	s.boundFolder = s.folder
 	if s.folder == "root" || s.folder == "appDataFolder" {
-		data, err := s.bytes(ctx, metadataLane, http.MethodGet, filesURL+"/"+s.folder+"?fields=id", "", nil, 4096)
-		if err != nil {
+		var f driveFile
+		if err := s.getJSON(ctx, filesURL+"/"+s.folder+"?fields=id", 4096, &f); err != nil {
 			return err
 		}
-		var f driveFile
-		if json.Unmarshal(data, &f) != nil || f.ID == "" {
+		if f.ID == "" {
 			return errors.New("cannot resolve Drive folder ID")
 		}
 		s.boundFolder = f.ID
@@ -576,7 +583,7 @@ func (s *driveStorage) bindRing(ctx context.Context, r ring) error {
 }
 
 // A name creates the file; subsequent publications patch its reserved ID.
-func (s *driveStorage) writeFile(ctx context.Context, id, name, description string, payload []byte) error {
+func (s *driveStorage) writeFile(ctx context.Context, id, name, description string, payload, tag []byte) error {
 	f := driveFile{Description: description}
 	method, path := http.MethodPatch, "/"+url.PathEscape(id)
 	if name != "" {
@@ -595,7 +602,7 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 	target, query, typ := filesURL, "?fields=id&supportsAllDrives=true", "application/json"
 	if payload != nil {
 		target, query = uploadURL, query+"&uploadType=multipart"
-		md, typ = multipartBody(md, payload)
+		md, typ = multipartBody(md, payload, tag)
 	}
 	data, err := s.bytes(ctx, writeLane(ctx, payload), method, target+path+query, typ, md, 4096)
 	if err == nil {
@@ -655,18 +662,22 @@ func writeLane(ctx context.Context, body []byte) driveLane {
 	return metadataLane
 }
 
+func (s *driveStorage) getJSON(ctx context.Context, target string, limit int64, v any) error {
+	data, err := s.bytes(ctx, writeLane(ctx, nil), http.MethodGet, target, "", nil, limit)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, v)
+}
+
 func (s *driveStorage) readDescription(ctx context.Context, id string) (string, error) {
 	name, pending := s.unchecked.Load(id)
 	fields := "description"
 	if pending {
 		fields += ",name,parents,trashed,mimeType"
 	}
-	data, err := s.bytes(ctx, writeLane(ctx, nil), http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?fields="+fields+"&supportsAllDrives=true", "", nil, 64<<10)
-	if err != nil {
-		return "", err
-	}
 	var f driveFile
-	if err := json.Unmarshal(data, &f); err != nil {
+	if err := s.getJSON(ctx, filesURL+"/"+url.PathEscape(id)+"?fields="+fields+"&supportsAllDrives=true", 64<<10, &f); err != nil {
 		return "", err
 	}
 	if pending {
@@ -833,14 +844,13 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 	if len(s.ids) < n || time.Now().After(s.idsExpire) {
 		count := min(1000, 3*n)
 		target := fmt.Sprintf("%s/generateIds?count=%d&space=%s", filesURL, count, s.space)
-		data, err := s.bytes(ctx, metadataLane, http.MethodGet, target, "", nil, 256<<10)
-		if err != nil {
-			return nil, err
-		}
 		var batch struct {
 			IDs []string `json:"ids"`
 		}
-		if json.Unmarshal(data, &batch) != nil || len(batch.IDs) != count || !validSlotIDs(make(map[string]bool, count), batch.IDs...) {
+		if err := s.getJSON(ctx, target, 256<<10, &batch); err != nil {
+			return nil, err
+		}
+		if len(batch.IDs) != count || !validSlotIDs(make(map[string]bool, count), batch.IDs...) {
 			return nil, errors.New("invalid Drive ID batch")
 		}
 		s.ids, s.idsExpire = batch.IDs, time.Now().Add(10*time.Minute)
@@ -863,7 +873,7 @@ func (s *driveStorage) putObject(ctx context.Context, id, name string, payload [
 		description = base64.StdEncoding.EncodeToString(payload)
 		payload = nil
 	}
-	return s.writeFile(ctx, id, name, description, payload)
+	return s.writeFile(ctx, id, name, description, payload, nil)
 }
 
 func (s *driveStorage) find(ctx context.Context, query string, describe, dateEntries bool) ([]driveFile, error) {

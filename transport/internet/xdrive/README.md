@@ -19,8 +19,8 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
   Input is normally gathered for 25 ms. A small first write with no uploads
-  in flight gets a 2 ms window outside cooldown. Idle bursts may use up to
-  24 inline positions. There are at most 32 upload workers per direction
+  in flight gets a 2 ms window outside cooldown. A burst that fits in four
+  inline positions can avoid a media GET. There are at most 32 upload workers per direction
   and never more than the ring depth.
   Reuse requires previous local completion and cumulative remote credit.
 - **Read:** idle polling focuses on the head. After a minute without a head,
@@ -43,8 +43,8 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
   and targeting at least 512 KiB of payload per range.
   If the first range returns a full HTTP 200 body, keep it and cancel the other
   ranges instead of downloading the full body four times. Validate every
-   block's sequence tag, HTTP range/length and EOF. Resume an incomplete span
-   without delivering the same bytes twice (see Fetch below). No media GET runs
+  block's sequence tag, HTTP range/length and EOF. Resume an incomplete span
+  without delivering the same bytes twice (see Fetch below). No media GET runs
   before discovering its frame description.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
@@ -76,24 +76,22 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    Cooldown freezes frame size instead of shrinking it: smaller frames spend
    more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
    the writer is a ring ahead. Larger frames carry more bytes per position.
-3. **Publish.** Up to 14 KiB goes inline in a file description. Idle bursts
-   can use several available inline positions, avoiding a media GET. The
-   planner suppresses large inline waves while streaming and for the eager
-   window after a media upload starts (2 s by default). A whole burst that
-   fits in up to four inline slots (56 KiB at the defaults) can still split if
-   enough upload permits are free and fewer than eight uploads are in flight.
-   This exchanges extra slot publications for avoiding a dependent media GET.
-   A partial frame with all 24 inline positions free and no recent media can
-   still use an inline lead. During cooldown the writer does not split bursts.
+3. **Publish.** Up to 14 KiB goes inline in a file description. With fewer
+   than eight uploads in flight and outside cooldown, the writer splits a
+   burst only if it fits entirely in at most four free slots (56 KiB). Four
+   positions fit in the reader's discovery window even past the frontier.
+   Larger bursts use one media publication instead of multiple waves of GETs
+   for descriptions. Tags are written directly into the multipart upload
+   buffer, avoiding an intermediate copy of the entire media body.
    A media frame is one multipart create or PATCH: the description holds
    `XDRVSL04`, sequence, mode and total payload length. For media frames up to
-   256 KiB it also holds the first 14 KiB of payload. The reader can deliver
+   1 MiB it also holds the first 14 KiB of payload. The reader can deliver
    this prefix in order before the body GET returns; it costs no extra slot or
    request. The rest (all payload for larger frames) is stored in blocks of an
    8-byte sequence tag and up to 256 KiB of data. At most 32 uploads and
    4 MiB of unfinished uploads per media connection run per direction (one
-   frame may exceed it alone). Media requests rotate per request over
-   the media connections (XMUX `maxConnections`, default 4): one Google
+   frame may exceed it alone). Each media request uses the lane with the
+   fewest unfinished requests, rotating ties (XMUX `maxConnections`, default 4): one Google
    connection carries only a fraction of a link (a measured single-connection
    client download averaged ~0.22 MB/s). The byte bound,
    about one 4 MiB frame per connection, bounds payload bytes, not request count
@@ -132,8 +130,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    It can restart early only if its frame is the ordered head, the coordinator is
    draining this specific span, and Drive is not cooling down. There must be
    evidence of progress: a later range in this frame or a later media frame
-   has verified through EOF. The latter also covers the last range of a frame
-   and a progressive GET waiting for headers. An interrupted header wait uses the existing HTTP GET retry budget;
+   has verified through EOF, or a later inline frame has been read in full.
+   A verified successor also covers the last range of a frame and a progressive
+   GET waiting for headers. An interrupted header wait uses the existing HTTP GET retry budget;
    a partial body uses offset-aware resume. After a stall
    triggers a retry, subsequent attempts use the ordinary timeout. Any positive
    body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
@@ -164,9 +163,9 @@ Drive requests, quotas, object CRUD, ID allocation, and media verification.
 `client.go` is shared with the URL-template and S3 transports. It retains the
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
-pools. Metadata and priority select a lease once per session; media rotates
-per request across one-connection XMUX lanes instead of random selection
-(the upper `maxConnections` bound, default 4). Request/reuse/lifetime limits
+pools. Metadata and priority select a lease once per session. Media chooses
+among one-connection XMUX lanes by outstanding requests, counting a response
+until its body closes, including across lease rotation. Request/reuse/lifetime limits
 still apply within each lane; the media byte budget follows the same count.
 Peer-supplied IDs are checked for valid syntax and uniqueness. An existing
 object must match its announced session name and configured parent on first
@@ -225,6 +224,25 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
+Two race-instrumented peers used a loopback HTTP/2 Drive mock. With a 220 ms
+metadata delay, one 179,017-byte idle response used 14 downlink publications on
+`.101` and five on `.102`; completion was 1.50 s and 0.83 s respectively.
+For three 32 MiB + 587 byte responses per version, one of four media connections
+delayed GET headers by 550 ms, the others by 70 ms. All payloads matched.
+The delayed connection received nine GETs per transfer on `.101` and three
+to four on `.102`. Median completion fell from 2.02 s to 1.83 s. This models
+uneven connections; it does not measure sustained speed on live Drive.
+
+A later inline frame alone allowed a blocked media GET to retry after 5.17 s;
+a 6.1 s header delay with no successor completed on the first attempt. The
+workload also covered a full HTTP 200 fallback, an ambiguous PATCH, a persistent
+wrong tag, ring reuse and concurrent bidirectional transfers over Drive, local,
+template and S3 stores. In a separate HTTP/1.1 run, a 14 MiB + 661 byte response
+matched after two cuts in the same prefixed media frame: the three GETs began
+at wire offsets 0, 262,152 and 262,152. No test files were added.
+
+### Earlier release checks
+
 Two race-instrumented peers ran against a loopback TLS Drive mock. With a
 1.2 s delay before media headers, the first 6,000 application bytes of a
 110,003-byte response arrived in 0.11–0.33 s on `.101` versus 1.38–1.56 s on
@@ -239,8 +257,6 @@ and a slow full HTTP 200 fallback completed without early retry. A twice-truncat
 prefixed body resumed byte-exactly; a persistent wrong tag failed after one
 retry. The mock also covered a lost committed PATCH reply, concurrent echoes,
 and concurrent local, template and S3 WAL transfers.
-
-### Earlier release checks
 
 Two race-instrumented Drive peers delivered a 40,000-byte browsing tail after
 bulk traffic as three inline slots, and confirmed a committed inline PATCH
@@ -334,7 +350,7 @@ bidirectional transfer with a dedicated live Drive folder.
 
 ## Drive source budget (physical lines, including comments and blanks)
 
-The cap is **2,954** physical lines.
+The cap is **2,914** physical lines.
 
 Count all three implementation files in full, including the shared HTTP client.
 For mixed files, the following inventory charges whole integration functions
@@ -345,9 +361,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1045 |
-| `slots.go` | whole file | 832 |
-| `client.go` | whole file | 536 |
+| `drive.go` | whole file | 1055 |
+| `slots.go` | whole file | 801 |
+| `client.go` | whole file | 546 |
 | `conn.go` | 59–65, 67–72, 133–165, 167–180 | 60 |
 | `xdrive.go` | 9, 112–190, 205, 216, 240, 275–361, 419–430, 432–449, 466–498, 508–588 | 314 |
 | `params.go` | 75–91 | 17 |
@@ -355,4 +371,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | whole file | 58 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2914** |
+| **Total** | | **2903** |
