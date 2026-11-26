@@ -33,6 +33,7 @@ const (
 	driveMaxInflight    = 64
 	driveMaxAttempts    = 8
 	driveTimeout        = time.Minute
+	driveReconnectGrace = 45 * time.Second
 	driveRequestSpacing = time.Second / 80
 	driveInitialBackoff = 200 * time.Millisecond
 	driveMaxBackoff     = 8 * time.Second
@@ -386,10 +387,7 @@ func readLimited(r io.Reader, limit int64) ([]byte, error) {
 	if int64(len(b)) > limit {
 		return nil, errDriveSize
 	}
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+	return b, err
 }
 
 // request holds its permit through consume; only an explicit rejection permits write replay.
@@ -560,9 +558,9 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 		return err
 	}
 	// One writer per file: confirm the exact frame or ACK without replay.
-	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), 15*time.Second)
+	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), driveReconnectGrace)
 	defer cancel()
-	for verify.Err() == nil {
+	for delay := driveInitialBackoff; verify.Err() == nil; delay = min(2*delay, 2*time.Second) {
 		d, readErr := s.readDescription(verify, id)
 		matches := readErr == nil && d == description
 		if matches && description == "" && payload != nil { // A media announcement needs a full body comparison.
@@ -573,7 +571,7 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 		if matches {
 			return nil
 		}
-		if readErr == errDriveScope || isAuthError(readErr) || sleepContext(verify, 150*time.Millisecond) != nil {
+		if readErr == errDriveScope || isAuthError(readErr) || sleepContext(verify, delay) != nil {
 			break
 		}
 	}
@@ -615,12 +613,12 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 }
 
 // readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
-// A second resume requires fresh payload progress and another transport read failure.
+// On a flaky connection, allow an interrupted resume to reconnect once without new bytes.
 func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole func()) error {
 	const stride = slotBodyHeader + slotTagBlock
 	total := f.size + slotBodyHeader*slotBlocks(f.size)
 	pos := lo * slotTagBlock // Payload offset of the next undelivered chunk.
-	for attempt := 0; ; attempt++ {
+	for attempt, stalled := 1, false; ; attempt++ {
 		before := pos
 		first := min(pos/slotTagBlock, hi-1)
 		start, end := first*stride, min(hi*stride, total)
@@ -629,7 +627,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
 		}
 		var headers time.Time
-		var readErr error // Only failed tag/payload reads qualify for the second resume.
+		var readErr error // Only interrupted reads qualify for further resumes.
 		started := time.Now()
 		err := s.request(ctx, mediaLane, http.MethodGet, driveMediaURL(id), "", nil, header, false, func(resp *http.Response) error {
 			headers = time.Now()
@@ -676,14 +674,15 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 					at += len(b)
 				}
 			}
-			if _, err := io.ReadFull(resp.Body, tag[:1]); err != io.EOF {
-				return errors.New("Drive media did not end at the declared length").Base(err)
+			if _, readErr = io.ReadFull(resp.Body, tag[:1]); readErr != io.EOF {
+				return errors.New("Drive media did not end at the declared length").Base(readErr)
 			}
 			errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
 			return nil
 		})
-		firstRetry := attempt == 0 && (!headers.IsZero() || err == errNotFound || err == errDriveRange)
-		progressRetry := attempt == 1 && readErr != nil && pos > before
+		firstRetry := attempt == 1 && (!headers.IsZero() || err == errNotFound || err == errDriveRange)
+		progressRetry := attempt < driveMaxAttempts && readErr != nil && (!stalled || pos > before)
+		stalled = pos == before
 		if err == nil || ctx.Err() != nil || !firstRetry && !progressRetry {
 			return err
 		}
@@ -870,8 +869,6 @@ func (s *driveStorage) List(ctx context.Context, prefix string) ([]Entry, error)
 	return slices.Collect(maps.Values(entries)), nil
 }
 
-var errDriveDuplicate = errors.New("multiple Drive files have the requested name")
-
 // readRing returns nil without an error for malformed announcements. Only a valid
 // ring needs the canonical parent ID for its first file identity checks.
 func (s *driveStorage) readRing(ctx context.Context, session string, e Entry) (*ring, error) {
@@ -905,7 +902,7 @@ func (s *driveStorage) Delete(ctx context.Context, name string) error {
 		return err
 	}
 	if strings.HasPrefix(name, sessionsDir+"/") && len(ids) > 1 {
-		return errDriveDuplicate
+		return errors.New("multiple Drive files have the requested name")
 	}
 	for _, id := range slices.DeleteFunc(ids, func(id string) bool { return id == "" }) {
 		// Share cleanup pacing across sessions instead of competing with uploads.

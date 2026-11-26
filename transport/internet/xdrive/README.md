@@ -121,8 +121,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    A full HTTP 200 response to the first range replaces all ranges; the others
    are canceled before any of their bytes are delivered. Bytes are delivered
    in pieces of up to 4 KiB at offset zero, then up to 32 KiB. A retry starts
-   at the block containing the first undelivered byte. If that retry emits new
-   payload and is interrupted again while reading, it gets one more resume.
+   at the block containing the first undelivered byte. Interrupted body reads
+   can use up to eight span attempts, stopping after two consecutive attempts
+   emit no new payload. A second wrong tag, range or length still fails.
    The offset is relative to the media body, excluding any description prefix.
    Duplicate bytes are skipped; tags, declared length and exact EOF are checked.
    For a multi-range frame, the first range streams straight into the frame queue.
@@ -183,8 +184,9 @@ allocation failure now fails the dial explicitly instead of switching to WAL.
 Announcements are also created with reserved IDs. After a lost reply, read back
 the exact slot, watermark or inline announcement description; for a media
 announcement also compare the complete body. Never replay an ambiguous write.
-After an ambiguous create or PATCH the writer has up to 15 s to confirm the
-exact contents across a reconnect, including data slots and watermarks. There
+After an ambiguous create or PATCH the writer has up to 45 s to confirm the
+exact contents across a reconnect, including data slots and watermarks. The
+first check is immediate; failed checks back off from 200 ms to 2 s. There
 is no added wait on a successful write. An unconfirmed write still fails the
 connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
 the original write error is preserved. Graceful close reports final ACK errors. These are
@@ -219,8 +221,9 @@ at this ceiling use about 9,600 attempts/minute against the observed 12,000
 quota, leaving headroom, not a guarantee for other processes or profiles sharing
 the project. Each admitted attempt reserves its own pacing turn and rechecks
 cooldown before proceeding. Cancellation may leave an unused pacing turn.
-Drive's default HTTP/2 health check probes after 1.5 s of read idle and uses
-Go's 15 s ping-response grace. An explicit keepalive setting still takes precedence.
+Drive's HTTP/2 health check probes after 10 s of read idle and allows 45 s for
+the PING reply before closing the shared connection. An explicit keepalive
+period still overrides the idle interval; a negative period disables PINGs.
 Drive rate-limit responses and 503 responses with `Retry-After` apply a shared
 exponential cooldown (jittered 2–30 s base), reset after a minute without a new
 cooldown. Concurrent rejections in one cooldown do not escalate independently;
@@ -231,7 +234,34 @@ announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
 
-### Verification of this candidate
+### Slow-link recovery
+
+The paired client/server capture contained seven matching sessions. All six
+client session failures reported `http2: client connection lost`: four PATCHes
+(two explicitly identified as watermarks), one POST and one media read. In Go
+1.27.4 this error is raised by the HTTP/2 PING health check. The server reported
+`.103`; the client log did not include the release suffix. Neither logged a
+Drive cooldown.
+
+Race-instrumented peers on a loopback HTTP/2 Drive mock gave these results:
+
+| Fault | `.103` | Slow-link change |
+|---|---|---|
+| Client-side traffic paused for 35 s during a write | Watermark failure and session loss at 31.5 s | Original connection and session delivered the interrupted response and a follow-up byte-for-byte |
+| Committed slot write lost its reply; exact readback hidden for 20 s | Follow-up needed a new session | Confirmed at 21.2 s; follow-up used the same session. Both builds sent the mutation once. |
+| Four interruptions in one media span, including a resume that emitted no new payload | Response ended early on the second cut | All 3,146,057 response bytes matched; five GETs for the interrupted span |
+
+With a lost watermark reply and 20 s of stale readbacks, a 16 MiB + 329 byte
+response and a follow-up also matched on one session, with one watermark
+mutation for the affected sequence. A write that never committed failed after
+45.1 s without replay. With just the original socket blackholed, the first
+readback arrived over a working connection at 55 s. Two attempts with no new
+payload or two wrong tags stopped the read; repeated progressing cuts stopped
+on attempt eight. A 16 MiB + 329 byte response matched through EOF both when
+the mock ignored Range and when a range trickled 4 KiB at a time for over 10 s.
+The trickling range used one GET. These checks measure recovery, not live goodput.
+
+### Verification of `.103`
 
 The source inventory below uses the same counting rules as the 2,703-line
 candidate and the 2,903-line `.102` release. The wire format remains `XDRVSL04`.
@@ -413,8 +443,7 @@ bidirectional transfer with a dedicated live Drive folder.
 
 ## Drive source budget (physical lines, including comments and blanks)
 
-The original cap is **2,914** physical lines; the review target for this
-refactor is **2,500**.
+The cap is **2,500** physical lines.
 
 Count all three implementation files in full, including the shared HTTP client.
 For mixed files, the following inventory charges whole integration functions
@@ -425,9 +454,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 921 |
+| `drive.go` | whole file | 918 |
 | `slots.go` | whole file | 678 |
-| `client.go` | whole file | 435 |
+| `client.go` | whole file | 438 |
 | `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–180 | 60 |
 | `xdrive.go` | 4, 7, 11, 114–178, 188–189, 197, 199–202, 222–223, 260–286, 288–333, 341–346, 366–394, 397–413, 415–434, 436–473 | 260 |
 | `params.go` | 74–82 | 9 |

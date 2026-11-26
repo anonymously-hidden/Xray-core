@@ -166,11 +166,14 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	period := config.GetXmux().GetHKeepAlivePeriod()
 	h3KeepAlive := time.Duration(max(period, 0)) * time.Second
 	h2 := &http.HTTP2Config{SendPingTimeout: 1500 * time.Millisecond, PingTimeout: 2500 * time.Millisecond}
-	switch {
-	case period != 0:
-		h2.SendPingTimeout, h2.PingTimeout = h3KeepAlive, 0
-	case config.GetService() == "google-drive" || config.GetService() == "Google Drive":
-		h2.PingTimeout = 0 // net/http's default ping grace on Drive's shared h2 connections.
+	if config.GetService() == "google-drive" || config.GetService() == "Google Drive" {
+		// A missed PING tears down every in-flight read and write on this connection.
+		h2.SendPingTimeout, h2.PingTimeout = 10*time.Second, driveReconnectGrace
+	} else if period != 0 {
+		h2.PingTimeout = 0
+	}
+	if period != 0 {
+		h2.SendPingTimeout = h3KeepAlive
 	}
 	clientTLS := tls.Client
 	if fp := tls.GetFingerprint(tlsConfig.Fingerprint); fp != nil {
