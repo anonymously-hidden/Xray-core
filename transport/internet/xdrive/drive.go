@@ -67,7 +67,8 @@ type driveShared struct {
 	tokenClient                                                   *http.Client
 	pools                                                         [laneCount]*connPool
 	permits                                                       [laneCount]chan struct{}
-	headMedia                                                     chan struct{} // reserved HTTP permits, same media pool
+	headMedia                                                     chan struct{}            // reserved HTTP permits, same media pool
+	turns                                                         [laneCount]chan struct{} // media and metadata share the ordinary queue
 	cancel                                                        context.CancelFunc
 	sessionGuard                                                  driveSessionGuard
 	mu                                                            sync.Mutex
@@ -96,6 +97,8 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
 		headMedia: make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
 	}}
+	s.turns[metadataLane], s.turns[priorityLane] = make(chan struct{}, 1), make(chan struct{}, 1)
+	s.turns[mediaLane] = s.turns[metadataLane]
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
@@ -106,8 +109,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 		s.permits[i] = make(chan struct{}, limit)
 	}
 	s.tokenClient.CheckRedirect = driveRedirect
-	s.openClients()
-	return s, nil
+	return s.openClients(), nil
 }
 
 // Redirect reads only: never convert a mutation to GET or forward a refresh form.
@@ -118,16 +120,15 @@ func driveRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-func (s *driveStorage) openClients() {
+func (s *driveStorage) openClients() *driveStorage {
 	for i, pool := range s.pools {
 		s.clients[i] = &http.Client{Transport: &sessionTransport{pool: pool, spread: driveLane(i) == mediaLane}, CheckRedirect: driveRedirect}
 	}
+	return s
 }
 
 func (s *driveStorage) session() Storage {
-	c := &driveStorage{driveShared: s.driveShared, child: true}
-	c.openClients()
-	return c
+	return (&driveStorage{driveShared: s.driveShared, child: true}).openClients()
 }
 
 func (s *driveStorage) Close() error {
@@ -325,19 +326,36 @@ func (s *driveStorage) delayRequests(h http.Header) {
 	errors.LogDebug(context.Background(), "xdrive cooldown ", time.Until(s.coolUntil))
 }
 
-// Reserve spaced starts across all lanes; a later cooldown reschedules the turn.
-func (s *driveStorage) waitRequest(ctx context.Context) error {
+// A promoted read can switch queues while waiting for a permit or pacing turn.
+func acquireDrive(ctx context.Context, ordinary, urgent chan struct{}, head <-chan struct{}) (chan struct{}, error) {
+	for {
+		if isClosedChan(head) {
+			ordinary, head = urgent, nil
+		}
+		select {
+		case ordinary <- struct{}{}:
+			return ordinary, nil
+		case <-head:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (s *driveStorage) waitRequest(ctx context.Context, lane driveLane, head <-chan struct{}) error {
+	turn, err := acquireDrive(ctx, s.turns[lane], s.turns[priorityLane], head)
+	if err != nil {
+		return err
+	}
+	defer func() { <-turn }()
 	for {
 		s.mu.Lock()
 		now := time.Now()
 		delay := max(0, s.coolUntil.Sub(now), s.nextRequest.Sub(now))
 		s.nextRequest = now.Add(delay).Add(time.Second / 80)
 		s.mu.Unlock()
-		if err := sleepContext(ctx, delay); err != nil {
+		if err := sleepContext(ctx, delay); err != nil || !s.cooling() {
 			return err
-		}
-		if !s.cooling() {
-			return nil
 		}
 	}
 }
@@ -431,25 +449,10 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return err
 			}
 		}
-		permits := s.permits[lane]
-		var head <-chan struct{}
-		if lane == mediaLane && method == http.MethodGet {
-			head, _ = ctx.Value(mediaHeadKey{}).(<-chan struct{})
-		}
-		if isClosedChan(head) {
-			permits, head = s.headMedia, nil
-		}
-		select {
-		case permits <- struct{}{}:
-		case <-head: // A queued look-ahead request has become the ordered head.
-			permits = s.headMedia
-			select {
-			case permits <- struct{}{}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		case <-ctx.Done():
-			return ctx.Err()
+		head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{}) // only frame GETs carry this
+		permits, err := acquireDrive(ctx, s.permits[lane], s.headMedia, head)
+		if err != nil {
+			return err
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-permits }()
@@ -458,7 +461,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				_, retry := err.(tokenRetry) // No file request has been sent yet.
 				return retry, err
 			}
-			if err := s.waitRequest(ctx); err != nil {
+			if err := s.waitRequest(ctx, lane, head); err != nil {
 				return false, err
 			}
 			req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
@@ -603,7 +606,7 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 		return err
 	}
 	// One writer per file: confirm the exact frame or ACK without replay.
-	verify, cancel := context.WithTimeout(ctx, 2*time.Second)
+	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), 2*time.Second)
 	defer cancel()
 	for verify.Err() == nil {
 		d, readErr := s.readDescription(verify, id)
@@ -715,9 +718,6 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 				if lo == 0 && whole != nil {
 					hi, stop = n, f.size
 					whole() // Keep this response; cancel redundant full-body downloads.
-					if header != "" {
-						errors.LogDebug(ctx, "xdrive media seq ", f.seq, " Range ignored; using one full body")
-					}
 				}
 			case http.StatusPartialContent:
 				if resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", start, end-1, total) {
@@ -738,7 +738,11 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 					return errDriveRange // an older lap of this slot
 				}
 				for at, blockEnd := i*slotTagBlock, min((i+1)*slotTagBlock, f.size); at < blockEnd; {
-					b := make([]byte, min(slotReadChunk, blockEnd-at))
+					size := slotReadChunk
+					if at == 0 { // Expose headers before a slow link fills the first 32 KiB.
+						size = 4 << 10
+					}
+					b := make([]byte, min(size, blockEnd-at))
 					if _, err := io.ReadFull(resp.Body, b); err != nil {
 						return err
 					}

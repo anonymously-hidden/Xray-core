@@ -17,11 +17,10 @@ Mode 1 carries up to 14 KiB in metadata, mode 5 a media body, modes 3 and 4
 mean end and error. See "Transport model" below.
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
-  Input is gathered for 25 ms; after idle, a small write has a 2 ms window.
-  The planner uses up to 24 available inline positions; larger bursts can use
-  media. There are at most 32 upload workers per direction and never more than
-  the ring depth. For the eager window after a media upload starts (default 2 s),
-  later bursts do not split into inline waves even if few uploads remain.
+  Input is normally gathered for 25 ms. A fresh burst gets a 2 ms window and
+  one priority inline lead of up to 14 KiB outside cooldown. The remainder
+  uses normal frame sizes. There are at most 32 upload workers per direction
+  and never more than the ring depth.
   Reuse requires previous local completion and cumulative remote credit.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
@@ -61,8 +60,9 @@ Receiving END alone does not close the outbound half.
 Each direction is a ring of `depth` Drive files plus one watermark file owned
 by the reader. Sequence `n` always lives in `slots[n % depth]`.
 
-1. **Gather.** The writer collects caller input for up to 25 ms (2 ms after
-   idle for a single small write) or until the current frame size is reached.
+1. **Gather.** The writer collects caller input for up to 25 ms or until the
+   current frame size is reached. After an input gap of at least one flush
+   interval with no uploads outstanding, it gathers for at most 2 ms outside cooldown.
    With 4 or more uploads in flight the writer is streaming: it keeps
    gathering while input keeps arriving, up to 200 ms or a full frame, and
    sends once input pauses for 25 ms, so a reply burst goes out as one frame.
@@ -73,11 +73,11 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    Cooldown freezes frame size instead of shrinking it: smaller frames spend
    more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
    the writer is a ring ahead. Larger frames carry more bytes per position.
-3. **Publish.** Up to 14 KiB goes inline in the file description (one PATCH;
-   an idle writer may split a burst into up to 24 inline frames, a streaming
-   writer never does, because the reader finds only about 24 frames per round
-   trip and 14 KiB frames would cap throughput near 1 MB/s). Larger frames
-   are one multipart PATCH: the description holds `XDRVSL03`, sequence, mode
+3. **Publish.** Up to 14 KiB goes inline in the file description. A fresh
+   burst gets one inline lead outside cooldown, so the peer can read its first
+   bytes without a media GET. Remaining bytes use the normal frame size rather
+   than splitting the burst into a wave of metadata writes. A media frame
+   is one multipart create or PATCH: the description holds `XDRVSL03`, sequence, mode
    and length; the body is blocks of an 8-byte sequence tag followed by up to
    256 KiB of data. At most 32 uploads and
    4 MiB of unfinished uploads per media connection run per direction (one
@@ -110,7 +110,7 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    ~1 s, per large frame).
    A full HTTP 200 response to the first range replaces all ranges; the others
    are canceled before any of their bytes are delivered. Bytes are delivered
-   in 32 KiB pieces as they arrive. One retry resumes
+   in pieces of up to 4 KiB at offset zero, then up to 32 KiB. One retry resumes
    after the delivered bytes; the declared length and exact EOF are checked.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
    frames or 1.5 s. A slot is rewritten only after that credit. Frame size
@@ -181,8 +181,11 @@ is sent. All Drive file attempts, including retries, reserve spaced starts at
 80 requests/s per shared storage instance, across sessions and lanes. Two peers
 at this ceiling use about 9,600 attempts/minute against the observed 12,000
 quota, leaving headroom, not a guarantee for other processes or profiles sharing
-the project. Queued requests recheck cooldown before proceeding. Cancellation
-may leave unused pacing turns, but releases the request permit.
+the project. Ordinary and priority work can each hold one upcoming pacing turn;
+an ordinary backlog cannot book the clock ahead of head reads, watermarks,
+fresh inline leads or metadata write confirmations. A media GET promoted to head
+can switch queues while waiting. Both classes recheck the same cooldown.
+Cancellation releases its permits but may leave an unused pacing turn.
 Drive rate-limit responses and 503 responses with `Retry-After` apply a shared
 exponential cooldown (jittered 2–30 s base), reset after a minute without a new
 cooldown. Concurrent rejections in one cooldown do not escalate independently;
@@ -194,6 +197,13 @@ The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
 
 ### Verification of this candidate
+
+The latency changes were built with `go build ./...` and vetted with
+`go vet ./transport/internet/xdrive`. Two Go peers ran against a loopback
+Drive HTTP/1.1 mock over TLS, with 161 concurrent requests: 160 small assets
+and one 3 MiB + 301 byte response. All response bodies matched exactly despite
+a lost committed-write reply and one media response cut after 4,119 wire bytes.
+This exercises recovery and byte order, not live-Drive TTFB or throughput.
 
 This version descends from the v7 candidate, which began as a literal merge
 of v6's four slot files. The per-block CRCs, the checksum table and the
@@ -230,8 +240,8 @@ this Go package**:
 **Release gates:** the candidate workspace had no Go 1.27 or `gofmt`, so the
 model checks above did not build it. This snapshot was formatted with `gofmt`
 (and the repository's `vformat`/`vprotogen` checks), vetted and built with the
-`go.mod` toolchain; it has not been run against an HTTP mock in Go, with a
-`-race` workload, or against live Drive. The inventory below is the physical
+`go.mod` toolchain. The loopback run above used a Python HTTP mock; neither a
+`-race` workload nor live Drive was tested. The inventory below is the physical
 post-`gofmt` count. No XDrive test file is shipped.
 
 For deeper assurance, in a disposable checkout, run the same depth-two
@@ -253,8 +263,8 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1056 |
-| `slots.go` | whole file | 879 |
+| `drive.go` | whole file | 1060 |
+| `slots.go` | whole file | 874 |
 | `client.go` | whole file | 537 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
@@ -263,4 +273,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2999** |
+| **Total** | | **2998** |
