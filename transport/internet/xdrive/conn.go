@@ -45,36 +45,29 @@ type chunkReader interface {
 	chunks() <-chan []byte
 	Err() error
 	Wake()
+	wait()
 }
 
 func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix string, p params, discard bool, onClose func()) *Conn {
 	ctx, cancel := context.WithCancel(ctx)
-	return &Conn{
-		ctx:     ctx,
-		cancel:  cancel,
-		writer:  newWALWriter(ctx, storage, writePrefix, p),
-		reader:  newWALReader(ctx, storage, readPrefix, p, discard),
-		onClose: onClose,
-
-		readDeadline:  newPipeDeadline(),
-		writeDeadline: newPipeDeadline(),
-		closing:       make(chan struct{}),
-	}
+	c := baseConn(ctx, cancel, onClose)
+	c.writer = newWALWriter(ctx, storage, writePrefix, p)
+	c.reader = newWALReader(ctx, storage, readPrefix, p, discard)
+	return c
 }
 
-func newSlotConn(ctx context.Context, store slotStore, write, read slotTable, p params, first []byte, onClose func()) *Conn {
+func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, first []byte, onClose func()) *Conn {
 	ctx, fail := context.WithCancelCause(ctx)
-	closing := make(chan struct{})
-	return &Conn{
-		ctx:     ctx,
-		cancel:  func() { fail(context.Canceled) },
-		writer:  newSlotWriter(ctx, fail, store, write, p),
-		reader:  newSlotReader(ctx, fail, store, read, p, first, closing),
-		onClose: onClose,
+	c := baseConn(ctx, func() { fail(context.Canceled) }, onClose)
+	c.writer = newSlotWriter(ctx, fail, store, write, p)
+	c.reader = newSlotReader(ctx, fail, store, read, p, first, c.closing)
+	return c
+}
 
-		readDeadline:  newPipeDeadline(),
-		writeDeadline: newPipeDeadline(),
-		closing:       closing,
+func baseConn(ctx context.Context, cancel context.CancelFunc, onClose func()) *Conn {
+	return &Conn{
+		ctx: ctx, cancel: cancel, onClose: onClose, closing: make(chan struct{}),
+		readDeadline: newPipeDeadline(), writeDeadline: newPipeDeadline(),
 	}
 }
 
@@ -82,44 +75,29 @@ func (c *Conn) Read(b []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	select {
-	case <-c.closing:
+	deadline := c.readDeadline.wait()
+	if isClosedChan(c.closing) {
 		return 0, io.ErrClosedPipe
-	default:
 	}
-	select {
-	case <-c.readDeadline.wait():
+	if isClosedChan(deadline) {
 		return 0, os.ErrDeadlineExceeded
-	default:
 	}
 	if len(b) == 0 {
 		return 0, nil
 	}
-	if len(c.readBuf) > 0 {
-		// Check state again before consuming buffered bytes: deadline or Close
-		// may have happened after we filled readBuf but before this Read call.
+	if len(c.readBuf) == 0 {
 		select {
+		case data, ok := <-c.reader.chunks():
+			if !ok {
+				return 0, c.reader.Err()
+			}
+			c.readBuf = data
 		case <-c.closing:
 			return 0, io.ErrClosedPipe
-		default:
-		}
-		select {
-		case <-c.readDeadline.wait():
+		case <-deadline:
 			return 0, os.ErrDeadlineExceeded
-		default:
 		}
-		n := copy(b, c.readBuf)
-		c.readBuf = c.readBuf[n:]
-		if len(c.readBuf) == 0 {
-			c.readBuf = nil
-		}
-		return n, nil
 	}
-	data, err := c.receive()
-	if err != nil {
-		return 0, err
-	}
-	c.readBuf = data
 	n := copy(b, c.readBuf)
 	c.readBuf = c.readBuf[n:]
 	if len(c.readBuf) == 0 {
@@ -128,43 +106,13 @@ func (c *Conn) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (c *Conn) receive() ([]byte, error) {
-	select {
-	case <-c.closing:
-		return nil, io.ErrClosedPipe
-	default:
-	}
-	deadline := c.readDeadline.wait()
-	select {
-	case <-deadline:
-		return nil, os.ErrDeadlineExceeded
-	default:
-	}
-
-	select {
-	case data, ok := <-c.reader.chunks():
-		if !ok {
-			return nil, c.reader.Err()
-		}
-		return data, nil
-	case <-deadline:
-		return nil, os.ErrDeadlineExceeded
-	case <-c.closing:
-		return nil, io.ErrClosedPipe
-	}
-}
-
 func (c *Conn) Write(b []byte) (int, error) {
-	select {
-	case <-c.closing:
+	if isClosedChan(c.closing) {
 		return 0, io.ErrClosedPipe
-	default:
 	}
 	deadline := c.writeDeadline.wait()
-	select {
-	case <-deadline:
+	if isClosedChan(deadline) {
 		return 0, os.ErrDeadlineExceeded
-	default:
 	}
 
 	n, err := c.writer.writeUntil(b, deadline, c.closing)
@@ -218,25 +166,13 @@ func (c *Conn) Close() error {
 
 func (c *Conn) closeOrdered(err error) error {
 	c.publishWG.Wait()
-	if err == nil {
-		if writer, ok := c.writer.(interface{ Err() error }); ok {
-			err = writer.Err()
-		}
-	}
-	if reader, ok := c.reader.(*slotReader); ok && err == nil {
-		// Our END says nothing about the peer's outstanding writes. Keep the
-		// discard reader and its ACK worker alive through the peer's END.
-		// The outer watchdog bounds this wait even if the peer never closes.
-		reader.wait()
+	if _, slots := c.writer.(*slotWriter); slots && err == nil {
+		// Keep the discard reader and ACK worker alive through peer END or cancellation.
+		c.reader.wait()
 		err = context.Cause(c.ctx)
 	}
 	c.cancel()
-	if writer, ok := c.writer.(interface{ wait() }); ok {
-		writer.wait()
-	}
-	if reader, ok := c.reader.(interface{ wait() }); ok {
-		reader.wait()
-	}
+	c.reader.wait() // writer.Close has already joined its workers.
 	if c.onClose != nil {
 		c.onClose()
 	}

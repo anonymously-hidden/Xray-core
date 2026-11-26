@@ -78,9 +78,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    can use several available inline positions, avoiding a media GET. The
    planner suppresses large inline waves while streaming and for the eager
    window after a media upload starts (2 s by default). A whole burst that
-   fits in two inline slots (up to 28 KiB at the defaults) can still split if
-   two upload permits are free and fewer than eight uploads are in flight.
-   This exchanges one extra slot publication for avoiding a dependent media GET.
+   fits in up to four inline slots (56 KiB at the defaults) can still split if
+   enough upload permits are free and fewer than eight uploads are in flight.
+   This exchanges extra slot publications for avoiding a dependent media GET.
    During cooldown the writer does not split bursts into inline waves. A media frame
    is one multipart create or PATCH: the description holds `XDRVSL03`, sequence, mode
    and length; the body is blocks of an 8-byte sequence tag followed by up to
@@ -115,15 +115,17 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    ~1 s, per large frame).
    A full HTTP 200 response to the first range replaces all ranges; the others
    are canceled before any of their bytes are delivered. Bytes are delivered
-   in pieces of up to 4 KiB at offset zero, then up to 32 KiB. One retry resumes
-   after the delivered bytes; the declared length and exact EOF are checked.
+   in pieces of up to 4 KiB at offset zero, then up to 32 KiB. A retry starts
+   at the block containing the first undelivered byte. If that retry emits new
+   payload and is interrupted again while reading, it gets one more resume.
+   Duplicate bytes are skipped; tags, declared length and exact EOF are checked.
    For a multi-range frame, the first range streams straight into the frame queue.
    Each range checks after five seconds without headers or new HTTP 206 body bytes.
    It can restart early only if its frame is the ordered head, the coordinator is
    draining this specific range, a **later** range has verified through EOF, and
    Drive is not cooling down. This also covers a middle range once its predecessors
    finish. An interrupted header wait uses the existing HTTP GET retry budget;
-   a partial body uses the existing single offset-aware resume. After a stall
+   a partial body uses offset-aware resume. After a stall
    triggers a retry, subsequent attempts use the ordinary timeout. Any positive
    body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
@@ -136,7 +138,7 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    `xdrive span seq` records range status, wire bytes, time waiting for headers
    (including permit wait, retries and service latency), and time after headers.
    `xdrive span retry seq` records emitted payload bytes, attempt duration and the error that
-   triggered the one stream resume; successful final reads can hide this error.
+   triggered a stream resume; successful final reads can hide this error.
    `xdrive request retry seq` exposes retries before headers or buffered success.
    `xdrive cooldown D` records the shared delay after quota/service rejections.
 
@@ -169,10 +171,10 @@ allocation failure now fails the dial explicitly instead of switching to WAL.
 Announcements are also created with reserved IDs. After a lost reply, read back
 the exact slot, watermark or inline announcement description; for a media
 announcement also compare the complete body. Never replay an ambiguous write.
-The sole cumulative watermark writer gets 15 s to confirm an ambiguous create
-or PATCH across a reconnect; data publications retain their 2 s window. There
-is no added wait on a successful acknowledgement. An unconfirmed watermark
-still fails the connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
+After an ambiguous create or PATCH the writer has up to 15 s to confirm the
+exact contents across a reconnect, including data slots and watermarks. There
+is no added wait on a successful write. An unconfirmed write still fails the
+connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
 the original write error is preserved. Graceful close reports final ACK errors. These are
 behavior differences, not just source rearrangement. Historical throughput
 and tail-latency measurements from the larger version are **not** measurements
@@ -213,6 +215,18 @@ The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
 
 ### Verification of this candidate
+
+Two race-instrumented Drive peers delivered a 40,000-byte browsing tail after
+bulk traffic as three inline slots, and confirmed a committed inline PATCH
+after a 3.7 s readback delay without replay. A twice-truncated range resumed
+at tagged wire offsets 0 and 262,152; its 20 MiB + 581 byte response matched
+exactly. The same workload exercised a blocked middle range and a full HTTP
+200 fallback. A persistently wrong sequence tag failed after one retry. Local,
+template and S3 WAL peers also carried concurrent bidirectional requests; the
+template mock observed both commit writes and matching commit reads.
+With the final reader-owned byte reservations, two concurrent 21 MiB + 791 byte
+downloads on one session also matched with speculative successors and two
+partial-body resumes. These are correctness workloads, not a live speed test.
 
 Two race-instrumented Go peers against a loopback TLS Drive mock delivered an
 18,000-byte browsing response tail after a media upload via two inline descriptions
@@ -280,8 +294,8 @@ this Go package**:
 **Release gates:** the candidate workspace had no Go 1.27 or `gofmt`, so the
 model checks above did not build it. This snapshot was formatted with `gofmt`
 (and the repository's `vformat`/`vprotogen` checks), vetted and built with the
-`go.mod` toolchain. The loopback run above used a Python HTTP mock; neither a
-`-race` workload nor live Drive was tested. The inventory below is the physical
+`go.mod` toolchain. The loopback checks above use local mocks; they do not
+measure live Drive throughput or page latency. The inventory below is the physical
 post-`gofmt` count. No XDrive test file is shipped.
 
 For deeper assurance, in a disposable checkout, run the same depth-two
@@ -303,14 +317,14 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1048 |
-| `slots.go` | whole file | 871 |
-| `client.go` | whole file | 554 |
-| `conn.go` | 65–79, 185–217, 219–244 | 74 |
-| `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
+| `drive.go` | whole file | 1053 |
+| `slots.go` | whole file | 850 |
+| `client.go` | whole file | 550 |
+| `conn.go` | 59–65, 67–72, 133–165, 167–180 | 60 |
+| `xdrive.go` | 9, 112–190, 205, 216, 240, 275–361, 419–430, 432–449, 466–498, 508–588 | 314 |
 | `params.go` | 75–91 | 17 |
-| `storage.go` | 9, 20–24, 36–63, 65–75 | 45 |
-| `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
+| `storage.go` | 9, 20–24, 36–56 | 27 |
+| `storage_lease.go` | whole file | 58 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **3000** |
+| **Total** | | **2954** |

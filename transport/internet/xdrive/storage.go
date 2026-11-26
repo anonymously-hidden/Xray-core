@@ -33,45 +33,26 @@ type Storage interface {
 	Close() error
 }
 
-func newStorage(streamSettings *internet.MemoryStreamConfig) (Storage, error) {
-	config, err := streamConfig(streamSettings)
-	if err != nil {
-		return nil, err
-	}
-	switch config.Service {
-	case "local":
+func newStorage(streamSettings *internet.MemoryStreamConfig, config *Config) (*storageLease, error) {
+	if config.Service == "local" {
 		storage, err := newLocalStorage(config.RemoteFolder)
 		if err != nil {
 			return nil, err
 		}
 		return ownedStorage(storage), nil
-	case "google-drive", "Google Drive":
-		return sharedStorage(streamSettings, config, func() (Storage, error) {
+	}
+	return sharedStorage(streamSettings, config, func() (Storage, error) {
+		switch config.Service {
+		case "google-drive", "Google Drive":
 			return newDriveStorage(streamSettings, config)
-		})
-	case "template":
-		return sharedStorage(streamSettings, config, func() (Storage, error) {
+		case "template":
 			return newTemplateStorage(streamSettings, config)
-		})
-	case "s3":
-		return sharedStorage(streamSettings, config, func() (Storage, error) {
+		case "s3":
 			return newS3Storage(streamSettings, config)
-		})
-	default:
-		return nil, errors.New("unsupported service: ", config.Service)
-	}
-}
-
-func rawSessionStorage(storage Storage) Storage {
-	switch s := storage.(type) {
-	case *driveStorage:
-		return s.session()
-	case *templateStorage:
-		return s.session()
-	case *s3Storage:
-		return s.session()
-	}
-	return storage
+		default:
+			return nil, errors.New("unsupported service: ", config.Service)
+		}
+	})
 }
 
 var (
@@ -114,7 +95,7 @@ func shareKey(streamSettings *internet.MemoryStreamConfig, config *Config) strin
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, build func() (Storage, error)) (Storage, error) {
+func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, build func() (Storage, error)) (*storageLease, error) {
 	// Opaque masks have no immutable configuration identity. Isolate their
 	// owners rather than accidentally routing one profile through another.
 	if streamSettings != nil && streamSettings.FinalMask != nil {
@@ -129,9 +110,9 @@ func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, 
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
 
-	if owner, ok := shared[key]; ok && !owner.closed {
+	if owner := shared[key]; owner != nil {
 		owner.refs++
-		return wrapStorageLease(owner, owner.root, false), nil
+		return owner.lease(owner.root), nil
 	}
 	storage, err := build()
 	if err != nil {
@@ -139,5 +120,5 @@ func sharedStorage(streamSettings *internet.MemoryStreamConfig, config *Config, 
 	}
 	owner := &storageOwner{root: storage, key: key, refs: 1}
 	shared[key] = owner
-	return wrapStorageLease(owner, storage, false), nil
+	return owner.lease(storage), nil
 }

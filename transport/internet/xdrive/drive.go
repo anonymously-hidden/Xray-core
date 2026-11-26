@@ -181,6 +181,10 @@ func (s *driveStorage) holdSession(session string) (func(), error) {
 
 func flatten(name string) string { return strings.ReplaceAll(name, "/", flatSeparator) }
 
+func driveMediaURL(id string) string {
+	return filesURL + "/" + url.PathEscape(id) + "?alt=media&supportsAllDrives=true"
+}
+
 func quoteDriveValue(value string) string {
 	return strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
 }
@@ -597,11 +601,7 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 		return err
 	}
 	// One writer per file: confirm the exact frame or ACK without replay.
-	window := 2 * time.Second
-	if _, ack := ctx.Value(headKey{}).(watermarkWrite); ack {
-		window = 15 * time.Second // A reconnect may outlast the usual readback.
-	}
-	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), window)
+	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), 15*time.Second)
 	defer cancel()
 	for verify.Err() == nil {
 		d, readErr := s.readDescription(verify, id)
@@ -610,7 +610,7 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 				return nil
 			}
 			var media []byte // a media announcement has no identifying description
-			media, readErr = s.bytes(verify, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, int64(len(payload)))
+			media, readErr = s.bytes(verify, mediaLane, http.MethodGet, driveMediaURL(id), "", nil, int64(len(payload)))
 			if readErr == nil && bytes.Equal(media, payload) {
 				return nil
 			}
@@ -639,11 +639,10 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 }
 
 type (
-	headKey        struct{}
-	watermarkWrite struct{} // headKey value for the sole cumulative ACK writer
-	mediaHeadKey   struct{} // <-chan struct{}, closed on promotion
-	mediaSeqKey    struct{} // int64, for request retry diagnostics
-	spanRescueKey  struct{} // func() bool for a multi-range GET, cleared on span resume
+	headKey       struct{}
+	mediaHeadKey  struct{} // <-chan struct{}, closed on promotion
+	mediaSeqKey   struct{} // int64, for request retry diagnostics
+	spanRescueKey struct{} // func() bool for a multi-range GET, cleared on span resume
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {
@@ -689,7 +688,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 }
 
 // readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
-// One retry resumes at its first unemitted block and still proves exact EOF.
+// A second resume requires fresh payload progress and another transport read failure.
 func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole func()) error {
 	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
 	const stride = slotBodyHeader + slotTagBlock
@@ -697,17 +696,18 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 	total := f.size + slotBodyHeader*n
 	pos, stop := lo*slotTagBlock, min(hi*slotTagBlock, f.size) // data offsets
 	for attempt := 0; ; attempt++ {
+		before := pos
 		first := min(pos/slotTagBlock, hi-1)
 		start, end := first*stride, min(hi*stride, total)
 		var header string
 		if start > 0 || end < total {
 			header = fmt.Sprintf("bytes=%d-%d", start, end-1)
 		}
-		bodyFailed := false
+		inResponse, interrupted := false, false
 		started := time.Now()
-		err := s.request(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(id)+"?alt=media&supportsAllDrives=true", "", nil, header, false, func(resp *http.Response) error {
+		err := s.request(ctx, mediaLane, http.MethodGet, driveMediaURL(id), "", nil, header, false, func(resp *http.Response) error {
 			headers := time.Now()
-			bodyFailed = true
+			inResponse = true
 			from, to, length := first, hi, end-start
 			switch resp.StatusCode {
 			case http.StatusOK:
@@ -726,12 +726,14 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			if resp.ContentLength >= 0 && resp.ContentLength != int64(length) {
 				return errors.New("unexpected Drive media length")
 			}
+			interrupted = true // A failed tag or payload read, not a protocol or EOF mismatch.
 			for i := from; i < to; i++ {
 				var tag [slotBodyHeader]byte
 				if _, err := io.ReadFull(resp.Body, tag[:]); err != nil {
 					return err
 				}
 				if int64(binary.BigEndian.Uint64(tag[:])) != f.seq {
+					interrupted = false
 					return errDriveRange // an older lap of this slot
 				}
 				for at, blockEnd := i*slotTagBlock, min((i+1)*slotTagBlock, f.size); at < blockEnd; {
@@ -750,6 +752,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 					at += len(b)
 				}
 			}
+			interrupted = false
 			var extra [1]byte
 			if n, err := io.ReadFull(resp.Body, extra[:]); n != 0 || err != io.EOF {
 				return errors.New("Drive media did not end at the declared length").Base(err)
@@ -757,7 +760,9 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 			errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
 			return nil
 		})
-		if err == nil || attempt != 0 || (!bodyFailed && err != errNotFound && err != errDriveRange) || ctx.Err() != nil {
+		firstRetry := attempt == 0 && (inResponse || err == errNotFound || err == errDriveRange)
+		progressRetry := attempt == 1 && interrupted && pos > before
+		if err == nil || ctx.Err() != nil || !firstRetry && !progressRetry {
 			return err
 		}
 		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " elapsed ", time.Since(started), " err ", err)
@@ -857,10 +862,10 @@ func (s *driveStorage) takeIDs(ctx context.Context, n int) ([]string, error) {
 }
 
 func (s *driveStorage) Put(ctx context.Context, name string, payload []byte) error {
-	return putDriveObject(ctx, s, "", name, payload)
+	return s.putObject(ctx, "", name, payload)
 }
 
-func putDriveObject(ctx context.Context, s slotStore, id, name string, payload []byte) error {
+func (s *driveStorage) putObject(ctx context.Context, id, name string, payload []byte) error {
 	var description string
 	if len(payload) <= driveInlineLimit {
 		description = base64.StdEncoding.EncodeToString(payload)
@@ -994,7 +999,7 @@ func (s *driveStorage) Get(ctx context.Context, name string) ([]byte, error) {
 		limit = maxSegmentBytes
 	}
 	if f.Description == "" {
-		return s.bytes(ctx, mediaLane, http.MethodGet, filesURL+"/"+url.PathEscape(f.ID)+"?alt=media&supportsAllDrives=true", "", nil, limit)
+		return s.bytes(ctx, mediaLane, http.MethodGet, driveMediaURL(f.ID), "", nil, limit)
 	}
 	b, err := base64.StdEncoding.DecodeString(f.Description)
 	if int64(len(b)) > limit {

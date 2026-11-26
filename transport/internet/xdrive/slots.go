@@ -2,6 +2,7 @@ package xdrive
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -91,14 +92,6 @@ func (b *byteBudget) give(n int) {
 
 var errWriteStopped = errors.New("write stopped")
 
-type slotStore interface {
-	takeIDs(context.Context, int) ([]string, error)
-	createSlot(context.Context, string, string, string, []byte) error
-	setSlot(context.Context, string, string, []byte) error
-	readDescription(context.Context, string) (string, error)
-	readFrameStream(context.Context, string, slotFrame, chan<- []byte) error
-}
-
 // A slot description identifies its sequence and either carries the payload
 // (inline) or the length of a media body stored in the same file.
 type slotFrame struct {
@@ -123,32 +116,20 @@ func decodeSlot(description string) (slotFrame, bool) {
 	if err != nil || len(b) < slotHeaderLen || string(b[:len(slotMagic)]) != slotMagic {
 		return slotFrame{}, false
 	}
-	f := slotFrame{
-		seq:  int64(binary.BigEndian.Uint64(b[8:])),
-		mode: b[16],
-		size: int(binary.BigEndian.Uint32(b[17:])),
-	}
+	f := slotFrame{seq: int64(binary.BigEndian.Uint64(b[8:])), mode: b[16], size: int(binary.BigEndian.Uint32(b[17:]))}
 	if f.seq < 0 || f.size < 0 || f.size > maxSegmentBytes {
 		return slotFrame{}, false
 	}
 	switch f.mode {
 	case slotInline:
 		f.data = b[slotHeaderLen:]
-		if f.size == 0 || f.size > slotInlineLimit || len(f.data) != f.size {
-			return slotFrame{}, false
-		}
+		return f, f.size > 0 && f.size <= slotInlineLimit && len(f.data) == f.size
 	case slotStream:
-		if f.size == 0 || len(b) != slotHeaderLen {
-			return slotFrame{}, false
-		}
+		return f, f.size > 0 && len(b) == slotHeaderLen
 	case slotEnd, slotErr:
-		if f.size != 0 || len(b) != slotHeaderLen {
-			return slotFrame{}, false
-		}
-	default:
-		return slotFrame{}, false
+		return f, f.size == 0 && len(b) == slotHeaderLen
 	}
-	return f, true
+	return slotFrame{}, false
 }
 
 // slotTable is the ring of one direction: the ids of its slots and of the
@@ -204,7 +185,7 @@ func lazyRing(session string, depth int, ids []string) ring {
 }
 
 // Each object has one writer. Only its first publication in a lazy ring is a create.
-func (t slotTable) publish(ctx context.Context, store slotStore, seq int64, mode byte, data []byte) error {
+func (t slotTable) publish(ctx context.Context, store *driveStorage, seq int64, mode byte, data []byte) error {
 	idx := int(seq % int64(len(t.Slots)))
 	f := slotFrame{seq: seq, mode: mode, size: len(data)}
 	var body []byte
@@ -223,17 +204,12 @@ func (t slotTable) publish(ctx context.Context, store slotStore, seq int64, mode
 	return store.setSlot(ctx, t.Slots[idx], f.encode(), body)
 }
 
-func isCooling(s slotStore) bool {
-	c, ok := s.(interface{ cooling() bool })
-	return ok && c.cooling()
-}
-
 // Outbound: run assigns sequence numbers and owns the coalescing buffer.
 // Uploads may finish out of order. Each physical position has a completion fence.
 type slotWriter struct {
 	ctx   context.Context
 	fail  context.CancelCauseFunc
-	store slotStore
+	store *driveStorage
 	table slotTable
 	params
 	input               chan []byte
@@ -252,7 +228,7 @@ type slotWriter struct {
 	flight              *byteBudget // bytes of unfinished uploads
 }
 
-func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params) *slotWriter {
+func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store *driveStorage, table slotTable, p params) *slotWriter {
 	w := &slotWriter{
 		ctx: ctx, fail: fail, store: store, table: table, params: p,
 		input: make(chan []byte), writeToken: make(chan struct{}, 1),
@@ -269,10 +245,7 @@ func newSlotWriter(ctx context.Context, fail context.CancelCauseFunc, store slot
 func (w *slotWriter) Err() error { return context.Cause(w.ctx) }
 
 func (w *slotWriter) stopped() error {
-	if err := w.Err(); err != nil {
-		return err
-	}
-	return io.ErrClosedPipe
+	return cmp.Or(w.Err(), io.ErrClosedPipe)
 }
 
 func (w *slotWriter) Write(p []byte) (int, error) { return w.writeUntil(p, nil, nil) }
@@ -463,7 +436,7 @@ func (w *slotWriter) run() {
 		timer.Stop()
 		frame, full := w.frame, len(buf) >= w.frame
 		// Credit strain reduces bytes; request quotas need larger frames, not smaller.
-		strained, cooling := w.strained.Swap(false), isCooling(w.store)
+		strained, cooling := w.strained.Swap(false), w.store.cooling()
 		if strained && !cooling {
 			w.frame = max(base, w.frame/2)
 		} else if full && !cooling {
@@ -472,18 +445,12 @@ func (w *slotWriter) run() {
 		if w.frame != frame {
 			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
-		// Idle bursts can avoid a media GET; active bulk keeps full-sized frames.
-		unit := min(frame, slotInlineLimit)
-		wave := min(24, cap(w.permits)-len(w.permits))
-		inline := min(len(buf), wave*unit)
-		pair := wave >= 2 && len(buf) <= 2*unit && len(w.permits) < 2*slotBusyUploads
-		if cooling || !pair && (len(w.permits) >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow) || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
-			inline = 0
-		}
+		busy := len(w.permits)
+		inline := inlinePrefix(len(buf), frame, busy, cap(w.permits)-busy, time.Since(mediaAt) < w.eagerWindow, cooling)
 		for len(buf) > 0 {
 			n := min(len(buf), frame)
 			if inline > 0 {
-				n = min(inline, unit)
+				n = min(inline, n, slotInlineLimit)
 				inline -= n
 			}
 			if !launch(buf[:n:n]) {
@@ -514,7 +481,7 @@ func (w *slotWriter) run() {
 			if len(buf) == 0 {
 				buf, bufAt = b, lastIn
 				d := w.flushInterval
-				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !isCooling(w.store) {
+				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !w.store.cooling() {
 					d = min(d, 2*time.Millisecond)
 				}
 				timer.Reset(d)
@@ -539,24 +506,34 @@ func (w *slotWriter) run() {
 	}
 }
 
-func (w *slotWriter) Close() error {
-	w.closeOnce.Do(func() { close(w.stop) })
-	w.wait() // Conn.Close owns the watchdog for the entire shutdown.
-	return w.Err()
+// inlinePrefix is the part of a burst to send as inline slots. Busy large
+// transfers use media; modest bursts can spend spare slots to avoid a body GET.
+func inlinePrefix(size, frame, busy, free int, recentMedia, cooling bool) int {
+	unit, wave := min(frame, slotInlineLimit), min(slotReadAhead, free)
+	capacity := wave * unit
+	if cooling || size > capacity && (wave < slotReadAhead || size > frame) {
+		return 0
+	}
+	if (busy >= slotBusyUploads || recentMedia) && (busy >= 2*slotBusyUploads || size > min(wave, 4)*unit) {
+		return 0
+	}
+	return min(size, capacity)
 }
 
-func (w *slotWriter) wait() { <-w.done }
+func (w *slotWriter) Close() error {
+	w.closeOnce.Do(func() { close(w.stop) })
+	<-w.done // Conn.Close owns the watchdog for the entire shutdown.
+	return w.Err()
+}
 
 func waitCloseProgress(done <-chan struct{}, progress func() time.Time) error {
 	for {
 		remaining := slotStallTimeout - time.Since(progress())
 		if remaining <= 0 {
-			select {
-			case <-done:
+			if isClosedChan(done) {
 				return nil
-			default:
-				return context.DeadlineExceeded
 			}
+			return context.DeadlineExceeded
 		}
 		select {
 		case <-done:
@@ -572,7 +549,7 @@ type slotReader struct {
 	ctx     context.Context
 	setErr  context.CancelCauseFunc
 	discard <-chan struct{}
-	store   slotStore
+	store   *driveStorage
 	table   slotTable
 	params
 	ch                       chan []byte
@@ -589,11 +566,19 @@ type readSlot struct {
 	prior       <-chan struct{} // previous frame's ready: ordered body admission
 	head, ready chan struct{}
 	data        chan []byte // published by ready; closed after the last verified block
+	reserved    int         // published by ready; returned by the ordered reader
 	end         bool
 	err         error // published by closing ready (no data) or data
 }
 
-func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store slotStore, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
+func (j *readSlot) release(b *byteBudget) {
+	if j.reserved > 0 {
+		b.give(j.reserved)
+		j.reserved = 0
+	}
+}
+
+func newSlotReader(ctx context.Context, fail context.CancelCauseFunc, store *driveStorage, table slotTable, p params, first []byte, discard <-chan struct{}) *slotReader {
 	r := &slotReader{
 		ctx: ctx, setErr: fail, discard: discard, store: store, table: table, params: p,
 		ch: make(chan []byte, 2), wake: make(chan struct{}, 1),
@@ -627,10 +612,7 @@ func (r *slotReader) Wake() {
 }
 
 func (r *slotReader) Err() error {
-	if err := context.Cause(r.ctx); err != nil {
-		return err
-	}
-	return io.EOF
+	return cmp.Or(context.Cause(r.ctx), io.EOF)
 }
 
 func (r *slotReader) observe(n int64) {
@@ -655,10 +637,10 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 			d, err := r.store.readDescription(readCtx, id)
 			f, ok := decodeSlot(d)
 			invalid := d != "" && !ok
-			if err == nil && f.seq > job.seq {
+			if err == nil && ok && f.seq > job.seq {
 				return slotFrame{}, errors.New("Drive slot ", job.seq, " was overwritten by sequence ", f.seq)
 			}
-			if err == nil && f.mode != 0 && f.seq == job.seq {
+			if err == nil && ok && f.seq == job.seq {
 				r.activeAt.Store(time.Now().UnixNano())
 				r.observe(f.seq)
 				return f, nil
@@ -667,7 +649,7 @@ func (r *slotReader) lookup(ctx context.Context, job *readSlot) (slotFrame, erro
 				return slotFrame{}, err
 			}
 			// A lazy missing head may be idle; probe other descriptions for a gap.
-			if head && depth > 1 && time.Now().After(probeAt) && r.frontier.Load() <= job.seq && !isCooling(r.store) && r.probing.CompareAndSwap(false, true) {
+			if head && depth > 1 && time.Now().After(probeAt) && r.frontier.Load() <= job.seq && !r.store.cooling() && r.probing.CompareAndSwap(false, true) {
 				idx := (job.seq + offset) % depth
 				offset, probeAt = offset%(depth-1)+1, time.Now().Add(slotStallTimeout/12)
 				r.wg.Go(func() {
@@ -713,15 +695,13 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	f, err := r.lookup(ctx, j)
 	found := time.Now()
 	// Discover concurrently, but reserve body bytes in sequence order.
-	if j.prior != nil {
-		select {
-		case <-j.prior:
-		case <-j.head:
-		case <-ctx.Done():
-			j.err = ctx.Err()
-			close(j.ready)
-			return
-		}
+	select {
+	case <-j.prior:
+	case <-j.head: // Includes the first job, which has no predecessor.
+	case <-ctx.Done():
+		j.err = ctx.Err()
+		close(j.ready)
+		return
 	}
 	switch f.mode {
 	case slotInline:
@@ -739,20 +719,12 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 	// The ordered head has its own allowance; only successors use look-ahead bytes.
 	ctx = context.WithValue(ctx, mediaHeadKey{}, (<-chan struct{})(j.head))
 	if j.seq != r.head.Load() {
-		reserved := r.media.take(f.size, j.head, ctx.Done())
-		if !reserved && ctx.Err() != nil {
+		if r.media.take(f.size, j.head, ctx.Done()) {
+			j.reserved = f.size
+		} else if ctx.Err() != nil {
 			j.err = ctx.Err()
 			close(j.ready)
 			return
-		}
-		if reserved {
-			r.wg.Go(func() {
-				select {
-				case <-j.head:
-				case <-ctx.Done():
-				}
-				r.media.give(f.size)
-			})
 		}
 	}
 	j.data = make(chan []byte, f.size/slotReadChunk+slotBlocks(f.size)+1) // pieces never cross a block
@@ -764,10 +736,16 @@ func (r *slotReader) fetch(ctx context.Context, j *readSlot) {
 }
 
 func (r *slotReader) run() {
-	defer close(r.ch)
 	ctx, cancel := context.WithCancel(r.ctx)
-	defer cancel()
 	jobs := make(map[int64]*readSlot)
+	defer func() {
+		cancel()
+		close(r.ch)
+		for _, j := range jobs {
+			<-j.ready
+			j.release(r.media)
+		}
+	}()
 	next := r.head.Load()
 	for ctx.Err() == nil {
 		head := r.head.Load()
@@ -788,6 +766,7 @@ func (r *slotReader) run() {
 		close(j.head)
 		select {
 		case <-j.ready:
+			j.release(r.media) // The head now uses its own allowance, even if its download is unfinished.
 		case <-ctx.Done():
 			return
 		}
@@ -823,7 +802,7 @@ func (r *slotReader) run() {
 // This goroutine is the only watermark writer. END triggers one last snapshot
 // after the ordered reader has stopped, including credit below the batch size.
 func (r *slotReader) ackLoop(readDone <-chan struct{}) {
-	ctx := context.WithValue(r.ctx, headKey{}, watermarkWrite{})
+	ctx := context.WithValue(r.ctx, headKey{}, true)
 	t := time.NewTicker(1500 * time.Millisecond)
 	defer t.Stop()
 	acked := int64(-1)

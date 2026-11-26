@@ -70,11 +70,11 @@ func paramsFromConfig(c *Config) params {
 }
 
 // paramsForStorage applies the Drive slot-path defaults only where the storage
-// is a slotStore and only to fields the config leaves at 0; wal-based backends
+// uses Drive slots and only to fields the config leaves at 0; WAL backends
 // keep the defaults above because their concurrency and flush mean other things
 func paramsForStorage(c *Config, storage Storage) params {
 	p := paramsFromConfig(c)
-	if _, ok := storage.(slotStore); ok {
+	if _, ok := storage.(*driveStorage); ok {
 		if c.Concurrency == 0 {
 			p.concurrency = 64
 		}

@@ -35,39 +35,21 @@ func init() {
 	common.Must(internet.RegisterTransportListener(protocolName, Serve))
 }
 
-func newSessionID() (string, error) {
-	buf := make([]byte, 16)
-	if _, err := rand.Read(buf); err != nil {
-		return "", errors.New("failed to generate session id").Base(err)
-	}
-	return hex.EncodeToString(buf), nil
+func newSessionID() string {
+	var id [16]byte
+	rand.Read(id[:]) // crypto/rand.Read fills the buffer or terminates the process.
+	return hex.EncodeToString(id[:])
 }
 
 func announceName(session string, at time.Time) string {
 	return fmt.Sprintf("%s/%d-%s", sessionsDir, at.UnixNano(), session)
 }
 
-func parseAnnounce(entry string) (string, time.Time, bool) {
-	session, at, ok := announceParts(entry)
-	if !ok || !safeSessionID(session) {
-		return "", time.Time{}, false
-	}
-	return session, at, true
-}
-
-// announceParts splits an announcement entry into its session and its time.
-// The session is not checked: a caller that turns it into an object name has
-// to ask safeSessionID first.
-func announceParts(entry string) (string, time.Time, bool) {
-	dash := strings.IndexByte(entry, '-')
-	if dash <= 0 || dash == len(entry)-1 {
-		return "", time.Time{}, false
-	}
-	nanos, err := strconv.ParseInt(entry[:dash], 10, 64)
-	if err != nil {
-		return "", time.Time{}, false
-	}
-	return entry[dash+1:], time.Unix(0, nanos), true
+// A valid timestamp does not imply a safe session name: validate it before use.
+func announceParts(entry string) (string, bool) {
+	stamp, session, ok := strings.Cut(entry, "-")
+	_, err := strconv.ParseInt(stamp, 10, 64)
+	return session, ok && session != "" && err == nil
 }
 
 // A session id reaches object names, so it must not traverse, must not
@@ -75,12 +57,6 @@ func announceParts(entry string) (string, time.Time, bool) {
 // a reserved file.
 func safeSessionID(session string) bool {
 	return safeNameChars(session) && !reservedName(session)
-}
-
-// A listed name becomes a delete target, so it must be safe to build one
-// from.
-func safeListedName(name string) bool {
-	return safeNameChars(name) && !reservedName(name)
 }
 
 func safeNameChars(name string) bool {
@@ -99,10 +75,7 @@ func safeNameChars(name string) bool {
 }
 
 func reservedName(name string) bool {
-	base := name
-	if i := strings.IndexByte(base, '.'); i >= 0 {
-		base = base[:i]
-	}
+	base, _, _ := strings.Cut(name, ".")
 	switch strings.ToUpper(base) {
 	case "CON", "PRN", "AUX", "NUL":
 		return true
@@ -153,21 +126,15 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		streamSettings = &patched
 	}
 
-	storage, err := newStorage(streamSettings)
+	root, err := newStorage(streamSettings, config)
 	if err != nil {
 		return nil, err
 	}
-	storage, err = transferSessionStorage(storage)
-	if err != nil {
-		return nil, err
-	}
-	session, err := newSessionID()
-	if err != nil {
-		storage.Close()
-		return nil, err
-	}
-	p := paramsForStorage(config, storage)
-	if slots, ok := storage.(slotStore); ok {
+	storage := root.session()
+	root.Close()
+	session := newSessionID()
+	p := paramsForStorage(config, storage.Storage)
+	if slots, ok := storage.Storage.(*driveStorage); ok {
 		depth := max(2, p.concurrency)
 		ids, err := slots.takeIDs(ctx, 2*(depth+1)+1)
 		if err != nil {
@@ -176,7 +143,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 		r := lazyRing(session, depth, ids[:len(ids)-1])
 		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
-		releaseSession, err := holdStorageSession(storage, session)
+		releaseSession, err := slots.holdSession(session)
 		if err != nil {
 			storage.Close()
 			return nil, err
@@ -203,7 +170,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 				announce, _ = json.Marshal(r)
 			}
 			// An announce failure surfaces as a connection error on the next Write/Read.
-			if err := putDriveObject(conn.ctx, slots, ids[len(ids)-1], announceName(session, time.Now()), announce); err != nil && conn.ctx.Err() == nil {
+			if err := slots.putObject(conn.ctx, ids[len(ids)-1], announceName(session, time.Now()), announce); err != nil && conn.ctx.Err() == nil {
 				err = errors.New("failed to announce session ", session).Base(err)
 				writer.fail(err)
 			}
@@ -216,7 +183,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		return nil, errors.New("failed to announce session ", session).Base(err)
 	}
 	errors.LogInfo(ctx, "opened session ", session)
-	return newConn(context.Background(), storage,
+	return newConn(context.Background(), storage.Storage,
 		uplinkPrefix(session), downlinkPrefix(session), p, false, func() {
 			storage.Close()
 		}), nil
@@ -225,7 +192,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 type Listener struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
-	storage Storage
+	storage *storageLease
 	addConn internet.ConnHandler
 	params
 
@@ -235,8 +202,7 @@ type Listener struct {
 	idleSince      map[string]time.Time
 	collecting     map[string]bool
 	announceWarned map[string]bool
-	firstSeen      map[string]time.Time
-	lastSeen       map[string]time.Time
+	announcements  map[string]seenAnnouncement
 	stopping       bool
 	cleanupPending map[string]bool
 	cleanupQueue   []string
@@ -245,10 +211,9 @@ type Listener struct {
 	cleanupWG      sync.WaitGroup
 	closeOnce      sync.Once
 	closeErr       error
-
-	// collectPause spaces the deletion of two collected sessions.
-	collectPause time.Duration
 }
+
+type seenAnnouncement struct{ first, last time.Time }
 
 func Serve(ctx context.Context, address net.Address, port net.Port, streamSettings *internet.MemoryStreamConfig, addConn internet.ConnHandler) (internet.Listener, error) {
 	config, err := streamConfig(streamSettings)
@@ -256,7 +221,7 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 		return nil, err
 	}
 
-	storage, err := newStorage(streamSettings)
+	storage, err := newStorage(streamSettings, config)
 	if err != nil {
 		return nil, err
 	}
@@ -267,25 +232,18 @@ func Serve(ctx context.Context, address net.Address, port net.Port, streamSettin
 		cancel:         cancel,
 		storage:        storage,
 		addConn:        addConn,
-		params:         paramsForStorage(config, storage),
+		params:         paramsForStorage(config, storage.Storage),
 		active:         make(map[string]bool),
 		handled:        make(map[string]time.Time),
 		idleSince:      make(map[string]time.Time),
 		announceWarned: make(map[string]bool),
-		firstSeen:      make(map[string]time.Time),
-		lastSeen:       make(map[string]time.Time),
-		collectPause:   cleanupSessionPause,
+		announcements:  make(map[string]seenAnnouncement),
+		collecting:     make(map[string]bool),
+		cleanupPending: make(map[string]bool),
 	}
 
-	listener.loopWG.Add(2)
-	go func() {
-		defer listener.loopWG.Done()
-		listener.acceptLoop(ctx)
-	}()
-	go func() {
-		defer listener.loopWG.Done()
-		listener.collectLoop(ctx)
-	}()
+	listener.loopWG.Go(func() { listener.acceptLoop(ctx) })
+	listener.loopWG.Go(func() { listener.collectLoop(ctx) })
 
 	return listener, nil
 }
@@ -299,23 +257,17 @@ func (l *Listener) acceptLoop(logCtx context.Context) {
 			errors.LogWarningInner(logCtx, err, "failed to list sessions")
 		}
 
-		switch {
-		case accepted:
+		if accepted {
 			active = time.Now()
+		}
+		if accepted || time.Since(active) < l.eagerWindow {
 			delay = l.minPollInterval
-		case time.Since(active) < l.eagerWindow:
-			delay = l.minPollInterval
-		default:
-			delay *= 2
-			if delay > l.maxPollInterval {
-				delay = l.maxPollInterval
-			}
+		} else {
+			delay = min(2*delay, l.maxPollInterval)
 		}
 
-		select {
-		case <-l.ctx.Done():
+		if sleepContext(l.ctx, delay) != nil {
 			return
-		case <-time.After(delay):
 		}
 	}
 }
@@ -330,32 +282,28 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 	l.mu.Lock()
 	now := time.Now()
 	for _, listed := range sessions {
-		l.lastSeen[listed.Name] = now
-		if _, seen := l.firstSeen[listed.Name]; !seen {
-			first := listed.created
-			if first.IsZero() || first.After(now) {
-				first = now
+		seen := l.announcements[listed.Name]
+		if seen.first.IsZero() {
+			seen.first = listed.created
+			if seen.first.IsZero() || seen.first.After(now) {
+				seen.first = now
 			}
-			l.firstSeen[listed.Name] = first
 		}
+		seen.last = now
+		l.announcements[listed.Name] = seen
 	}
 	// Keep first-seen times across brief listing omissions.
-	for entry := range l.firstSeen {
-		if now.Sub(l.lastSeen[entry]) >= 2*l.sessionTTL {
-			delete(l.firstSeen, entry)
-			delete(l.lastSeen, entry)
-		}
-	}
+	maps.DeleteFunc(l.announcements, func(_ string, a seenAnnouncement) bool { return now.Sub(a.last) >= 2*l.sessionTTL })
 	l.mu.Unlock()
 
 	for _, listed := range sessions {
 		entry := listed.Name
 		full := sessionsDir + "/" + entry
 
-		session, _, ok := announceParts(entry)
+		session, ok := announceParts(entry)
 		if !ok {
 			// Never construct a deletion path from an unsafe name.
-			if safeListedName(entry) {
+			if safeSessionID(entry) {
 				l.queueDrop(full)
 			}
 			continue
@@ -364,7 +312,7 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 			continue
 		}
 		l.mu.Lock()
-		expires := l.firstSeen[entry].Add(l.sessionTTL)
+		expires := l.announcements[entry].first.Add(l.sessionTTL)
 		l.mu.Unlock()
 		if !time.Now().Before(expires) {
 			errors.LogInfo(logCtx, "dropping the stale announcement of session ", session)
@@ -384,7 +332,7 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 		announce := listed.Inline
 		var conn *Conn
 		var loadErr error
-		if _, slots := l.storage.(slotStore); slots && len(announce) == 0 {
+		if _, slots := l.storage.Storage.(*driveStorage); slots && len(announce) == 0 {
 			announce, loadErr = l.storage.Get(context.WithValue(admit, maxBodyKey{}, int64(driveMaxAnnounce)), full)
 		}
 		if loadErr == nil && admit.Err() == nil {
@@ -432,9 +380,6 @@ func (l *Listener) queueSessionDrop(session string) {
 	if since := l.idleSince[session]; !since.IsZero() && time.Since(since) < l.sessionTTL {
 		return
 	}
-	if l.collecting == nil {
-		l.collecting = make(map[string]bool)
-	}
 	l.collecting[session] = true
 	if !l.queueDropLocked(sessionPrefix(session)) {
 		delete(l.collecting, session)
@@ -445,21 +390,16 @@ func (l *Listener) queueDropLocked(name string) bool {
 	if l.stopping || l.ctx.Err() != nil || len(l.cleanupQueue) >= listenerCleanupQueue || l.cleanupPending[name] {
 		return false
 	}
-	if l.cleanupPending == nil {
-		l.cleanupPending = make(map[string]bool)
-	}
 	l.cleanupPending[name] = true
 	l.cleanupQueue = append(l.cleanupQueue, name)
 	if l.cleanupRunning < listenerCleanupWorkers {
 		l.cleanupRunning++
-		l.cleanupWG.Add(1)
-		go l.cleanupWorker()
+		l.cleanupWG.Go(l.cleanupWorker)
 	}
 	return true
 }
 
 func (l *Listener) cleanupWorker() {
-	defer l.cleanupWG.Done()
 	for {
 		l.mu.Lock()
 		if len(l.cleanupQueue) == 0 {
@@ -493,14 +433,11 @@ func (l *Listener) drop(name string) error {
 	ctx := context.WithValue(l.ctx, cleanupKey{}, true)
 	var last error
 	for attempt := 0; attempt < cleanupMaxRetries && ctx.Err() == nil; attempt++ {
-		if err := l.storage.Delete(ctx, name); err == nil {
-			return nil
-		} else if err == errSessionInUse {
-			return err
-		} else {
-			last = err
-			errors.LogDebug(ctx, "failed to drop ", name, ": ", err)
+		last = l.storage.Delete(ctx, name)
+		if last == nil || last == errSessionInUse {
+			return last
 		}
+		errors.LogDebug(ctx, "failed to drop ", name, ": ", last)
 		if attempt+1 < cleanupMaxRetries && sleepContext(ctx, cleanupRetryDelay+jitter(cleanupRetryDelay)) != nil {
 			return ctx.Err()
 		}
@@ -514,17 +451,8 @@ func (l *Listener) drop(name string) error {
 func (l *Listener) claim(session string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if !safeSessionID(session) {
-		return false
-	}
 	if l.stopping || l.ctx.Err() != nil || l.active[session] || !l.handled[session].IsZero() || l.collecting[session] {
 		return false
-	}
-	if l.active == nil {
-		l.active = make(map[string]bool)
-	}
-	if l.handled == nil {
-		l.handled = make(map[string]time.Time)
 	}
 	l.active[session] = true
 	l.handled[session] = time.Now()
@@ -536,51 +464,41 @@ func (l *Listener) claim(session string) bool {
 
 // Drive requires a ring announcement; other backends use the WAL.
 func (l *Listener) newSessionConn(admit context.Context, session string, announce []byte) *Conn {
-	storage, err := acquireSessionStorage(l.storage)
-	if err != nil {
-		return nil
-	}
-	releaseSession, err := holdStorageSession(storage, session)
-	if err != nil {
-		storage.Close()
-		return nil
-	}
+	storage := l.storage.session()
 	onClose := func() {
 		storage.Close()
-		releaseSession()
 		l.mu.Lock()
 		delete(l.active, session)
 		l.mu.Unlock()
 	}
-	if slots, ok := storage.(slotStore); ok {
-		if r, ok := decodeRing(announce); ok {
-			r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
-			r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
-			deadline, _ := admit.Deadline() // acceptPending always supplies the announcement deadline
-			if scoped, ok := slots.(interface {
-				bindRing(context.Context, ring) error
-			}); (ok && scoped.bindRing(admit, r) != nil) || admit.Err() != nil || !time.Now().Before(deadline) {
-				onClose()
-				return nil
-			}
-			errors.LogInfo(admit, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
-			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, onClose)
+	if slots, ok := storage.Storage.(*driveStorage); ok {
+		r, valid := decodeRing(announce)
+		if !valid {
+			onClose()
+			return nil
 		}
-		onClose()
-		return nil
+		release, err := slots.holdSession(session)
+		if err != nil {
+			onClose()
+			return nil
+		}
+		r.Up.lazy, r.Down.lazy = r.Lazy, r.Lazy
+		r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
+		deadline, _ := admit.Deadline()
+		if slots.bindRing(admit, r) != nil || admit.Err() != nil || !time.Now().Before(deadline) {
+			release()
+			onClose()
+			return nil
+		}
+		errors.LogInfo(admit, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
+		return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, func() { release(); onClose() })
 	}
 	errors.LogInfo(admit, "accepted session ", session)
-	return newConn(l.ctx, storage, downlinkPrefix(session), uplinkPrefix(session), l.params, true, onClose)
+	return newConn(l.ctx, storage.Storage, downlinkPrefix(session), uplinkPrefix(session), l.params, true, onClose)
 }
 
 func (l *Listener) collectLoop(logCtx context.Context) {
-	interval := l.sessionTTL / 2
-	for {
-		select {
-		case <-l.ctx.Done():
-			return
-		case <-time.After(interval):
-		}
+	for sleepContext(l.ctx, l.sessionTTL/2) == nil {
 		if err := l.collect(); err != nil {
 			errors.LogWarningInner(logCtx, err, "failed to collect abandoned sessions")
 		}
@@ -588,7 +506,7 @@ func (l *Listener) collectLoop(logCtx context.Context) {
 }
 
 func (l *Listener) collect() error {
-	if c, ok := l.storage.(interface{ cooling() bool }); ok && c.cooling() {
+	if drive, ok := l.storage.Storage.(*driveStorage); ok && drive.cooling() {
 		return nil
 	}
 	ctx := context.WithValue(l.ctx, cleanupKey{}, true)
@@ -602,9 +520,6 @@ func (l *Listener) collect() error {
 	var expired []string
 
 	l.mu.Lock()
-	if l.collecting == nil {
-		l.collecting = make(map[string]bool)
-	}
 	present := make(map[string]bool, len(sessions))
 	for _, listed := range sessions {
 		session := listed.Name
@@ -632,8 +547,8 @@ func (l *Listener) collect() error {
 	}
 	maps.DeleteFunc(l.idleSince, func(id string, _ time.Time) bool { return !present[id] })
 	announced := make(map[string]bool)
-	for entry, seen := range l.lastSeen {
-		if session, _, ok := parseAnnounce(entry); ok && now.Sub(seen) < 2*l.sessionTTL {
+	for entry, seen := range l.announcements {
+		if session, ok := announceParts(entry); ok && safeSessionID(session) && now.Sub(seen.last) < 2*l.sessionTTL {
 			announced[session] = true
 		}
 	}
@@ -651,22 +566,23 @@ func (l *Listener) collect() error {
 	}()
 	var first error
 	for i, session := range expired {
-		if i > 0 && l.collectPause > 0 && sleepContext(l.ctx, l.collectPause) != nil {
+		if i > 0 && sleepContext(l.ctx, cleanupSessionPause) != nil {
 			return l.ctx.Err()
 		}
-		if err := l.storage.Delete(ctx, sessionPrefix(session)); err != nil && err != errSessionInUse {
+		err := l.storage.Delete(ctx, sessionPrefix(session))
+		if err != nil && err != errSessionInUse {
 			if first == nil {
 				first = err
 			}
-		} else if err == nil {
-			l.mu.Lock()
-			delete(l.idleSince, session)
-			l.mu.Unlock()
-		} else {
-			l.mu.Lock()
-			l.idleSince[session] = time.Now()
-			l.mu.Unlock()
+			continue
 		}
+		l.mu.Lock()
+		if err == nil {
+			delete(l.idleSince, session)
+		} else {
+			l.idleSince[session] = time.Now()
+		}
+		l.mu.Unlock()
 	}
 	return first
 }

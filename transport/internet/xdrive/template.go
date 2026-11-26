@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -196,7 +198,7 @@ func readAdapterBody(body io.Reader, limit int64) ([]byte, error) {
 func (s *templateStorage) baseVars() map[string]string {
 	vars := map[string]string{"folder": s.folder}
 	for i, secret := range s.secrets {
-		vars["secret"+itoa(i)] = secret
+		vars["secret"+strconv.Itoa(i)] = secret
 	}
 	return vars
 }
@@ -212,20 +214,6 @@ func subst(tmpl string, vars map[string]string) string {
 	return out
 }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b [20]byte
-	pos := len(b)
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(b[pos:])
-}
-
 func (s *templateStorage) storedName(name string) string {
 	if s.tmpl.Flatten {
 		return flatten(name)
@@ -234,17 +222,8 @@ func (s *templateStorage) storedName(name string) string {
 }
 
 func (s *templateStorage) retryable(status int, payload []byte) bool {
-	for _, code := range s.tmpl.Retry.Status {
-		if status == code {
-			return true
-		}
-	}
-	if status == http.StatusForbidden && s.tmpl.Retry.RateReason != "" {
-		if reason := jsonString(payload, s.tmpl.Retry.RateReason); reason != "" {
-			return true
-		}
-	}
-	return false
+	r := s.tmpl.Retry
+	return slices.Contains(r.Status, status) || status == http.StatusForbidden && r.RateReason != "" && jsonString(payload, r.RateReason) != ""
 }
 
 func (s *templateStorage) authHeaders(ctx context.Context, vars map[string]string) (map[string]string, error) {
@@ -719,6 +698,10 @@ func (s *templateStorage) List(ctx context.Context, prefix string) ([]Entry, err
 func (s *templateStorage) Close() error {
 	if s.release != nil {
 		s.release()
+	} else {
+		s.closeTokenWorkers()
+		s.conns.Close()
+		s.client.CloseIdleConnections() // The root also uses this client for tokens.
 	}
 	return nil
 }

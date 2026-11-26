@@ -179,6 +179,9 @@ func (s *s3Storage) session() Storage {
 func (s *s3Storage) Close() error {
 	if s.release != nil {
 		s.release()
+	} else {
+		s.conns.Close()
+		s.client.CloseIdleConnections()
 	}
 	return nil
 }

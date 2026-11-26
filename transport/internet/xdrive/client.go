@@ -39,8 +39,7 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		next = t.secure
 	}
 	ctx, cancel := context.WithCancelCause(r.Context())
-	var timerMu sync.Mutex
-	ended := false
+	var mu sync.Mutex
 	rescue, _ := ctx.Value(spanRescueKey{}).(func() bool)
 	gap := t.stall
 	if rescue != nil {
@@ -48,52 +47,56 @@ func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	last := time.Now()
 	var timer *time.Timer
-	timerMu.Lock()
+	mu.Lock()
 	timer = time.AfterFunc(gap, func() {
-		timerMu.Lock()
-		defer timerMu.Unlock()
-		if idle := time.Since(last); !ended && idle >= gap {
-			if idle >= t.stall || rescue != nil && rescue() {
-				cancel(errStalled)
-			} else {
-				timer.Reset(min(gap, t.stall-idle))
-			}
+		mu.Lock()
+		defer mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		idle := time.Since(last)
+		if idle >= t.stall || idle >= gap && rescue != nil && rescue() {
+			cancel(errStalled)
+			return
+		}
+		// Read activity only updates a timestamp, rather than rearming a timer per chunk.
+		if idle < gap {
+			timer.Reset(gap - idle)
+		} else {
+			timer.Reset(min(gap, t.stall-idle))
 		}
 	})
-	timerMu.Unlock()
+	mu.Unlock()
 	alive := func(ordinary bool) {
-		timerMu.Lock()
-		defer timerMu.Unlock()
-		if !ended {
-			if ordinary {
-				gap = t.stall
-			}
-			last = time.Now()
-			timer.Reset(gap)
+		mu.Lock()
+		if ordinary {
+			gap = t.stall
 		}
+		last = time.Now()
+		mu.Unlock()
 	}
 	end := func() {
-		timerMu.Lock()
-		ended = true
+		mu.Lock()
+		defer mu.Unlock()
 		timer.Stop()
-		timerMu.Unlock()
 		cancel(nil)
 	}
 	r = r.WithContext(ctx)
 	// Clone before setting defaults: the caller owns the original headers.
 	r.Header = r.Header.Clone()
 	utils.TryDefaultHeadersWith(r.Header, "fetch")
-	if r.Body != nil && r.Body != http.NoBody {
-		r.Body = &progressBody{ReadCloser: r.Body, alive: alive, upload: true}
+	upload := func(body io.ReadCloser) io.ReadCloser {
+		if body == nil || body == http.NoBody {
+			return body
+		}
+		return &progressBody{ReadCloser: body, alive: alive, upload: true}
 	}
+	r.Body = upload(r.Body)
 	// Rewinds performed by the transport must also reset the stall timer.
 	if getBody := r.GetBody; getBody != nil {
 		r.GetBody = func() (io.ReadCloser, error) {
 			body, err := getBody()
-			if err != nil || body == http.NoBody {
-				return body, err
-			}
-			return &progressBody{ReadCloser: body, alive: alive, upload: true}, nil
+			return upload(body), err
 		}
 	}
 
@@ -263,16 +266,19 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		return tlsConn, nil
 	}
 
-	secure := func(connsPerHost int) *http.Transport {
+	transport := func(connsPerHost int) *http.Transport {
 		return &http.Transport{
-			DialTLSContext:      dialTLS,
-			ForceAttemptHTTP2:   true,
 			IdleConnTimeout:     net.ConnIdleTimeout,
 			MaxIdleConns:        maxConns,
 			MaxIdleConnsPerHost: maxConns,
 			MaxConnsPerHost:     connsPerHost,
-			HTTP2:               &http.HTTP2Config{SendPingTimeout: h2Idle, PingTimeout: h2PingWait},
 		}
+	}
+	secure := func(conns int) *http.Transport {
+		t := transport(conns)
+		t.DialTLSContext, t.ForceAttemptHTTP2 = dialTLS, true
+		t.HTTP2 = &http.HTTP2Config{SendPingTimeout: h2Idle, PingTimeout: h2PingWait}
+		return t
 	}
 
 	var https http.RoundTripper = &secureTransport{h2: secure(1), h1: secure(maxConns), h1Hosts: h1Hosts}
@@ -356,19 +362,9 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		}
 	}
 
-	return &http.Client{
-		Transport: &serviceTransport{
-			plain: &http.Transport{
-				DialContext:         dialPlain,
-				IdleConnTimeout:     net.ConnIdleTimeout,
-				MaxIdleConns:        maxConns,
-				MaxIdleConnsPerHost: maxConns,
-				MaxConnsPerHost:     maxConns,
-			},
-			secure: https,
-			stall:  stall,
-		},
-	}
+	plain := transport(maxConns)
+	plain.DialContext = dialPlain
+	return &http.Client{Transport: &serviceTransport{plain: plain, secure: https, stall: stall}}
 }
 
 // Closing the socket unregisters the owner-context callback.
