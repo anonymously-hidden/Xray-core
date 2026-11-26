@@ -67,8 +67,7 @@ type driveShared struct {
 	tokenClient                                                   *http.Client
 	pools                                                         [laneCount]*connPool
 	permits                                                       [laneCount]chan struct{}
-	headMedia                                                     chan struct{}            // reserved HTTP permits, same media pool
-	turns                                                         [laneCount]chan struct{} // media and metadata share the ordinary queue
+	headMedia                                                     chan struct{} // reserved HTTP permits, same media pool
 	cancel                                                        context.CancelFunc
 	sessionGuard                                                  driveSessionGuard
 	mu                                                            sync.Mutex
@@ -97,8 +96,6 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 		tokenURL: "https://oauth2.googleapis.com/token", tokenClient: client(ctx), cancel: cancel, idLock: make(chan struct{}, 1),
 		headMedia: make(chan struct{}, min(4, int(driveMediaConns(config.Xmux)))),
 	}}
-	s.turns[metadataLane], s.turns[priorityLane] = make(chan struct{}, 1), make(chan struct{}, 1)
-	s.turns[mediaLane] = s.turns[metadataLane]
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
@@ -326,28 +323,8 @@ func (s *driveStorage) delayRequests(h http.Header) {
 	errors.LogDebug(context.Background(), "xdrive cooldown ", time.Until(s.coolUntil))
 }
 
-// A promoted read can switch queues while waiting for a permit or pacing turn.
-func acquireDrive(ctx context.Context, ordinary, urgent chan struct{}, head <-chan struct{}) (chan struct{}, error) {
-	for {
-		if isClosedChan(head) {
-			ordinary, head = urgent, nil
-		}
-		select {
-		case ordinary <- struct{}{}:
-			return ordinary, nil
-		case <-head:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-}
-
-func (s *driveStorage) waitRequest(ctx context.Context, lane driveLane, head <-chan struct{}) error {
-	turn, err := acquireDrive(ctx, s.turns[lane], s.turns[priorityLane], head)
-	if err != nil {
-		return err
-	}
-	defer func() { <-turn }()
+// Reserve spaced starts across all lanes; a later cooldown reschedules the turn.
+func (s *driveStorage) waitRequest(ctx context.Context) error {
 	for {
 		s.mu.Lock()
 		now := time.Now()
@@ -449,10 +426,22 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				return err
 			}
 		}
+		permits := s.permits[lane]
 		head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{}) // only frame GETs carry this
-		permits, err := acquireDrive(ctx, s.permits[lane], s.headMedia, head)
-		if err != nil {
-			return err
+		if isClosedChan(head) {
+			permits, head = s.headMedia, nil
+		}
+		select {
+		case permits <- struct{}{}:
+		case <-head: // A queued look-ahead request has become the ordered head.
+			permits = s.headMedia
+			select {
+			case permits <- struct{}{}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 		retry, err := func() (bool, error) {
 			defer func() { <-permits }()
@@ -461,7 +450,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				_, retry := err.(tokenRetry) // No file request has been sent yet.
 				return retry, err
 			}
-			if err := s.waitRequest(ctx, lane, head); err != nil {
+			if err := s.waitRequest(ctx); err != nil {
 				return false, err
 			}
 			req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
@@ -606,7 +595,11 @@ func (s *driveStorage) writeFile(ctx context.Context, lane driveLane, method, id
 		return err
 	}
 	// One writer per file: confirm the exact frame or ACK without replay.
-	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), 2*time.Second)
+	window := 2 * time.Second
+	if _, ack := ctx.Value(headKey{}).(watermarkWrite); ack {
+		window = 15 * time.Second // A reconnect may outlast the usual readback.
+	}
+	verify, cancel := context.WithTimeout(context.WithValue(ctx, headKey{}, true), window)
 	defer cancel()
 	for verify.Err() == nil {
 		d, readErr := s.readDescription(verify, id)
@@ -644,9 +637,10 @@ func (s *driveStorage) createSlot(ctx context.Context, id, name, description str
 }
 
 type (
-	headKey      struct{}
-	mediaHeadKey struct{} // <-chan struct{}, closed on promotion
-	mediaSeqKey  struct{} // int64, for request retry diagnostics
+	headKey        struct{}
+	watermarkWrite struct{} // headKey value for the sole cumulative ACK writer
+	mediaHeadKey   struct{} // <-chan struct{}, closed on promotion
+	mediaSeqKey    struct{} // int64, for request retry diagnostics
 )
 
 func writeLane(ctx context.Context, body []byte) driveLane {

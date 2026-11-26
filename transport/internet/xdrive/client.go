@@ -159,7 +159,11 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		tlsConfig = tls.ConfigFromStreamSettings(streamSettings)
 		sockopt = streamSettings.SocketSettings
 		fronting = streamSettings.Destination
-		if config, ok := streamSettings.ProtocolSettings.(*Config); ok && config != nil && config.Xmux != nil {
+		config, _ := streamSettings.ProtocolSettings.(*Config)
+		if config != nil && (config.Service == "google-drive" || config.Service == "Google Drive") {
+			h2PingWait = 0 // Use net/http's 15 s ping grace on Drive's shared h2 connections.
+		}
+		if config != nil && config.Xmux != nil {
 			switch period := config.Xmux.HKeepAlivePeriod; {
 			case period > 0:
 				h3KeepAlive = time.Duration(period) * time.Second

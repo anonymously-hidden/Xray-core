@@ -366,7 +366,7 @@ func (w *slotWriter) credit(seq int64) (bool, error) {
 	return w.acked >= need, nil
 }
 
-func (w *slotWriter) publish(ctx context.Context, seq int64, previous <-chan struct{}, mode byte, chunk []byte) error {
+func (w *slotWriter) publish(seq int64, previous <-chan struct{}, mode byte, chunk []byte) error {
 	if previous != nil {
 		select {
 		case <-previous:
@@ -397,7 +397,7 @@ func (w *slotWriter) publish(ctx context.Context, seq int64, previous <-chan str
 		return err
 	}
 	credited := time.Now()
-	if err := w.table.publish(ctx, w.store, seq, mode, chunk); err != nil {
+	if err := w.table.publish(w.ctx, w.store, seq, mode, chunk); err != nil {
 		// A lost reply is not a refusal: never overwrite possibly committed data.
 		if _, refused := err.(refusedPayload); refused && w.ctx.Err() == nil {
 			ctx, cancel := context.WithTimeout(w.ctx, 2*time.Second)
@@ -417,7 +417,7 @@ func (w *slotWriter) run() {
 	defer close(w.done)
 	defer w.workers.Wait()
 	var seq int64
-	var fresh bool // first bytes after an input gap, with no outstanding uploads
+	var mediaAt time.Time // keep bulk bursts out of inline waves between uploads
 	fences := make([]chan struct{}, len(w.table.Slots))
 	launch := func(chunk []byte) bool {
 		select {
@@ -430,10 +430,6 @@ func (w *slotWriter) run() {
 			return false
 		}
 		n := seq
-		ctx := w.ctx
-		if fresh {
-			ctx, fresh = context.WithValue(ctx, headKey{}, true), false
-		}
 		seq++
 		i := n % int64(len(fences))
 		prev, done := fences[i], make(chan struct{})
@@ -444,12 +440,14 @@ func (w *slotWriter) run() {
 			if n == 0 {
 				w.first <- chunk
 			}
+		} else {
+			mediaAt = time.Now()
 		}
 		w.workers.Go(func() {
 			defer close(done)
 			defer func() { <-w.permits }()
 			defer w.flight.give(len(chunk))
-			if err := w.publish(ctx, n, prev, mode, chunk); err != nil {
+			if err := w.publish(n, prev, mode, chunk); err != nil {
 				w.fail(err)
 			}
 		})
@@ -474,11 +472,18 @@ func (w *slotWriter) run() {
 		if w.frame != frame {
 			errors.LogDebug(w.ctx, "xdrive frame size ", frame, " -> ", w.frame, " strained=", strained, " cooling=", cooling, " uploads=", len(w.permits))
 		}
-		// One inline lead exposes a fresh burst; bulk uses the entire frame.
+		// Idle bursts can avoid a media GET; active bulk keeps full-sized frames.
+		unit := min(frame, slotInlineLimit)
+		wave := min(24, cap(w.permits)-len(w.permits))
+		inline := min(len(buf), wave*unit)
+		if cooling || len(w.permits) >= slotBusyUploads || time.Since(mediaAt) < w.eagerWindow || len(buf) > wave*unit && (wave < 24 || len(buf) > frame) {
+			inline = 0
+		}
 		for len(buf) > 0 {
 			n := min(len(buf), frame)
-			if fresh && !cooling {
-				n = min(n, slotInlineLimit)
+			if inline > 0 {
+				n = min(inline, unit)
+				inline -= n
 			}
 			if !launch(buf[:n:n]) {
 				return false
@@ -498,25 +503,23 @@ func (w *slotWriter) run() {
 			}
 			w.workers.Wait()
 			if w.ctx.Err() == nil {
-				if err := w.publish(w.ctx, seq, fences[seq%int64(len(fences))], slotEnd, nil); err != nil {
+				if err := w.publish(seq, fences[seq%int64(len(fences))], slotEnd, nil); err != nil {
 					w.fail(err)
 				}
 			}
 			return
 		case b := <-w.input:
-			now := time.Now()
+			lastIn = time.Now()
 			if len(buf) == 0 {
-				buf, bufAt = b, now
-				fresh = len(w.permits) == 0 && now.Sub(lastIn) >= w.flushInterval
+				buf, bufAt = b, lastIn
 				d := w.flushInterval
-				if fresh && !isCooling(w.store) {
+				if len(w.permits) == 0 && len(b) <= slotInlineLimit && !isCooling(w.store) {
 					d = min(d, 2*time.Millisecond)
 				}
 				timer.Reset(d)
 			} else {
 				buf = append(buf, b...)
 			}
-			lastIn = now
 			if len(buf) >= w.frame && !flush() {
 				return
 			}
@@ -826,7 +829,7 @@ func (r *slotReader) run() {
 // This goroutine is the only watermark writer. END triggers one last snapshot
 // after the ordered reader has stopped, including credit below the batch size.
 func (r *slotReader) ackLoop(readDone <-chan struct{}) {
-	ctx := context.WithValue(r.ctx, headKey{}, true)
+	ctx := context.WithValue(r.ctx, headKey{}, watermarkWrite{})
 	t := time.NewTicker(1500 * time.Millisecond)
 	defer t.Stop()
 	acked := int64(-1)

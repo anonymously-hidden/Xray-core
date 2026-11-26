@@ -17,9 +17,9 @@ Mode 1 carries up to 14 KiB in metadata, mode 5 a media body, modes 3 and 4
 mean end and error. See "Transport model" below.
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
-  Input is normally gathered for 25 ms. A fresh burst gets a 2 ms window and
-  one priority inline lead of up to 14 KiB outside cooldown. The remainder
-  uses normal frame sizes. There are at most 32 upload workers per direction
+  Input is normally gathered for 25 ms. A small first write with no uploads
+  in flight gets a 2 ms window outside cooldown. Idle bursts may use up to
+  24 inline positions. There are at most 32 upload workers per direction
   and never more than the ring depth.
   Reuse requires previous local completion and cumulative remote credit.
 - **Read:** idle polling focuses on the head. After a minute without a head,
@@ -61,8 +61,8 @@ Each direction is a ring of `depth` Drive files plus one watermark file owned
 by the reader. Sequence `n` always lives in `slots[n % depth]`.
 
 1. **Gather.** The writer collects caller input for up to 25 ms or until the
-   current frame size is reached. After an input gap of at least one flush
-   interval with no uploads outstanding, it gathers for at most 2 ms outside cooldown.
+   current frame size is reached. The 2 ms fast flush applies only when the
+   initial write fits inline, no uploads are outstanding and Drive is not cooling down.
    With 4 or more uploads in flight the writer is streaming: it keeps
    gathering while input keeps arriving, up to 200 ms or a full frame, and
    sends once input pauses for 25 ms, so a reply burst goes out as one frame.
@@ -73,10 +73,10 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    Cooldown freezes frame size instead of shrinking it: smaller frames spend
    more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
    the writer is a ring ahead. Larger frames carry more bytes per position.
-3. **Publish.** Up to 14 KiB goes inline in the file description. A fresh
-   burst gets one inline lead outside cooldown, so the peer can read its first
-   bytes without a media GET. Remaining bytes use the normal frame size rather
-   than splitting the burst into a wave of metadata writes. A media frame
+3. **Publish.** Up to 14 KiB goes inline in a file description. Idle bursts
+   can use several available inline positions, avoiding a media GET. The
+   planner suppresses inline waves while streaming, during cooldown and for
+   the eager window after a media upload starts (2 s by default). A media frame
    is one multipart create or PATCH: the description holds `XDRVSL03`, sequence, mode
    and length; the body is blocks of an 8-byte sequence tag followed by up to
    256 KiB of data. At most 32 uploads and
@@ -155,7 +155,10 @@ allocation failure now fails the dial explicitly instead of switching to WAL.
 Announcements are also created with reserved IDs. After a lost reply, read back
 the exact slot, watermark or inline announcement description; for a media
 announcement also compare the complete body. Never replay an ambiguous write.
-If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
+The sole cumulative watermark writer gets 15 s to confirm an ambiguous create
+or PATCH across a reconnect; data publications retain their 2 s window. There
+is no added wait on a successful acknowledgement. An unconfirmed watermark
+still fails the connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
 the original write error is preserved. Graceful close reports final ACK errors. These are
 behavior differences, not just source rearrangement. Historical throughput
 and tail-latency measurements from the larger version are **not** measurements
@@ -181,11 +184,10 @@ is sent. All Drive file attempts, including retries, reserve spaced starts at
 80 requests/s per shared storage instance, across sessions and lanes. Two peers
 at this ceiling use about 9,600 attempts/minute against the observed 12,000
 quota, leaving headroom, not a guarantee for other processes or profiles sharing
-the project. Ordinary and priority work can each hold one upcoming pacing turn;
-an ordinary backlog cannot book the clock ahead of head reads, watermarks,
-fresh inline leads or metadata write confirmations. A media GET promoted to head
-can switch queues while waiting. Both classes recheck the same cooldown.
-Cancellation releases its permits but may leave an unused pacing turn.
+the project. Each admitted attempt reserves its own pacing turn and rechecks
+cooldown before proceeding. Cancellation may leave an unused pacing turn.
+Drive's default HTTP/2 health check probes after 1.5 s of read idle and uses
+Go's 15 s ping-response grace. An explicit keepalive setting still takes precedence.
 Drive rate-limit responses and 503 responses with `Retry-After` apply a shared
 exponential cooldown (jittered 2–30 s base), reset after a minute without a new
 cooldown. Concurrent rejections in one cooldown do not escalate independently;
@@ -198,7 +200,15 @@ not to the resulting connection. Use a dedicated folder for one listener and its
 
 ### Verification of this candidate
 
-The latency changes were built with `go build ./...` and vetted with
+The ACK recovery check used two Go peers and a local TLS Drive mock. A committed
+watermark PATCH lost its reply; its readback was delayed 3.5 s. One session
+delivered a 5 MiB + 301 byte response and 21 small responses byte-for-byte,
+including a truncated media GET. A later watermark advanced without replaying
+the ambiguous PATCH. Separately, an HTTP/2 mock held a PING acknowledgement
+for 3.5 s during a Drive LIST; the next LIST used the same connection. Neither
+check measures live speed.
+
+The previous `.96` latency changes were built with `go build ./...` and vetted with
 `go vet ./transport/internet/xdrive`. Two Go peers ran against a loopback
 Drive HTTP/1.1 mock over TLS, with 161 concurrent requests: 160 small assets
 and one 3 MiB + 301 byte response. All response bodies matched exactly despite
@@ -263,9 +273,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 1060 |
-| `slots.go` | whole file | 874 |
-| `client.go` | whole file | 537 |
+| `drive.go` | whole file | 1054 |
+| `slots.go` | whole file | 877 |
+| `client.go` | whole file | 541 |
 | `conn.go` | 65–79, 185–217, 219–244 | 74 |
 | `xdrive.go` | 9, 139–223, 276, 323–413, 479–490, 492–512, 538–572, 588–670 | 329 |
 | `params.go` | 75–91 | 17 |
@@ -273,4 +283,4 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 | `storage_lease.go` | 26–32, 42–45, 47–63, 69–70, 89, 157–162 | 37 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2998** |
+| **Total** | | **2999** |
