@@ -41,7 +41,8 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
   Ordered delivery refreshes the eager timer; speculative body downloads do not.
 - **Media:** frames through 1 MiB use one progressive GET; larger frames
   use up to four block ranges at once, capped by the media connection count
-  and targeting at least 512 KiB of payload per range.
+  and targeting at least 512 KiB of payload per range. A prefetched frame
+  starts with its first two ranges; the ordered head can start all of them.
   If the first range returns a full HTTP 200 body, keep it and cancel the other
   ranges instead of downloading the full body four times. Validate every
   block's sequence tag, HTTP range/length and EOF. Resume an incomplete span
@@ -114,10 +115,11 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 5. **Fetch.** Media up to 1 MiB uses one streaming GET; larger frames use
    two to four block-aligned ranges with the default four connections,
    targeting at least 512 KiB per range and reaching four ranges at 2 MiB.
-   They start together for each admitted frame: every block carries
-   the sequence tag, so each range rejects an older lap by itself (before,
-   later ranges waited for the first one, costing a second time-to-first-byte,
-   ~1 s, per large frame).
+   The ordered head starts all its ranges immediately. A prefetched frame
+   starts its first two; the others start when range zero receives its first
+   tagged block or the frame becomes the head, whichever happens first. This keeps later
+   ranges from taking as much bandwidth away from earlier bytes. Each block
+   carries its own sequence tag. Promotion does not restart an existing GET.
    A full HTTP 200 response to the first range replaces all ranges; the others
    are canceled before any of their bytes are delivered. Bytes are delivered
    in pieces of up to 4 KiB at offset zero, then up to 32 KiB. A retry starts
@@ -169,9 +171,11 @@ cannot collect their files while either peer still holds the profile locally.
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
 pools. Metadata and priority select a lease once per session. Each media lane
-keeps its assigned work until the body closes. A verified GET measures elapsed
-time against work completed on that lane during the request, including overlapping
-GETs. Each lane averages its estimate with the new sample. New lanes and lanes
+keeps its assigned work until the body closes. Each complete tagged block measures
+elapsed time against wire bytes read on that lane since the GET started, including
+overlapping GETs and one start allowance. This updates the estimate while a slow
+range is still in progress; only ordered delivery through EOF grants ring credit.
+Each lane averages its estimate with the new sample. New lanes and lanes
 without a sample in the last minute use the latest pool sample. Uploads
 use outstanding work alone. Request/reuse/lifetime limits
 still apply within each lane; the media byte budget follows the same count.
@@ -236,6 +240,41 @@ folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+### Sustained downloads on `.105`
+
+The matched 64-slot session carried 300.65 MiB in 143 media frames. Median
+server publication took 1.42 s. Of 82 frames with at least three ranges, 42
+had a third or fourth range finish before range zero. Frame 164's last range
+finished 24.7 s after its first completion. Both peers kept the session and
+neither logged a quota cooldown. The logs time Drive requests; they do not
+measure Steam's instantaneous delivery rate.
+
+Race-instrumented peers confirmed both ways to start the waiting ranges: after
+the first tagged block while the preceding frame was still downloading, and on
+promotion while that block was withheld. When a speculative range zero got a
+full HTTP 200, its waiting ranges made no requests. All three 32 MiB + 329 byte
+responses and their follow-ups matched the origin through EOF.
+
+For the sustained-transfer comparison, four concurrent application downloads
+each received 16 MiB + 329 bytes on one 64-slot session. The local HTTP/2
+Drive service delayed media headers by 650 ms; connections were shaped at
+1.1 MiB/s, with the slow connection, when present, shaped at 0.12 MiB/s.
+The comparison used four batches per build and profile, reversing build order.
+The last two columns are the median of each batch's slowest 1 MiB of ordered
+application payload, measured after the first payload byte.
+
+| Media connections | `.105` MiB/s | Updated MiB/s | `.105` slowest MiB | Updated slowest MiB |
+|---|---:|---:|---:|---:|
+| Four equal | 2.60 | 3.02 | 5.42 s | 3.61 s |
+| One consistently slow | 1.51 | 1.50 | 15.20 s | 15.08 s |
+| Slow connection changes every 8 s | 1.40 | 1.48 | 10.33 s | 8.87 s |
+
+An additional 24-download run also moved the slow connection every eight seconds.
+There the 95th-percentile time to receive the next MiB improved from 4.61 s
+to 3.38 s, but the single slowest MiB took 10.92 s versus 10.02 s on `.105`.
+Aggregate application throughput was 1.60 versus 1.63 MiB/s. These are
+loopback delivery measurements, not a live bandwidth floor.
 
 ### Download throughput since `.101`
 

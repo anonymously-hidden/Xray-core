@@ -55,7 +55,7 @@ type (
 
 type mediaRead struct {
 	size     int
-	verified func(int) // Set by the selected lane; only exact EOF supplies a timing sample.
+	progress func(int) // Timing only: receipt of a tagged block does not release ring credit.
 }
 
 type driveLane int
@@ -608,7 +608,7 @@ func (s *driveStorage) readDescription(ctx context.Context, id string) (string, 
 
 // readSpan verifies tagged blocks [lo, hi), emitting each payload byte once.
 // On a flaky connection, allow an interrupted resume to reconnect once without new bytes.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole func()) error {
+func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole, prefixReady func()) error {
 	const stride = slotBodyHeader + slotTagBlock
 	total := f.size + slotBodyHeader*slotBlocks(f.size)
 	pos := lo * slotTagBlock // Payload offset of the next undelivered chunk.
@@ -668,12 +668,15 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 					}
 					at += len(b)
 				}
+				read.progress(slotBodyHeader + min(slotTagBlock, f.size-i*slotTagBlock))
+				if prefixReady != nil && i == from {
+					prefixReady()
+				}
 			}
 			if _, readErr = io.ReadFull(resp.Body, tag[:1]); readErr != io.EOF {
 				return errors.New("Drive media did not end at the declared length").Base(readErr)
 			}
 			errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
-			read.verified(length)
 			return nil
 		})
 		firstRetry := attempt == 1 && (!headers.IsZero() || err == errNotFound || err == errDriveRange)
@@ -690,56 +693,53 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 	}
 }
 
-// Frames through slotProgressiveMax use one progressive GET. Larger frames
-// use up to four block ranges at once, targeting at least 512 KiB per range.
+// Speculative frames start with the first two ranges. The ordered head may use all lanes.
 func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, out chan<- []byte, verifiedFrame *atomic.Int64) error {
 	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
-	n := slotBlocks(f.size)
 	count := min(cap(s.headMedia), f.size/(2*slotTagBlock))
 	if f.size <= slotProgressiveMax || s.cooling() {
 		count = 1
 	}
+	boundary := func(i int) int { return i * slotBlocks(f.size) / count }
 	var draining, verified atomic.Int64 // Ordered range and highest range verified through EOF.
 	head := ctx.Value(mediaHeadKey{}).(<-chan struct{})
-	read := func(ctx context.Context, i int, chunks chan<- []byte, whole func()) error {
+	read := func(ctx context.Context, i int, chunks chan<- []byte, whole, prefixReady func()) error {
 		ctx = context.WithValue(ctx, spanRescueKey{}, func() bool {
 			later := verifiedFrame.Load() > f.seq || verified.Load() > int64(i)
 			return later && isClosedChan(head) && draining.Load() == int64(i) && !s.cooling()
 		})
-		return s.readSpan(ctx, id, f, i*n/count, (i+1)*n/count, chunks, whole)
+		return s.readSpan(ctx, id, f, boundary(i), boundary(i+1), chunks, whole, prefixReady)
 	}
 	if count == 1 {
-		return read(ctx, 0, out, nil)
+		return read(ctx, 0, out, nil, nil)
 	}
 	tailCtx, stopTails := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	defer stopTails()
+	firstBlock := make(chan struct{})
 	queues := make([]chan []byte, count) // Range zero streams directly to out.
 	results := make([]error, count)      // Published by closing the corresponding queue.
 	for i := 1; i < count; i++ {
-		lo, hi := i*n/count, (i+1)*n/count
-		queues[i] = make(chan []byte, (hi-lo)*(slotTagBlock/slotReadChunk))
+		queues[i] = make(chan []byte, (boundary(i+1)-boundary(i))*(slotTagBlock/slotReadChunk))
 		wg.Go(func() {
-			results[i] = read(tailCtx, i, queues[i], nil)
-			if results[i] == nil {
-				advance(&verified, int64(i))
+			if i == 1 || waitFor(tailCtx, firstBlock, head) == nil {
+				if results[i] = read(tailCtx, i, queues[i], nil, nil); results[i] == nil {
+					advance(&verified, int64(i))
+				}
 			}
 			close(queues[i])
 		})
 	}
-	err := read(ctx, 0, out, stopTails)
-	for i := 1; i < count && err == nil; i++ {
-		if tailCtx.Err() != nil { // Full-body fallback unless the parent was canceled.
-			return ctx.Err()
-		}
+	err := read(ctx, 0, out, stopTails, sync.OnceFunc(func() { close(firstBlock) }))
+	for i := 1; i < count && err == nil && tailCtx.Err() == nil; i++ {
 		draining.Store(int64(i))
 		for b := range queues[i] {
 			out <- b
 		}
 		err = results[i]
 	}
-	return err
+	return cmp.Or(err, ctx.Err()) // Full HTTP 200 cancels only the tails.
 }
 
 // One ID for the announcement and two tables, each with a watermark.

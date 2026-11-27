@@ -342,8 +342,8 @@ type connPool struct {
 type connLane struct {
 	manager   *splithttp.XmuxManager
 	pending   atomic.Int64 // Charged until the body closes, including across lease rotation.
-	delivered int64        // Verified work on this connection, including overlapping GETs.
-	cost      float64      // Nanoseconds per charged byte of a verified media GET; guarded by pool.mu.
+	delivered int64        // Tagged wire bytes consumed across overlapping GETs.
+	cost      float64      // Nanoseconds per charged byte; guarded by pool.mu.
 	sampled   time.Time
 }
 
@@ -367,14 +367,14 @@ func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 	p.next = (best + 1) % len(p.lanes)
 	lane := &p.lanes[best]
 	if read != nil {
-		before := lane.delivered
-		read.verified = func(bytes int) {
+		before := lane.delivered - slotTagBlock // Include this GET's start cost once in every estimate.
+		read.progress = func(bytes int) {
 			p.mu.Lock()
 			defer p.mu.Unlock()
 			lane.sampled = time.Now()
-			lane.delivered += int64(slotTagBlock + bytes)
+			lane.delivered += int64(bytes)
 			p.cost = float64(lane.sampled.Sub(now)) / float64(lane.delivered-before)
-			lane.cost = (p.cost + cmp.Or(lane.cost, p.cost)) / 2 // Smooth queueing noise between completions.
+			lane.cost = (p.cost + cmp.Or(lane.cost, p.cost)) / 2
 		}
 	}
 	return lane
