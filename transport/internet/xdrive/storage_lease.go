@@ -16,11 +16,11 @@ type storageOwner struct {
 func (o *storageOwner) hold(id string, delta int) bool {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
-	if n := o.sessions[id]; n >= 0 && (n == 0 || delta >= 0) {
-		o.sessions[id] = n + delta
-		return true
+	if n := o.sessions[id]; n < 0 || n > 0 && delta < 0 {
+		return false
 	}
-	return false
+	o.sessions[id] += delta
+	return true
 }
 
 func (o *storageOwner) release(id string) error {

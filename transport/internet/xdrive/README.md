@@ -1,689 +1,133 @@
 # XDRIVE
 
-xDrive carries an ordered byte stream in each direction. Use matching releases on
-both peers. Drive uses slots; local, URL-template and S3 stores keep their WAL.
-This repository is a review candidate based on the maintainer's fork, not a merge
-of the current upstream branch.
+XDrive carries one ordered byte stream in each direction. The Google Drive backend
+uses a ring of files; local, URL-template and S3 storage use a write-ahead log.
+Use matching releases on the two peers and a private Drive folder for the listener
+and its clients.
 
-## Drive protocol
+## What can Google Drive metadata do?
 
-The announcement names a table of file IDs and one reader-owned watermark for
-**each direction**. IDs are allocated in batches. The first lap creates files
-on first publication. Established sessions do not list files to find data:
-sequence `n` maps directly to `slots[n % depth]`. If present, the announcement's
-first payload is sequence zero, not an additional record.
-
-Mode 1 carries up to 14 KiB in metadata. Mode 5 has a tagged media body and
-can carry its first 14 KiB in the same publication's description. Modes 3 and
-4 mean end and error. See "Transport model" below.
-
-- **Write:** one goroutine batches caller input and assigns sequence numbers.
-  Input is normally gathered for 25 ms. A small first write with no uploads
-  in flight gets a 2 ms window outside cooldown. A quiet burst can use up to
-  24 inline positions; during streaming the limit is four. There are at most
-  32 upload workers per direction and never more than the ring depth.
-  Reuse requires previous local completion and cumulative remote credit. Media
-  bytes remain charged against the sender's delivery window until acknowledged.
-- **Read:** idle polling focuses on the head. After a minute without a head,
-  one bounded background probe at a time rotates through other slot descriptions
-  to distinguish a gap from a genuinely idle peer. During activity, up to
-  24 known descriptions are prefetched, with one metadata GET per worker at a
-  time. Repeated empty-slot polling reaches only four positions beyond the
-  observed frontier (or head). A full inline slot allows a single earlier
-  probe of each position in the rest of the 24-slot window.
-  All media sizes may be prefetched; byte admission follows sequence
-  order, bounded to 4 MiB per media connection and held until head promotion.
-  Ordinary media has four HTTP permits per connection (capped at 64); head
-  media has separate permits (up to four), including queued requests promoted
-  to head. Both use the same connections; the head has its own frame allowance.
-  A prefetched frame returns its local byte reservation when promoted, even if
-  its body is still downloading. Completed successors retain theirs until promoted.
-  Workers can finish out of order; one coordinator alone delivers bytes.
-  Ordered delivery refreshes the eager timer; speculative body downloads do not.
-- **Media:** frames through 1 MiB use one progressive GET; larger frames
-  use up to four block ranges at once, capped by the media connection count
-  and targeting at least 512 KiB of payload per range. A prefetched frame
-  starts with its first two ranges; the ordered head can start all of them.
-  If the first range returns a full HTTP 200 body, keep it and cancel the other
-  ranges instead of downloading the full body four times. Validate every
-  block's sequence tag, HTTP range/length and EOF. Resume an incomplete span
-  without delivering the same bytes twice (see Fetch below). A media GET requires
-  a descriptor, obtained from the slot itself or, for a blocked head, its successor.
-- **Close:** Close discards unread input, drains its writer and publishes END.
-  It keeps verifying input and returning credit until it reads the peer's END,
-  then flushes any remaining verified watermark. The peer may still have a full
-  ring to drain after our writer finishes. Interrupt cancels instead.
-
-Unlike v6, a unilateral graceful Close can time out if the peer never publishes
-END. The one-minute watchdog tracks outbound progress until the local writer
-finishes, then also counts successful inbound watermark writes during Close.
-Receiving END alone does not close the outbound half.
-
-## Transport model (Drive)
-
-Each direction is a ring of `depth` Drive files plus one watermark file owned
-by the reader. Sequence `n` always lives in `slots[n % depth]`.
-
-1. **Gather.** The writer collects caller input for up to 25 ms or until the
-   current frame size is reached. The 2 ms fast flush applies only when the
-   initial write fits inline, no uploads are outstanding and Drive is not cooling down.
-   With 4 or more uploads in flight the writer is streaming: it keeps
-   gathering while input keeps arriving, up to 200 ms or a full frame, and
-   sends once input pauses for 25 ms. Bytes that cross a full-frame boundary
-   start the next gather; a small overflow does not cost an immediate extra slot.
-2. **Frame size follows ordered delivery.** The starting target is `segmentBytes`
-   (default 512 KiB, bounded to 256 KiB–1 MiB). When a media GET is admitted,
-   the reader records its ordered byte count and the time. Once that frame has
-   been delivered and verified through EOF, it reports the bytes delivered since
-   admission divided by elapsed time. This includes concurrent transfers that
-   actually reached the ordered stream. The writer targets one second at that
-   rate, bounded to 256 KiB–4 MiB; a partial gather can still be smaller.
-   The sender also limits *unacknowledged media bytes*: two frame allowances per
-   lane (at least four allowances), plus a quarter second of measured delivery,
-   capped at the local look-ahead byte budget plus one head frame. Each allowance
-   starts at no less than 512 KiB; once a positive rate arrives it tracks the
-   measured frame target down to 256 KiB.
-   Inline slots still use ordinary ring credit. A successful upload alone cannot
-   open the media window. Quota cooldown freezes the sender's rate estimate.
-3. **Publish.** Up to 14 KiB goes inline in a file description. With fewer
-   than eight uploads in flight and outside cooldown, the writer splits a
-   burst only if its entire run fits both free workers and known remote credit.
-   Normally the limit is four (56 KiB); for a partial frame with fewer than four
-   uploads and no burst over 56 KiB in the last eager window, it is 24 (336 KiB).
-   A larger burst uses one media publication. Tags go directly into the multipart
-   upload buffer, avoiding an intermediate copy of the entire media body.
-   A media frame is one multipart create or PATCH: the description holds
-   `XDRVSL04`, sequence, mode and total payload length. For media frames up to
-   1 MiB it also holds the first 14 KiB of payload. The reader can deliver
-   this prefix in order before the body GET returns; it costs no extra slot or
-   request. The rest (all payload for larger frames) is stored in blocks of an
-   8-byte sequence tag and up to 256 KiB of data. At most 32 uploads and
-   4 MiB of unfinished uploads per media connection run per direction (one
-   frame may exceed it alone). Media requests are charged by payload size plus
-   one block of request overhead. A download chooses the lowest estimated
-   completion time, rotating ties (XMUX `maxConnections`, default 4): one Google
-   connection carries only a fraction of a link (a measured single-connection
-   client download averaged ~0.22 MB/s). The byte bound,
-   about one 4 MiB frame per connection, bounds payload bytes, not request count
-   or duplicated network traffic. Head reads have separate HTTP permits, not
-   extra connections. Bounded look-ahead overlaps service latency between frames
-   instead of forcing one large frame to finish before starting the next.
-4. **Discover.** The reader polls the head slot's description (25 ms while
-   active; no duplicate hedged GET) and prefetches up to 24 descriptions. Slots
-   beyond the observed frontier plus four wait without repeated polling. A full
-   inline slot suggests a split burst, so each successor in the window can try
-   once before the frontier reaches it. A prediction never counts as evidence of a gap.
-   Bodies of all sizes download ahead within the byte budget, admitted in sequence
-   order so distant successors cannot reserve it before nearer frames. The head
-   bypasses that budget, and a queued media request switches to the reserved
-   HTTP permits when promoted. Admission waits for the previous frame's ready
-   signal, not its completed download.
-   If an ordered metadata GET goes idle for five seconds with a later sequence
-   already visible, discovery can retry it outside cooldown. After publishing a
-   frame larger than 1 MiB, the writer also includes that frame's 28-character
-   descriptor in the successor's optional Drive file property `xdrivePrev`.
-   These frames have no prefix in their description: the original media contains
-   all their bytes. On a failed or stale head lookup, the reader can use this hint
-   once if the prior file ID is already bound to the session. It buffers that
-   head, checks its own tags, length and EOF, then exposes its bytes. A stale body
-   is discarded before falling back to the original metadata. Old properties on
-   a reused slot do not match the required sequence. Ordinary reads still stream.
-   Promotion releases any existing look-ahead reservation, not remote ring credit.
-   Thus a head discovered in advance no longer consumes both its own allowance
-   and the successors' budget. Cancellation wakes waiters and retires the
-   reader's private budget with the session.
-5. **Fetch.** Media up to 1 MiB uses one streaming GET; larger frames use
-   two to four block-aligned ranges with the default four connections,
-   targeting at least 512 KiB per range and reaching four ranges at 2 MiB.
-   The ordered head starts all its ranges immediately. A prefetched frame
-   starts its first two; the others start when range zero receives its first
-   tagged block or the frame becomes the head, whichever happens first. This keeps later
-   ranges from taking as much bandwidth away from earlier bytes. Each block
-   carries its own sequence tag. Promotion does not restart an existing GET.
-   A full HTTP 200 response to the first range replaces all ranges; the others
-   are canceled before any of their bytes are delivered. Bytes are delivered
-   in pieces of up to 4 KiB at offset zero, then up to 32 KiB. A retry starts
-   at the block containing the first undelivered byte. Interrupted body reads
-   can use up to eight span attempts, stopping after two consecutive attempts
-   emit no new payload. A second wrong tag, range or length still fails.
-   The offset is relative to the media body, excluding any description prefix.
-   Duplicate bytes are skipped; tags, declared length and exact EOF are checked.
-   For a multi-range frame, the first range streams straight into the frame queue.
-    Each span checks after five seconds without headers or new body bytes on an
-    HTTP 206 or an ordinary (unranged) HTTP 200 media GET.
-   It can restart early only if its frame is the ordered head, the coordinator is
-   draining this specific span, and Drive is not cooling down. There must be
-   evidence of progress: a later range in this frame or a later media frame
-   has verified through EOF, or a later inline frame has been read in full.
-   An inline description is already the entire frame: it counts immediately,
-   even if an intervening slot is still waiting for its description or byte allowance.
-   This evidence does not deliver the inline bytes or release ring credit early.
-   A verified successor also covers the last range of a frame and a progressive
-   GET waiting for headers. An interrupted header wait uses the existing HTTP GET retry budget;
-   a partial body uses offset-aware resume. After a stall
-    triggers a retry, the next GET uses a different media lane if available and
-    the ordinary timeout. Any positive body read resets the idle clock. An HTTP
-    200 answering a **Range** request keeps its ordinary timeout.
-6. **Credit.** The watermark description is JSON: `s` is the last completely
-   delivered sequence and `r` is ordered payload bytes per second (zero until
-   measured). The reader coalesces writes at `depth/6` frames, or checks every
-   250 ms for pending credit: media can be acknowledged after 250 ms and inline
-   traffic after 1.5 s. Close flushes the last snapshot. One writer waits for cumulative credit in sequence order;
-   a slot also waits for its previous local upload to finish. Each media frame
-   is logged at debug level: `xdrive upload seq` (credit wait, PUT time) and
-   `xdrive read seq` (time to find, admission/byte-budget wait, body time).
-   `xdrive watermark seq N put P` records successful ACK publications, and
-   `xdrive credit seq N ack A` records the writer observing newer credit.
-   `xdrive span seq` records range status, wire bytes, time waiting for headers
-   (including permit wait, retries and service latency), and time after headers.
-   `xdrive span retry seq` records emitted payload bytes, attempt duration and the error that
-   triggered a stream resume; successful final reads can hide this error.
-   `xdrive request retry seq` exposes retries before headers or buffered success.
-   `xdrive cooldown D` records the shared delay after quota/service rejections.
-
-There are no CRCs: integrity relies on TLS, the length checks and the
-per-block sequence tags, and VLESS encryption authenticates the payload. Both
-peers must use the same watermark format: **upgrade the server and client
-together from `.106` or earlier**. Slot payloads still use `XDRVSL04`.
-
-## Implementation and trade-offs
-
-`slots.go` contains the frame codec, ring announcement and
-publication, outbound writer, and inbound reader, in that order. Gathering
-yields immutable chunks to the uploader. Each direction has a byte allowance;
-promotion releases the head's reservation without canceling its media GET.
-One reader ACK loop owns both periodic and final watermark writes. `drive.go`
-owns OAuth, Drive requests, quotas, file operations, ID allocation, and media
-verification. A storage profile tracks its open sessions, so a second listener
-cannot collect their files while either peer still holds the profile locally.
-`client.go` is shared with the URL-template and S3 transports. It retains the
-configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
-keepalive and XMUX leases. Drive uses distinct metadata, priority and media
-pools. Metadata and priority select a lease once per session. Each media lane
-keeps its assigned work until the body closes. Each complete tagged block measures
-elapsed time against wire bytes read on that lane since the GET started, including
-overlapping GETs and one start allowance. This updates the estimate while a slow
-range is still in progress; only ordered delivery through EOF grants ring credit.
-Each lane averages its estimate with the new sample. New lanes and lanes
-without a sample in the last minute use the latest pool sample. Uploads
-use outstanding work alone. Request/reuse/lifetime limits
-still apply within each lane; the media byte budget follows the same count.
-Peer-supplied IDs are checked for valid syntax and uniqueness. An existing
-object must match its announced session name and configured parent on first
-use. Keep the folder private to the two peers; these checks do not authenticate
-a writer who already has access to the session folder.
-
-Removed from the larger implementation: custom spare-connection probes,
-background connection/token/ID keepers, eager spare rings, duplicated media
-rescue and latency controllers, and detailed per-burst telemetry. A Drive ID
-allocation failure now fails the dial explicitly instead of switching to WAL.
-Announcements are also created with reserved IDs. After a lost reply, read back
-the exact slot, watermark or inline announcement description; for a media
-announcement also compare the complete body. Never replay an ambiguous write.
-After an ambiguous create or PATCH the writer has up to 45 s to confirm the
-exact contents across a reconnect. For ordinary data after sequence zero, a
-validated cumulative watermark from the same direction can also confirm that the
-peer consumed the slot. The writer never resends the mutation on this evidence.
-Sequence zero can arrive in the announcement, so its ACK cannot confirm its slot write.
-Exact readback starts immediately. If it is still unresolved after 200 ms,
-the writer also checks for a covering receipt, reusing credit it already validated.
-Failed checks back off from 200 ms to 2 s. There
-is no added wait on a successful write. An unconfirmed write still fails the
-connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
-the original write error is preserved. Graceful close reports final ACK errors. These are
-behavior differences, not just source rearrangement. Historical throughput
-and tail-latency measurements from the larger version are **not** measurements
-of this one. Empty Drive announcements are rejected rather than opened as WAL
-sessions. Uploads and OAuth refresh requests do not follow redirects.
-
-## Failure handling and verification
-
-A fatal upload, media-read or watermark error cancels both halves of a Drive
-connection with the first error as the cause. A normal END only closes its
-own direction. Readers reject an overwritten sequence; a writer verifies that
-a cumulative ACK cannot cover its own unpublished sequence before reusing a slot.
-Buffered GETs can retry an interrupted response body. A media announcement
-is fetched by the file ID from the same listing that established its age and
-uniqueness. Both admission and ambiguous-write confirmation require a whole
-HTTP 200 response for that object. Streamed media resumes
-by delivered offset, and an ambiguous mutation is not replayed. Listing and ID allocation
-use the app-data space when `remoteFolder` is `appDataFolder`. Drive announcement
-age is seeded from `createdTime` and the listing response’s `Date`, so an expired
-announcement does not become fresh when a listener restarts. This is not a
-persistent exactly-once claim within the TTL. An unprovable gap (no subsequent
-frame) still looks like an idle connection; use a read deadline when one is required.
-
-Transient OAuth transport and service failures can retry before any file operation
-is sent. A token refresh has its own 30-second HTTP timeout; a stalled media
-span cannot shorten it. Refreshes honor the shared cooldown and `Retry-After`.
-All Drive file attempts and token refreshes, including retries, reserve spaced starts at
-80 requests/s per shared storage instance, across sessions and lanes. Two peers
-at this ceiling use about 9,600 attempts/minute against the observed 12,000
-quota, leaving headroom, not a guarantee for other processes or profiles sharing
-the project. Each admitted attempt reserves its own pacing turn and rechecks
-cooldown before proceeding. Cancellation may leave an unused pacing turn.
-Drive's HTTP/2 health check probes after 10 s of read idle and allows 45 s for
-the PING reply before closing the shared connection. An explicit keepalive
-period still overrides the idle interval; a negative period disables PINGs.
-Drive rate-limit responses and 503 responses with `Retry-After` apply a shared
-exponential cooldown (jittered 2–30 s base), reset after a minute without a new
-cooldown. Concurrent rejections in one cooldown do not escalate independently;
-a longer `Retry-After` still extends it. A 503 never permits mutation replay.
-Quota retry logs omit the repetitive JSON error body. Cleanup excludes
-folders and Google-native objects. Conflicting regular files with the exact same
-announcement name are not selected or deleted as a group; resolve them manually.
-The admission deadline also applies while loading or binding the announcement,
-not to the resulting connection. Use a dedicated folder for one listener and its clients.
-
-### Removing ordered waits in `.109`
-
-| One-session fixture | Baseline | `.109` |
+| Drive request | What comes back | What XDrive uses it for |
 |---|---|---|
-| Media head paused; next description hidden; only the second successor is visible and inline | `.108` finished the head at 20.00 s | Finished at 10.25 s; the inline proof became visible at 7.02 s |
-| Warm slot's metadata held for a 1,310,757-byte head, with the next slot visible | `.108` delivered zero bytes in the eight-second observation window | Exact head and successor delivered 4.97 s after the successor appeared, while direct metadata was still held |
-| Committed PATCH loses its reply; writer keeps seeing the previous lap | `.108` failed after 45 s despite a covering ACK | Writer confirmed in 0.25 s; follow-up and EOF completed on the same TCP stream at 0.41 s, without replay |
+| `GET /drive/v3/files/{id}?fields=description` | A JSON string field, **without downloading the file** | Frame header and up to 14 KiB of early payload. A small frame needs no media request. |
+| `GET /drive/v3/files?fields=nextPageToken,files(id,description)` | The selected metadata for every matching file on the page | Discover a session and, when it fits, receive its first bytes in the listing itself. |
+| `GET /drive/v3/files/{id}?alt=media` | Binary file content, optionally a byte range | Stream the remainder of a large frame. |
 
-On the quiet page fixture with a 29.5 s metadata delay, the document's first byte
-arrived in 5.35 s (29.71 s on the earlier `.107` control); all 12 assets and the
-follow-up matched. These are injected faults on a local Drive service, not live
-GitHub timings or measurements of sustained throughput. Media parity was modeled
-but is not sent: the repair carrier can itself be beyond the sender's credit window.
-The slot body and watermark formats are unchanged. Both peers are needed for the
-descriptor hint; there is no configuration change.
+Google calls `description` a “short description” and does not specify a numeric
+maximum in its v3 File reference. **14 KiB is XDrive’s own raw-payload limit**,
+before the header and Base64 encoding. A Drive custom `property` is different:
+Google limits the key and value **combined** to 124 UTF-8 bytes. Public properties
+are visible across apps with file access; `appProperties` are private to the app.
+Descriptions can be read with metadata-only permissions. The bytes stored there
+are encrypted transport payload, just like the bytes stored in media.
 
-### GitHub first-byte delays on `.107`
+[File fields](https://developers.google.com/workspace/drive/api/reference/rest/v3/files) ·
+[Field selection](https://developers.google.com/workspace/drive/api/guides/fields-parameter) ·
+[Custom property limits](https://developers.google.com/workspace/drive/api/guides/properties) ·
+[Multipart uploads](https://developers.google.com/workspace/drive/api/guides/manage-uploads) ·
+[Range downloads](https://developers.google.com/workspace/drive/api/guides/manage-downloads)
 
-DevTools showed 29.51 s waiting for the first byte of `/pulls`, then 81 ms to
-download the document. The paired logs show a single 64-slot session. From the
-first GitHub connection through the end of the capture, all 70 completed client
-media frames matched server publications. Median server publication was 1.47 s;
-median client fetch was 9.42 s. All 70 were ordinary HTTP 200 media reads. The
-server opened the GitHub TCP connection within 22 ms of receiving it. Neither
-peer logged a Drive quota cooldown.
+## Transport model
 
-Frame 2474 received headers in 0.97 s, then took 25.10 s to read its body.
-Nine later media frames completed before it. Frame 2551 took 32.57 s despite a
-retry before headers; the server subsequently waited 36.09 s for receiver
-credit before frame 2569. Small browser responses share the same ordered bytes
-as other traffic. The logs show this bottleneck, but cannot identify which
-frame carried `/pulls`, measure GitHub's own HTTP response time, or distinguish
-a continuous trickle from a pause within frame 2474.
+1. **Open.** The client reserves Drive file IDs and announces two lists of slots
+   and two watermarks (one per direction). Each peer creates its files on first
+   use. Sequence `n` lives in `slots[n % depth]`, so established sessions can read
+   files directly by ID. A peer-supplied existing file must match the expected
+   session name, parent and regular-file type on first use.
+2. **Write.** Gather short writes briefly. Small frames go entirely in the
+   description. Larger ones use one multipart publication for the description
+   and binary body; they cannot be updated independently by the sender. Frames
+   through 1 MiB carry their first 14 KiB in the description. Media blocks carry
+   the sequence number so a resumed read cannot splice bytes from an old lap.
+3. **Read ahead, deliver in order.** Look up successive descriptions independently.
+   A complete inline slot counts as evidence immediately, even across a hole.
+   A discovered media frame can start whenever there is room in the look-ahead
+   budget (4 MiB per media connection). No worker waits for the preceding
+   description to reserve bytes; the head has its own allowance. Only ordered
+   delivery advances credit. Large bodies use parallel ranges; check their
+   sequence, range, length and exact EOF.
+4. **Bound the queue.** The reader reports the last delivered sequence and the
+   rate at which it delivered ordered bytes. The sender uses that rate for both
+   frame size (256 KiB–4 MiB) and the outstanding-media window. It cannot reuse
+   a position until its previous upload has finished locally **and** the peer has
+   acknowledged it. A fast upload alone says nothing about download speed.
+5. **Close.** END closes one direction. Graceful close drains outgoing bytes;
+   it continues verifying incoming bytes and returning credit through peer END.
+   Interrupt or a fatal error cancels the session.
 
-`.101` and `.107` both stopped checking for an early stall after *any* HTTP 200
-headers. This included ordinary media GETs as well as servers ignoring Range.
-The reader now keeps checking ordinary media bodies. It restarts an idle head
-only with verified later data, and resumes from a tagged block on another lane
-when possible. It does not restart a body that is still receiving bytes.
+### When a request stalls
 
-With two local peers and a 20 s pause after 48 KiB of an HTTP 200 body,
-the next media frame verified at 7 s. `.107` finished the head at 20.00 s;
-the updated reader retried on another connection and finished at 10.24 s.
-After 288 KiB, the retry started at the second tag (wire offset 262,152).
-Both a 206 resume and a server ignoring that range delivered the exact bytes
-through EOF. A steady trickle, an idle head with no successor, and a paused
-full-body fallback to an original range request each kept their original GET.
+- **Media:** if the ordered GET receives no new bytes for five seconds and later
+  data has verified, it can resume from a tagged block on another connection.
+  Already delivered bytes are skipped. A continuously progressing GET keeps its
+  connection. HTTP 200 in response to a Range request means a complete body, not
+  the requested slice.
+- **Metadata:** later sequences can expose a stuck head lookup. For a frame over
+  1 MiB the next slot can also carry its predecessor’s descriptor in `xdrivePrev`.
+  The reader may then fetch the original, already scoped slot directly. It checks
+  the whole body before exposing any bytes from that recovery read.
+- **Lost write reply:** read back the publication. For ordinary data after
+  sequence zero, a validated covering receiver watermark can also prove delivery,
+  independently of a stuck readback. Neither path resends an ambiguous mutation.
+  Sequence zero can arrive in the announcement; its ACK cannot prove a slot write.
+- **Quota and outages:** file requests and token refreshes share request pacing
+  and cooldown, including `Retry-After`. Short stall recovery is disabled during
+  cooldown. The HTTP progress watchdog measures inactivity rather than total
+  transfer time.
 
-In the capture the sender also queued 4.046 MiB (sequences 2534–2549) before
-admitting 2550. `.107` sized each allowance at no less than 512 KiB even after
-the receiver reported a 256 KiB frame target. With four media lanes that left
-room for about sixteen of the smallest frames. Using the measured target for
-the allowance as well cut the observed peak in that state from 4.04 to 2.05
-MiB on the 500 KB/s fixture. Holding the `.107` reader fixed, browser first-byte
-p95 fell from 26.05 to 11.67 s; average full-request bulk throughput fell from
-263 to 253 KB/s. Those figures cover two runs per sender, not live GitHub.
-With both changes, the same slow profile gave 12.35 s first-byte p95 and
-13.97 s completion p95, versus 26.05 s for each on `.107`. Bulk averaged
-252 KB/s (3.9% lower); all 40 probes finished during a download. A separate
-fast run delivered 219 Mbit/s with all 16 probes overlapping the download.
+### Measurements
 
-A separate fixture requested a document and its 12 assets during background
-traffic. One media connection sent 320 KiB of the 576,929-byte frame, then
-paused for 25.10 s while the other connections kept working. Document time to
-first byte was 30.19 s with `.101` peers, 28.60–28.63 s with `.107`, and
-8.81–9.05 s with both fixes. Full page completion went from 31.11–32.19 s on
-`.107` to 15.75–17.90 s. When bytes trickled continuously over the same interval,
-the updated reader did not retry and the document still took about 26 s to
-start. This reproduces the timing pattern without assuming the live GET paused.
-The `.107` wire format is unchanged. For downloads, the client supplies the
-new recovery behavior and the server supplies the smaller measured window.
+The [`.109` measurements and earlier comparisons](https://github.com/anonymously-hidden/Xray-core/blob/v26.10.31-resume.109/transport/internet/xdrive/README.md#removing-ordered-waits-in-109)
+include paired Drive traces and the single-session page, sustained-download,
+interrupted-read and lost-write fixtures. Local fault injection measures the
+transport; it cannot attribute a live HTTPS document’s entire first-byte delay
+to Drive or to its origin.
 
-### Browsing during a download on one session
+In a two-media-connection fixture the head GET was held for up to 12 seconds;
+the two nearest successor bodies could not finish until the head did, but the
+third successor was readable. `.109` delivered the four frames and EOF in
+12.11 s. Admitting discovered media by available bytes allowed the third
+successor to verify and the idle head to retry. The same byte stream and EOF
+arrived in **5.14 s** under the race detector. Promotion leaves a healthy
+metadata GET running; verified later data still permits retrying an idle head.
 
-In the capture with a `.105` server and a reported `.106` client, Steam content
-requests and browsing used the same 64-slot session. All 25 client media reads
-matched server publications by sequence and size (56.47 MiB). Median publication
-took 1.46 s; median client fetch took 16.84 s. Neither peer logged a quota
-cooldown. The logs do not measure individual page load times.
+| Browsing during a download on one session | Tagged `.109` (two runs) | Current candidate (one run) |
+|---|---:|---:|
+| Flaky 500 KB/s: browsing first-byte p95 | 12.10–16.12 s | 10.95 s |
+| Same workload: browsing completion p95 | 12.10–16.12 s | 17.16 s |
+| Same workload: bulk goodput, including startup | 246.7–249.5 KB/s | 246.5 KB/s |
+| Fast 128 MiB transfer: bulk goodput, including startup | 181.44–221.21 Mbit/s | 216.39 Mbit/s |
 
-The writer published sequences 104–106 at 512 KiB, 1 MiB and 2 MiB before the
-client acknowledged 104. For sequence 209, publishing 4 MiB took 1.53 s and
-fetching it took 45.94 s. The small, later frame 223 was already discovered but
-waited 37.28 s for ordered admission before its 1.17 s fetch. The client's
-watermark stayed at 208 for 47.45 s between successful writes. Watermarks track
-whole ordered frames; this interval does not mean that no bytes were delivered.
+All 36 candidate probes overlapped the downloads and matched byte-for-byte.
+These local fixture runs do not establish a live Drive latency or throughput guarantee.
 
-`.101` could halve its frame target after a long wait to reuse a ring slot.
-`.105` removed that signal: a full input buffer doubled the target up to 4 MiB,
-and completing an upload released its byte allowance before the client received
-the data. Ring positions still bounded the number of frames, but 64 positions
-could hold very different amounts of unread data.
+Two simplifications were tried separately against `.109` and rejected:
 
-Two real Xray peers on a local HTTP/2 Drive fixture carried two simultaneous
-downloads and paired 2 KiB / 32 KiB browser requests on one session. All bodies
-were compared byte-for-byte through EOF. These are full-request bulk rates
-(including startup) and pooled completion times for **all** browser requests,
-including ones that finished after the download. Each row covers two batches
-per build. Reference peers were a `.105` server and `.106` client.
-
-| Link and workload | Reference bulk | Updated bulk | Browser p95, reference → updated |
-|---|---:|---:|---:|
-| 500 KB/s shared downstream, one media lane paused 4 s every 16 s; 24 MiB | 282–286 KB/s | 275–289 KB/s | 39.42 → 21.28 s |
-| Uneven media lanes, 1 s media headers; 48 MiB | 2.17–2.33 MiB/s | 2.09–2.39 MiB/s | 11.37 → 10.47 s |
-| Fast loopback, 5 ms control / 20 ms media headers; 128 MiB | 268–273 Mbit/s | 189–209 Mbit/s | 1.08 → 0.92 s |
-
-On the 500 KB/s profile (decimal, across all client connections), 40/40 updated
-probes finished during a download, versus 23/40 on the reference. The worst
-interval to receive another MiB fell from 48.81 to 23.84 s. A `.101` server
-with the same `.106` client delivered 255 KB/s and had a 46.36 s browser p95
-in one batch. The fast build still used full 4 MiB frames. On a separate
-fast → slow → fast transfer within a single session, full frames shrank from
-2.94 MiB to roughly half a MiB before growing past 2 MiB again. Already
-published bytes remain ordered; a sudden slowdown cannot recall them. These
-results show a latency/throughput tradeoff, not a minimum speed on live Drive.
-
-### Sustained downloads on `.105`
-
-The matched 64-slot session carried 300.65 MiB in 143 media frames. Median
-server publication took 1.42 s. Of 82 frames with at least three ranges, 42
-had a third or fourth range finish before range zero. Frame 164's last range
-finished 24.7 s after its first completion. Both peers kept the session and
-neither logged a quota cooldown. The logs time Drive requests; they do not
-measure Steam's instantaneous delivery rate.
-
-Race-instrumented peers confirmed both ways to start the waiting ranges: after
-the first tagged block while the preceding frame was still downloading, and on
-promotion while that block was withheld. When a speculative range zero got a
-full HTTP 200, its waiting ranges made no requests. All three 32 MiB + 329 byte
-responses and their follow-ups matched the origin through EOF.
-
-For the sustained-transfer comparison, four concurrent application downloads
-each received 16 MiB + 329 bytes on one 64-slot session. The local HTTP/2
-Drive service delayed media headers by 650 ms; connections were shaped at
-1.1 MiB/s, with the slow connection, when present, shaped at 0.12 MiB/s.
-The comparison used four batches per build and profile, reversing build order.
-The last two columns are the median of each batch's slowest 1 MiB of ordered
-application payload, measured after the first payload byte.
-
-| Media connections | `.105` MiB/s | Updated MiB/s | `.105` slowest MiB | Updated slowest MiB |
-|---|---:|---:|---:|---:|
-| Four equal | 2.60 | 3.02 | 5.42 s | 3.61 s |
-| One consistently slow | 1.51 | 1.50 | 15.20 s | 15.08 s |
-| Slow connection changes every 8 s | 1.40 | 1.48 | 10.33 s | 8.87 s |
-
-An additional 24-download run also moved the slow connection every eight seconds.
-There the 95th-percentile time to receive the next MiB improved from 4.61 s
-to 3.38 s, but the single slowest MiB took 10.92 s versus 10.02 s on `.105`.
-Aggregate application throughput was 1.60 versus 1.63 MiB/s. These are
-loopback delivery measurements, not a live bandwidth floor.
-
-### Download throughput since `.101`
-
-`.102` replaced `.101`'s quiet inline window with a four-slot maximum and
-changed media selection from round-robin to the fewest outstanding requests.
-`.103` retained those policies; `.104` changed outage and retry handling. In
-the matched `.104` capture, 15 of 52 media frames took over 10 s to fetch.
-Frame 101 took 1.20 s to publish and 35.99 s to fetch; frame 170 took 1.25 s
-and 27.95 s. Neither peer logged a quota cooldown. Waiting to deliver an early
-range also delayed credit for already downloaded successors.
-
-On a loopback HTTP/2 Drive service with a 64-slot ring, `.101` carried an idle
-192 KiB response in descriptions. `.102`, `.103` and `.104` used a media GET.
-On 16 MiB responses all four releases assigned several MiB to the slowest
-connection; the bulk comparison did not isolate a `.103`-specific regression.
-With three connections shaped at 2.4 MiB/s and one at 0.18 MiB/s, three
-consecutive 16 MiB + 329 byte responses on `.104` took 19.38, 25.08 and
-31.20 s. With the current scheduler they took 24.98, 7.14 and 8.02 s. On
-the first transfer there was no rate history. On the next two, the slow
-connection received 0.08 and 1.08 MiB instead of 4 and 5 MiB. These are
-application completion times checked byte-for-byte, not live Drive goodput.
-With four equally shaped connections, alternating build order over two runs
-gave median times of 5.80 s on `.104` and 5.90 s here (six responses per build).
-For repeated 192 KiB responses with 220 ms metadata delay, the medians were
-1.31 s and 1.33 s. The gain was on uneven connections after their rates were learned.
-
-Race-instrumented peers also delivered two 8 MiB responses through a two-slot
-ring, recovered four interrupted media reads and a lost watermark reply, and
-rejected a repeated wrong block tag. Mixed `.104` and current peers transferred
-16 MiB + 329 bytes and a follow-up with each version acting as the reader.
-
-### Slow-link recovery
-
-The paired client/server capture contained seven matching sessions. All six
-client session failures reported `http2: client connection lost`: four PATCHes
-(two explicitly identified as watermarks), one POST and one media read. In Go
-1.27.4 this error is raised by the HTTP/2 PING health check. The server reported
-`.103`; the client log did not include the release suffix. Neither logged a
-Drive cooldown.
-
-Race-instrumented peers on a loopback HTTP/2 Drive mock gave these results:
-
-| Fault | `.103` | Slow-link change |
-|---|---|---|
-| Client-side traffic paused for 35 s during a write | Watermark failure and session loss at 31.5 s | Original connection and session delivered the interrupted response and a follow-up byte-for-byte |
-| Committed slot write lost its reply; exact readback hidden for 20 s | Follow-up needed a new session | Confirmed at 21.2 s; follow-up used the same session. Both builds sent the mutation once. |
-| Four interruptions in one media span, including a resume that emitted no new payload | Response ended early on the second cut | All 3,146,057 response bytes matched; five GETs for the interrupted span |
-
-With a lost watermark reply and 20 s of stale readbacks, a 16 MiB + 329 byte
-response and a follow-up also matched on one session, with one watermark
-mutation for the affected sequence. A write that never committed failed after
-45.1 s without replay. With just the original socket blackholed, the first
-readback arrived over a working connection at 55 s. Two attempts with no new
-payload or two wrong tags stopped the read; repeated progressing cuts stopped
-on attempt eight. A 16 MiB + 329 byte response matched through EOF both when
-the mock ignored Range and when a range trickled 4 KiB at a time for over 10 s.
-The trickling range used one GET. These checks measure recovery, not live goodput.
-
-### Verification of `.103`
-
-The source inventory below uses the same counting rules as the 2,703-line
-candidate and the 2,903-line `.102` release. The wire format remains `XDRVSL04`.
-
-Race-instrumented peers transferred four concurrent reverse echoes on an
-eight-slot ring. A stalled GET retried after 5.125 s with a later inline
-frame; without a successor, a 6.1 s delay completed on the original GET.
-A 16 MiB + 587 byte download matched after two cuts at GET wire offsets
-0, 262,152, 262,152. Full HTTP 200 range fallback and readback after a lost
-PATCH reply were byte-exact; a persistently wrong tag was rejected.
-
-The first side-by-side HTTP/2 run compared the 2,703-line build with this
-one, five measured responses per size per build. With 220 ms metadata delay,
-the 179,017-byte median was 0.875 s and 0.781 s respectively. With one of
-four media connections delayed by 550 ms and the others by 70 ms, the
-32 MiB + 587 byte median was 1.657 s and 1.813 s. All 20 responses matched
-the origin through EOF. These are loopback timings.
-
-A repeat bulk comparison alternated build order across four blocks. With a
-slow connection selected afresh for each response, the pooled medians (32
-responses per build) were 1.7965 s and 1.7865 s. With the same connection
-held slow across four consecutive responses, aggregate throughput over four
-sequences per build was 17.682 and 17.379 MiB/s: the refactor was 1.7% lower
-on that workload. All 96 responses in this comparison were byte-exact. Live
-Google Drive throughput and browser latency were not measured.
-
-On the final race build, an OAuth endpoint returning `Retry-After: 6` received
-its next POST after 6.015 s for both 429 and 503. A seven-second refresh with
-a verified successor completed once, and its token fetched the ordered head.
-A matching HTTP 206 prefix neither admitted a media announcement nor confirmed
-a lost write reply. Persistent 206s exhausted the 15 s confirmation window
-without a second announcement POST.
-
-Two listeners sharing a storage profile preserved active session files through
-cleanup and listener replacement. A 1.84 s delayed ACK at application close
-still allowed both Drive peers to publish END before collection. Local,
-template and S3 WAL peers each echoed 255,540 bytes in each direction across
-overlapping sessions and listener restart. No XDrive race was reported.
-
-### Earlier release and candidate checks
-
-The 2,703-line candidate kept `.102`'s wire format and transfer policies. Two
-race-instrumented peers on a loopback HTTPS Drive mock delivered four concurrent
-bidirectional payloads byte-for-byte through an eight-slot ring. With only a
-later inline frame, a stalled GET retried after 5.17 s; without a successor,
-a 6.1 s delay completed without retry. A 16 MiB + 587 byte download matched
-after two cuts in a prefixed frame (wire offsets 0, 262,152, 262,152).
-The same run exercised full HTTP 200 range fallback, exact readback after a
-lost PATCH reply without replay, and rejection of a persistently wrong tag.
-
-A separate HTTP/2 mock compared `.102` and the refactor with five measured
-responses per size per version. With 220 ms metadata latency, the 179,017-byte
-response took a median 0.766 s and 0.750 s respectively. With four media
-connections (550 ms header delay on one, 70 ms on the others), a 32 MiB + 587
-byte response took 1.735 s and 1.734 s. All 20 responses matched the origin.
-These timings measure the loopback workload, not live Google Drive.
-
-Two race-instrumented peers used a loopback HTTP/2 Drive mock. With a 220 ms
-metadata delay, one 179,017-byte idle response used 14 downlink publications on
-`.101` and five on `.102`; completion was 1.50 s and 0.83 s respectively.
-For three 32 MiB + 587 byte responses per version, one of four media connections
-delayed GET headers by 550 ms, the others by 70 ms. All payloads matched.
-The delayed connection received nine GETs per transfer on `.101` and three
-to four on `.102`. Median completion fell from 2.02 s to 1.83 s. This models
-uneven connections; it does not measure sustained speed on live Drive.
-
-A later inline frame alone allowed a blocked media GET to retry after 5.17 s;
-a 6.1 s header delay with no successor completed on the first attempt. The
-workload also covered a full HTTP 200 fallback, an ambiguous PATCH, a persistent
-wrong tag, ring reuse and concurrent bidirectional transfers over Drive, local,
-template and S3 stores. In a separate HTTP/1.1 run, a 14 MiB + 661 byte response
-matched after two cuts in the same prefixed media frame: the three GETs began
-at wire offsets 0, 262,152 and 262,152. No test files were added.
-
-Two race-instrumented peers ran against a loopback TLS Drive mock. With a
-1.2 s delay before media headers, the first 6,000 application bytes of a
-110,003-byte response arrived in 0.11–0.33 s on `.101` versus 1.38–1.56 s on
-`.100` (three requests per version). Completion was similar. A 32 MiB + 587
-byte response matched on both: `.100` used six intervening inline slots between
-successive full 4 MiB frames; `.101` used none. Elapsed time was 1.50 s and
-1.56 s respectively. This checks batching; it does not establish higher speed.
-
-A blocked progressive GET and a blocked final range retried in about 5.2 s
-with a later verified frame. A six-second header delay without that evidence
-and a slow full HTTP 200 fallback completed without early retry. A twice-truncated
-prefixed body resumed byte-exactly; a persistent wrong tag failed after one
-retry. The mock also covered a lost committed PATCH reply, concurrent echoes,
-and concurrent local, template and S3 WAL transfers.
-
-Two race-instrumented Drive peers delivered a 40,000-byte browsing tail after
-bulk traffic as three inline slots, and confirmed a committed inline PATCH
-after a 3.7 s readback delay without replay. A twice-truncated range resumed
-at tagged wire offsets 0 and 262,152; its 20 MiB + 581 byte response matched
-exactly. The same workload exercised a blocked middle range and a full HTTP
-200 fallback. A persistently wrong sequence tag failed after one retry. Local,
-template and S3 WAL peers also carried concurrent bidirectional requests; the
-template mock observed both commit writes and matching commit reads.
-With the final reader-owned byte reservations, two concurrent 21 MiB + 791 byte
-downloads on one session also matched with speculative successors and two
-partial-body resumes. These are correctness workloads, not a live speed test.
-
-Two race-instrumented Go peers against a loopback TLS Drive mock delivered an
-18,000-byte browsing response tail after a media upload via two inline descriptions
-(14,336 and 3,841 transport bytes). Five 12 MiB + 581 byte responses on the
-same session then exercised a blocked middle range before headers (one retry at
-5.11 s) and after a partial body (one block-aligned resume at 5.20 s), no
-verified later range, steady body progress and HTTP 200 fallback. The latter
-three needed no early retry; all payloads matched. These are not live Drive timings.
-
-Against a local TLS Drive mock, two Go peers transferred four 12 MiB + 581 byte
-responses on one session. With a blocked first range and a verified successor,
-the receiver issued one resume after 5.2 s, starting at the next tagged block
-(wire offset 262,152). A steadily trickling first body, a silent first body
-without a verified successor, and a first range answered with a full HTTP 200
-all completed without a resume. All four payloads matched byte-for-byte.
-This measures the injected stall, not live Drive latency.
-
-The ACK recovery check used two Go peers and a local TLS Drive mock. A committed
-watermark PATCH lost its reply; its readback was delayed 3.5 s. One session
-delivered a 5 MiB + 301 byte response and 21 small responses byte-for-byte,
-including a truncated media GET. A later watermark advanced without replaying
-the ambiguous PATCH. Separately, an HTTP/2 mock held a PING acknowledgement
-for 3.5 s during a Drive LIST; the next LIST used the same connection. Neither
-check measures live speed.
-
-The previous `.96` latency changes were built with `go build ./...` and vetted with
-`go vet ./transport/internet/xdrive`. Two Go peers ran against a loopback
-Drive HTTP/1.1 mock over TLS, with 161 concurrent requests: 160 small assets
-and one 3 MiB + 301 byte response. All response bodies matched exactly despite
-a lost committed-write reply and one media response cut after 4,119 wire bytes.
-This exercises recovery and byte order, not live-Drive TTFB or throughput.
-
-This version descends from the v7 candidate, which began as a literal merge
-of v6's four slot files. The per-block CRCs, the checksum table and the
-checksummed media reader are gone here. Retry safety rules remain, but media
-reading, request pacing and shared cooldown now differ from v6.
-
-The quota refinement passes `gofmt -l`, `go build ./...` and xdrive `go vet`.
-A Python virtual-clock model checks pacing, cancellation, cooldown extension,
-Retry-After, frontier progression and frame-size freezing; it is not a Go
-HTTP/race workload or a live-Drive throughput benchmark. No test files are added.
-
-The receive-credit refinement releases local look-ahead bytes on head promotion;
-watermarks still advance only after verified ordered delivery and exact EOF.
-No budgets, request limits or wire-format fields changed. Validate with slow
-heads, completed successors, cancellation and unequal Close workloads under race
-detection before attributing a sustained-speed improvement to this change.
-
-The following are **Python model checks against the v7 candidate, not runs of
-this Go package**:
-
-- At ring depth two, the v6 and candidate models each delivered 1,096,163
-  bytes in each direction, with separate deterministic payloads. All received
-  bytes matched. The fixture crossed the inline, prefix and multi-range
-  thresholds. It cut 16 model responses after a complete block plus 17 bytes;
-  eight resumes simulated a server ignoring Range. No duplicated bytes.
-- Seven scripted quota/status cases per version checked the retry decision for
-  429, rate-limited and ordinary 403, and 500/503, including a 503 with
-  Retry-After on a mutation. Delays used a virtual clock, not HTTP or Drive.
-- A small exhaustive close model let the empty writer publish END before the
-  opposite writer finished four data frames. Three v6 terminal states could
-  not progress; none of the candidate's 45 reachable states was stuck. This
-  is a bounded ordering check, not a goroutine race test.
-
-**Release gates:** the candidate workspace had no Go 1.27 or `gofmt`, so the
-model checks above did not build it. This snapshot was formatted with `gofmt`
-(and the repository's `vformat`/`vprotogen` checks), vetted and built with the
-`go.mod` toolchain. The loopback checks above use local mocks; they do not
-measure live Drive throughput or page latency. The inventory below is the physical
-post-`gofmt` count. No XDrive test file is shipped.
-
-For deeper assurance, in a disposable checkout, run the same depth-two
-transfers against v6 and the candidate with a fault-injecting Drive HTTP mock
-under `go test -race`: compare both byte streams, truncate media responses,
-return 429/403/503, and close both peers with unequal outstanding writes.
-Also check one-sided Close, final ACK failure and Interrupt. A plain
-`go test -race` without a workload is not a concurrency test. Repeat the
-bidirectional transfer with a dedicated live Drive folder.
+- With just one GET per existing frame, a paused 1,310,757-byte head with no
+  successor stayed silent for 20.00 s. With parallel ranges, a later range of
+  the **same frame** provided evidence to resume, cutting that wait to 5.20 s.
+- Retaining the announcement as the cleanup inventory took 91 more counted lines
+  once a delayed client could no longer create an orphan after cleanup. Cold
+  first-byte time on a 70 KiB transfer rose from 372 to 639 ms (medians of three
+  loopback runs per build with 80 ms per Drive request).
 
 ## Drive source budget (physical lines, including comments and blanks)
 
-The cap is **2,500** physical lines.
-
-Count all three implementation files in full, including the shared HTTP client.
-For mixed files, the following inventory charges whole integration functions
-where practical, including generic code within them. The remaining WAL/backend,
-protocol-wide listener, configuration and generated protobuf code is shared or
-unrelated, not a hidden second Drive implementation. Ranges below are inclusive
-for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/`.
+The target is **below 2,000** physical lines after repository formatting. The
+three implementation files are counted in full, including the shared HTTP client.
+Mixed files count their Drive integration as below; ranges are inclusive and
+relative to `transport/internet/xdrive` unless marked `infra/`.
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 874 |
-| `slots.go` | whole file | 730 |
-| `client.go` | whole file | 450 |
-| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–161, 163–175 | 55 |
-| `xdrive.go` | 4, 7, 11, 114–176, 186–187, 195, 197–200, 220–221, 258–283, 285–343, 351–356, 376–402, 404–423, 425–461 | 250 |
+| `drive.go` | whole file | 839 |
+| `slots.go` | whole file | 678 |
+| `client.go` | whole file | 447 |
+| `conn.go` | 8, 31, 60–65, 67–73, 134–154, 156–168 | 49 |
+| `xdrive.go` | 4, 7, 11, 14, 114–175, 184–188, 194–197, 217–218, 250–302, 304–325, 327–345, 347–388 | 213 |
 | `params.go` | 74–82 | 9 |
-| `storage.go` | 9, 20–25, 29–34, 45–77 | 46 |
+| `storage.go` | 10, 20–25, 29–34, 45–78 | 47 |
 | `storage_lease.go` | whole file | 61 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
-| **Total** | | **2500** |
+| **Total** | | **2368** |

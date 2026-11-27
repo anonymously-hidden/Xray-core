@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/sync/semaphore"
-
 	"github.com/xtls/xray-core/common/net"
 )
 
@@ -61,13 +59,8 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 
 func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, first []byte, onClose func()) *Conn {
 	c := baseConn(ctx, onClose)
-	// Each direction has one full frame of speculative bytes per configured media lane.
-	limit := int64(len(store.pools[mediaLane].lanes)) * slotMaxFrame
-	direction := func(t slotTable) slotDirection {
-		return slotDirection{Conn: c, store: store, table: t, params: p, flight: semaphore.NewWeighted(limit), limit: limit}
-	}
-	w := newSlotWriter(direction(write))
-	c.writer, c.reader = w, newSlotReader(direction(read), first, w.done)
+	w := newSlotWriter(slotDirection{Conn: c, store: store, table: write, params: p})
+	c.writer, c.reader = w, newSlotReader(slotDirection{Conn: c, store: store, table: read, params: p}, first, w.done)
 	return c
 }
 
@@ -146,7 +139,6 @@ func (c *Conn) Close() error {
 		result := make(chan error, 2) // The ordered close and its watchdog can each report once.
 		c.markProgress()
 		go func() { result <- c.closeOrdered() }()
-		defer c.fail(nil)
 		for wait := slotStallTimeout; wait > 0; wait = slotStallTimeout - time.Since(*c.progress.Load()) {
 			select {
 			case c.closeErr = <-result:
@@ -156,21 +148,22 @@ func (c *Conn) Close() error {
 		}
 		result <- context.DeadlineExceeded
 		c.closeErr = <-result // A completion already in the queue wins.
+		c.fail(nil)
 	})
 	return c.closeErr
 }
 
 func (c *Conn) closeOrdered() error {
 	defer c.onClose()
-	defer c.fail(nil)
 	err := c.writer.Close()
-	c.publishWG.Wait()
-	if _, slots := c.writer.(*slotWriter); slots && err == nil {
+	if _, slots := c.writer.(*slotWriter); slots {
+		c.publishWG.Wait()
 		c.reader.wait() // Drain through END, including the final watermark.
-		return context.Cause(c.ctx)
+		err = context.Cause(c.ctx)
+	} else {
+		defer c.reader.wait() // WAL polling stops on cancellation.
 	}
 	c.fail(nil)
-	c.reader.wait()
 	return err
 }
 
