@@ -30,6 +30,8 @@ import (
 var errStalled = errors.New("the request made no progress")
 
 type serviceTransport struct {
+	ctx             context.Context // Owns the sockets opened by this transport.
+	cancel          context.CancelFunc
 	plain, parallel *http.Transport
 	h1Hosts         *sync.Map // Hosts observed negotiating HTTP/1 on the single-connection transport.
 	secure          interface {
@@ -37,6 +39,13 @@ type serviceTransport struct {
 		CloseIdleConnections()
 	}
 	stall time.Duration
+}
+
+func (t *serviceTransport) IsClosed() bool { return t.ctx.Err() != nil }
+
+func (t *serviceTransport) Close() error {
+	t.cancel()
+	return nil
 }
 
 // Cancel stalled requests, not long transfers that continue to make progress.
@@ -158,8 +167,42 @@ func (b *progressBody) Read(p []byte) (int, error) {
 
 func (b *progressBody) Close() error { return b.close() }
 
+// A request or the transport owner can cancel the socket dial and its handshake.
+func dialService[T any](ctx, owner context.Context, settings *internet.MemoryStreamConfig, network, addr string, handshake func(context.Context, net.Conn, net.Destination) (T, error)) (T, error) {
+	var zero T
+	ctx, cancel := context.WithCancel(ctx)
+	defer context.AfterFunc(owner, cancel)()
+	defer cancel()
+	if err := owner.Err(); err != nil {
+		return zero, err
+	}
+	host, err := net.ParseDestination(network + ":" + addr)
+	if err != nil {
+		return zero, errors.New("bad address: ", addr).Base(err)
+	}
+	target := host // A configured front replaces the address, not the transport network.
+	if front := settings.Destination; front != nil {
+		target.Address = front.Address
+		target.Port = cmp.Or(front.Port, target.Port)
+	}
+	var conn net.Conn
+	switch mask := settings.FinalMask; {
+	case mask == nil:
+		conn, err = internet.DialSystem(ctx, target, settings.SocketSettings)
+	case target.Network == net.Network_UDP:
+		conn, err = mask.DialUDP(ctx, target)
+	default:
+		conn, err = mask.DialTCP(ctx, target)
+	}
+	if err != nil {
+		return zero, errors.New("failed to dial to dest").Base(err)
+	}
+	return handshake(ctx, conn, host)
+}
+
 // connCtx owns sockets; h1Hosts shares ALPN observations between clients.
 func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings *internet.MemoryStreamConfig, stall time.Duration, maxConns int) *http.Client {
+	connCtx, cancel := context.WithCancel(connCtx)
 	streamSettings = cmp.Or(streamSettings, &internet.MemoryStreamConfig{})
 	tlsConfig := cmp.Or(tls.ConfigFromStreamSettings(streamSettings), &tls.Config{})
 	config, _ := streamSettings.ProtocolSettings.(*Config)
@@ -180,64 +223,31 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		clientTLS = func(c net.Conn, cfg *gotls.Config) net.Conn { return tls.UClient(c, cfg, fp) }
 	}
 
-	// A configured front replaces the address, not the transport network.
-	dial := func(ctx context.Context, network, addr string) (net.Conn, net.Destination, error) {
-		if err := connCtx.Err(); err != nil {
-			return nil, net.Destination{}, err
-		}
-		host, err := net.ParseDestination(network + ":" + addr)
-		if err != nil {
-			return nil, host, errors.New("bad address: ", addr).Base(err)
-		}
-
-		target := host
-		if fronting := streamSettings.Destination; fronting != nil {
-			target.Address = fronting.Address
-			target.Port = cmp.Or(fronting.Port, target.Port)
-		}
-
-		var conn net.Conn
-		switch mask := streamSettings.FinalMask; {
-		case mask == nil:
-			conn, err = internet.DialSystem(ctx, target, streamSettings.SocketSettings)
-		case target.Network == net.Network_UDP:
-			conn, err = mask.DialUDP(ctx, target)
-		default:
-			conn, err = mask.DialTCP(ctx, target)
-		}
-		if err != nil {
-			return nil, host, errors.New("failed to dial to dest").Base(err)
-		}
-		return conn, host, nil
-	}
-
 	dialTCP := func(secure bool) func(context.Context, string, string) (net.Conn, error) {
-		return func(ctx context.Context, _, addr string) (net.Conn, error) {
-			ctx, cancel := context.WithCancel(ctx)
-			defer context.AfterFunc(connCtx, cancel)()
-			defer cancel()
-			raw, host, err := dial(ctx, "tcp", addr)
-			if err != nil {
-				return nil, err
-			}
+		handshake := func(ctx context.Context, raw net.Conn, host net.Destination) (net.Conn, error) {
 			conn := &ctxConn{Conn: raw, stop: context.AfterFunc(connCtx, func() { raw.Close() })}
 			if !secure {
 				return conn, nil
 			}
 			tlsConn := clientTLS(conn, tlsConfig.GetTLSConfig(tls.WithDestination(host))).(tls.Interface)
 			// Bound the handshake independently of connection reuse.
-			handshake, finish := context.WithTimeout(ctx, stall)
+			handshakeCtx, finish := context.WithTimeout(ctx, stall)
 			defer finish()
-			if err := tlsConn.HandshakeContext(handshake); err != nil {
+			if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
 				conn.Close()
 				return nil, err
 			}
 			return tlsConn, nil
 		}
+		return func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialService(ctx, connCtx, streamSettings, "tcp", addr, handshake)
+		}
 	}
-	plain := &http.Transport{DialContext: dialTCP(false), IdleConnTimeout: net.ConnIdleTimeout,
-		MaxIdleConnsPerHost: maxConns, MaxIdleConns: maxConns, MaxConnsPerHost: maxConns}
-	t := &serviceTransport{plain: plain, h1Hosts: h1Hosts, stall: stall}
+	plain := &http.Transport{
+		DialContext: dialTCP(false), IdleConnTimeout: net.ConnIdleTimeout,
+		MaxIdleConnsPerHost: maxConns, MaxIdleConns: maxConns, MaxConnsPerHost: maxConns,
+	}
+	t := &serviceTransport{ctx: connCtx, cancel: cancel, plain: plain, h1Hosts: h1Hosts, stall: stall}
 	// No server offers h3 by ALPN over TCP, so use it only when asked for alone.
 	if !slices.Equal(tlsConfig.NextProtocol, []string{http3.NextProtoH3}) {
 		t.parallel = plain.Clone()
@@ -262,53 +272,45 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	}}
 
 	h3.Dial = func(ctx context.Context, addr string, _ *gotls.Config, cfg *quic.Config) (*quic.Conn, error) {
-		ctx, cancel := context.WithCancel(ctx)
-		defer context.AfterFunc(connCtx, cancel)()
-		defer cancel()
 		cc := quicParams.Congestion
 		if cc != "" && cc != congestion.TypeBBR && cc != congestion.TypeReno {
 			return nil, errors.New("unsupported congestion control over h3: ", cc)
 		}
 
-		conn, host, err := dial(ctx, "udp", addr)
-		if err != nil {
-			return nil, err
-		}
-		var pktConn net.PacketConn
-		var udpAddr net.Addr
-		switch c := conn.(type) {
-		case *net.PacketConnWrapper:
-			pktConn, udpAddr = c.PacketConn, c.RemoteAddr()
-		case *cnc.Connection:
-			pktConn = &internet.FakePacketConn{Conn: c}
-			udpAddr = &net.UDPAddr{IP: []byte{0, 0, 0, 0}}
-		default:
-			conn.Close()
-			return nil, fmt.Errorf("unexpected UDP connection type %T", c)
-		}
+		return dialService(ctx, connCtx, streamSettings, "udp", addr, func(ctx context.Context, conn net.Conn, host net.Destination) (*quic.Conn, error) {
+			if stream, ok := conn.(*cnc.Connection); ok {
+				fake := &internet.FakePacketConn{Conn: stream}
+				conn = &net.PacketConnWrapper{PacketConn: fake, Dest: fake.LocalAddr()}
+			}
+			packet, ok := conn.(*net.PacketConnWrapper)
+			if !ok {
+				conn.Close()
+				return nil, fmt.Errorf("unexpected UDP connection type %T", conn)
+			}
 
-		// Set SNI before pinning/ECH; ChromeParrot rejects the server-only certificate callback.
-		gotlsConfig := tlsConfig.GetTLSConfig(tls.WithDestination(host))
-		gotlsConfig.GetCertificate = nil
-		tr := &quic.Transport{Conn: pktConn, DisableGSO: quicParams.DisableGSO}
-		if !quicParams.DisableChromeParrot {
-			tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
-		}
-		// Some packet conns ignore read deadlines. Close the socket before
-		// joining QUIC's receive loop on both dial failure and connection exit.
-		closers := common.ChainedClosable{pktConn, tr}
-		qconn, err := tr.Dial(ctx, udpAddr, gotlsConfig, cfg)
-		if err != nil {
-			closers.Close()
-			return nil, err
-		}
-		stopConn := context.AfterFunc(connCtx, func() { qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "") })
-		context.AfterFunc(qconn.Context(), func() {
-			stopConn()
-			closers.Close()
+			// Set SNI before pinning/ECH; ChromeParrot rejects the server-only certificate callback.
+			gotlsConfig := tlsConfig.GetTLSConfig(tls.WithDestination(host))
+			gotlsConfig.GetCertificate = nil
+			tr := &quic.Transport{Conn: packet.PacketConn, DisableGSO: quicParams.DisableGSO}
+			if !quicParams.DisableChromeParrot {
+				tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
+			}
+			// Some packet conns ignore read deadlines. Close the socket before
+			// joining QUIC's receive loop on both dial failure and connection exit.
+			closers := common.ChainedClosable{packet.PacketConn, tr}
+			qconn, err := tr.Dial(ctx, packet.RemoteAddr(), gotlsConfig, cfg)
+			if err != nil {
+				closers.Close()
+				return nil, err
+			}
+			stopConn := context.AfterFunc(connCtx, func() { qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "") })
+			context.AfterFunc(qconn.Context(), func() {
+				stopConn()
+				closers.Close()
+			})
+			congestion.UseConfigured(qconn, cc, quicParams.BbrProfile)
+			return qconn, nil
 		})
-		congestion.UseConfigured(qconn, cc, quicParams.BbrProfile)
-		return qconn, nil
 	}
 	t.secure = h3
 	return &http.Client{Transport: t}
@@ -380,27 +382,13 @@ func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 	return lane
 }
 
-type poolConn struct {
-	*serviceTransport
-	ctx    context.Context
-	cancel context.CancelFunc
-}
-
-func (c *poolConn) IsClosed() bool { return c.ctx.Err() != nil }
-
-func (c *poolConn) Close() error {
-	c.cancel()
-	return nil
-}
-
 // Positive conns spreads Drive media requests; other backends keep one manager.
 func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(context.Context) *http.Client) *connPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &connPool{ctx: ctx, cancel: cancel, spread: conns > 0, lanes: make([]connLane, max(1, conns))}
 	newConn := func() splithttp.XmuxConn {
-		ctx, cancel := context.WithCancel(p.ctx)
-		c := &poolConn{ctx: ctx, cancel: cancel, serviceTransport: newClient(ctx).Transport.(*serviceTransport)}
-		context.AfterFunc(ctx, c.CloseIdleConnections)
+		c := newClient(p.ctx).Transport.(*serviceTransport)
+		context.AfterFunc(c.ctx, c.CloseIdleConnections)
 		return c
 	}
 	maxConnections := config.GetMaxConnections()
@@ -456,7 +444,7 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	c.LeftRequests.Add(-1)
 	c.AddRunning()
 	p.mu.Unlock()
-	return c.XmuxConn.(*poolConn).roundTrip(r, func() {
+	return c.XmuxConn.(*serviceTransport).roundTrip(r, func() {
 		lane.pending.Add(-work)
 		c.DoneRunning()
 	})

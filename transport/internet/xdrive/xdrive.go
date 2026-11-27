@@ -119,9 +119,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 
 	if streamSettings.Destination == nil && dest.Address != nil {
 		dest.Network = net.Network_TCP
-		patched := *streamSettings
-		patched.Destination = &dest
-		streamSettings = &patched
+		streamSettings = new(*streamSettings)
+		streamSettings.Destination = &dest
 	}
 
 	root, err := newStorage(streamSettings, config)
@@ -316,20 +315,33 @@ func (l *Listener) accept(logCtx context.Context, listed Entry) *Conn {
 		return nil
 	}
 	s.handled, s.idle = true, time.Time{} // The owner lease also protects this tentative claim.
-	l.mu.Unlock()
-	conn, err := l.newSessionConn(session, listed, expires, storage, release)
-	l.mu.Lock()
-	if conn == nil {
+	admit, cancel := context.WithDeadline(l.ctx, expires)
+	defer cancel()
+	slots, drive := storage.(*driveStorage)
+	var r *ring
+	ready := admit.Err() == nil
+	if drive && ready {
+		l.mu.Unlock()
+		r, err = slots.readRing(admit, session, listed)
+		ready = r != nil && time.Now().Before(expires) && admit.Err() == nil
+		l.mu.Lock()
+	}
+	if !ready {
 		release()
 		s.handled = false
 		if err != nil && !s.warned {
 			errors.LogWarningInner(logCtx, err, "failed to read the announcement of session ", session)
 			s.warned = true
 		}
-	} else {
-		l.queueDrop(full)
+		return nil
 	}
-	return conn
+	defer l.queueDrop(full)
+	if drive {
+		errors.LogInfo(admit, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
+		return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, release)
+	}
+	errors.LogInfo(admit, "accepted session ", session)
+	return newConn(l.ctx, storage.(Storage), downlinkPrefix(session), uplinkPrefix(session), l.params, true, release)
 }
 
 const (
@@ -366,8 +378,7 @@ func (l *Listener) cleanupWorker(logCtx context.Context) {
 func (l *Listener) drop(logCtx context.Context, name string, periodic bool) {
 	var err error
 	for attempt := 1; l.ctx.Err() == nil; attempt++ {
-		err = l.storage.Delete(l.ctx, name)
-		if err == nil || err == errSessionInUse {
+		if err = l.storage.Delete(l.ctx, name); err == nil || err == errSessionInUse {
 			break
 		}
 		if periodic {
@@ -391,25 +402,6 @@ func (l *Listener) drop(logCtx context.Context, name string, periodic bool) {
 			s.idle = time.Now()
 		}
 	}
-}
-
-// Drive requires a ring announcement; other backends use the WAL.
-func (l *Listener) newSessionConn(session string, listed Entry, expires time.Time, storage backend, release func()) (*Conn, error) {
-	admit, cancel := context.WithDeadline(l.ctx, expires)
-	defer cancel()
-	if admit.Err() != nil {
-		return nil, nil
-	}
-	if slots, drive := storage.(*driveStorage); drive {
-		r, err := slots.readRing(admit, session, listed)
-		if r == nil || !time.Now().Before(expires) || admit.Err() != nil {
-			return nil, err
-		}
-		errors.LogInfo(admit, "accepted session ", session, " in ", len(r.Down.Slots), " slots")
-		return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, release), nil
-	}
-	errors.LogInfo(admit, "accepted session ", session)
-	return newConn(l.ctx, storage.(Storage), downlinkPrefix(session), uplinkPrefix(session), l.params, true, release), nil
 }
 
 func (l *Listener) collectLoop(logCtx context.Context) {
@@ -450,14 +442,13 @@ func (l *Listener) collect(sessions []Entry) []string {
 		name := sessionPrefix(id)
 		active := l.storage.sessions[id] > 0
 		pending := l.cleanupPending[name]
-		if !active && !pending && !now.Before(s.keepUntil) {
+		retained := active || pending || now.Before(s.keepUntil)
+		if !retained {
 			s.handled, s.warned = false, false
-			if !s.present {
-				delete(l.sessions, id)
-				continue
-			}
 		}
 		switch {
+		case !s.present && !retained:
+			delete(l.sessions, id)
 		case !s.present || active:
 			s.idle = time.Time{}
 		case pending: // A cleanup already owns this session.

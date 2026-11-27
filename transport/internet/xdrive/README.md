@@ -22,7 +22,8 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
   in flight gets a 2 ms window outside cooldown. A quiet burst can use up to
   24 inline positions; during streaming the limit is four. There are at most
   32 upload workers per direction and never more than the ring depth.
-  Reuse requires previous local completion and cumulative remote credit.
+  Reuse requires previous local completion and cumulative remote credit. Media
+  bytes remain charged against the sender's delivery window until acknowledged.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
@@ -70,11 +71,18 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    gathering while input keeps arriving, up to 200 ms or a full frame, and
    sends once input pauses for 25 ms. Bytes that cross a full-frame boundary
    start the next gather; a small overflow does not cost an immediate extra slot.
-2. **Frame size grows on demand.** It starts at `segmentBytes` (512 KiB)
-   and doubles after each round that filled a whole frame, up to 4 MiB (below
-   Drive's 5 MB multipart limit). Cooldown freezes growth. A full ring pauses
-   the writer before it starts another upload. Delayed credit leaves the frame
-   size alone rather than increasing the request count for the same payload.
+2. **Frame size follows ordered delivery.** The starting target is `segmentBytes`
+   (default 512 KiB, bounded to 256 KiB–1 MiB). When a media GET is admitted,
+   the reader records its ordered byte count and the time. Once that frame has
+   been delivered and verified through EOF, it reports the bytes delivered since
+   admission divided by elapsed time. This includes concurrent transfers that
+   actually reached the ordered stream. The writer targets one second at that
+   rate, bounded to 256 KiB–4 MiB; a partial gather can still be smaller.
+   The sender also limits *unacknowledged media bytes*: two frame allowances per
+   lane (at least four, each at least 512 KiB), plus a quarter second of measured
+   delivery, capped at the local look-ahead byte budget plus one head frame.
+   Inline slots still use ordinary ring credit. A successful upload alone cannot
+   open the media window. Quota cooldown freezes the sender's rate estimate.
 3. **Publish.** Up to 14 KiB goes inline in a file description. With fewer
    than eight uploads in flight and outside cooldown, the writer splits a
    burst only if its entire run fits both free workers and known remote credit.
@@ -139,8 +147,11 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    a partial body uses offset-aware resume. After a stall
    triggers a retry, subsequent attempts use the ordinary timeout. Any positive
    body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
-6. **Credit.** The reader writes its cumulative watermark every `depth/6`
-   frames or 1.5 s. One writer waits for cumulative credit in sequence order;
+6. **Credit.** The watermark description is JSON: `s` is the last completely
+   delivered sequence and `r` is ordered payload bytes per second (zero until
+   measured). The reader coalesces writes at `depth/6` frames, or checks every
+   250 ms for pending credit: media can be acknowledged after 250 ms and inline
+   traffic after 1.5 s. Close flushes the last snapshot. One writer waits for cumulative credit in sequence order;
    a slot also waits for its previous local upload to finish. Each media frame
    is logged at debug level: `xdrive upload seq` (credit wait, PUT time) and
    `xdrive read seq` (time to find, admission/byte-budget wait, body time).
@@ -155,7 +166,8 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
 
 There are no CRCs: integrity relies on TLS, the length checks and the
 per-block sequence tags, and VLESS encryption authenticates the payload. Both
-peers must use the `XDRVSL04` format; upgrade them together from `.100`.
+peers must use the same watermark format: **upgrade the server and client
+together from `.106` or earlier**. Slot payloads still use `XDRVSL04`.
 
 ## Implementation and trade-offs
 
@@ -240,6 +252,50 @@ folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+### Browsing during a download on one session
+
+In the capture with a `.105` server and a reported `.106` client, Steam content
+requests and browsing used the same 64-slot session. All 25 client media reads
+matched server publications by sequence and size (56.47 MiB). Median publication
+took 1.46 s; median client fetch took 16.84 s. Neither peer logged a quota
+cooldown. The logs do not measure individual page load times.
+
+The writer published sequences 104–106 at 512 KiB, 1 MiB and 2 MiB before the
+client acknowledged 104. For sequence 209, publishing 4 MiB took 1.53 s and
+fetching it took 45.94 s. The small, later frame 223 was already discovered but
+waited 37.28 s for ordered admission before its 1.17 s fetch. The client's
+watermark stayed at 208 for 47.45 s between successful writes. Watermarks track
+whole ordered frames; this interval does not mean that no bytes were delivered.
+
+`.101` could halve its frame target after a long wait to reuse a ring slot.
+`.105` removed that signal: a full input buffer doubled the target up to 4 MiB,
+and completing an upload released its byte allowance before the client received
+the data. Ring positions still bounded the number of frames, but 64 positions
+could hold very different amounts of unread data.
+
+Two real Xray peers on a local HTTP/2 Drive fixture carried two simultaneous
+downloads and paired 2 KiB / 32 KiB browser requests on one session. All bodies
+were compared byte-for-byte through EOF. These are full-request bulk rates
+(including startup) and pooled completion times for **all** browser requests,
+including ones that finished after the download. Each row covers two batches
+per build. Reference peers were a `.105` server and `.106` client.
+
+| Link and workload | Reference bulk | Updated bulk | Browser p95, reference → updated |
+|---|---:|---:|---:|
+| 500 KB/s shared downstream, one media lane paused 4 s every 16 s; 24 MiB | 282–286 KB/s | 275–289 KB/s | 39.42 → 21.28 s |
+| Uneven media lanes, 1 s media headers; 48 MiB | 2.17–2.33 MiB/s | 2.09–2.39 MiB/s | 11.37 → 10.47 s |
+| Fast loopback, 5 ms control / 20 ms media headers; 128 MiB | 268–273 Mbit/s | 189–209 Mbit/s | 1.08 → 0.92 s |
+
+On the 500 KB/s profile (decimal, across all client connections), 40/40 updated
+probes finished during a download, versus 23/40 on the reference. The worst
+interval to receive another MiB fell from 48.81 to 23.84 s. A `.101` server
+with the same `.106` client delivered 255 KB/s and had a 46.36 s browser p95
+in one batch. The fast build still used full 4 MiB frames. On a separate
+fast → slow → fast transfer within a single session, full frames shrank from
+2.94 MiB to roughly half a MiB before growing past 2 MiB again. Already
+published bytes remain ordered; a sudden slowdown cannot recall them. These
+results show a latency/throughput tradeoff, not a minimum speed on live Drive.
 
 ### Sustained downloads on `.105`
 
@@ -526,14 +582,14 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 914 |
-| `slots.go` | whole file | 647 |
-| `client.go` | whole file | 473 |
-| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–180 | 60 |
-| `xdrive.go` | 4, 7, 11, 114–178, 188–189, 197, 199–202, 222–223, 260–286, 288–333, 341–346, 366–394, 397–413, 415–434, 436–473 | 260 |
+| `drive.go` | whole file | 891 |
+| `slots.go` | whole file | 693 |
+| `client.go` | whole file | 461 |
+| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–178 | 58 |
+| `xdrive.go` | 4, 7, 11, 114–177, 187–188, 196, 198–201, 221–222, 259–285, 287–345, 353–358, 378–405, 407–426, 428–464 | 253 |
 | `params.go` | 74–82 | 9 |
 | `storage.go` | 9, 20–25, 29–34, 45–77 | 46 |
-| `storage_lease.go` | whole file | 66 |
+| `storage_lease.go` | whole file | 64 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
 | **Total** | | **2500** |

@@ -30,14 +30,12 @@ func (o *storageOwner) release(id string) error {
 	if o.sessions[id]--; o.sessions[id] <= 0 {
 		delete(o.sessions, id) // Drop the last holder, including an exclusive cleanup (-1).
 	}
-	last := len(o.sessions) == 0
-	if last {
+	if len(o.sessions) == 0 {
 		delete(shared, o.key)
-	}
-	sharedMu.Unlock()
-	if last {
+		sharedMu.Unlock()
 		return o.backend.Close()
 	}
+	sharedMu.Unlock()
 	return nil
 }
 

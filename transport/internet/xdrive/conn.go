@@ -164,18 +164,16 @@ func (c *Conn) Close() error {
 }
 
 func (c *Conn) closeOrdered() error {
+	defer c.onClose()
+	defer c.fail(nil)
 	err := c.writer.Close()
 	c.publishWG.Wait()
-	_, slots := c.writer.(*slotWriter)
-	if !slots || err != nil {
-		c.fail(nil) // Only a healthy Drive reader drains through the peer's END.
-	}
-	c.reader.wait()
-	if slots && err == nil {
-		err = context.Cause(c.ctx) // Includes failure of the final watermark.
+	if _, slots := c.writer.(*slotWriter); slots && err == nil {
+		c.reader.wait() // Drain through END, including the final watermark.
+		return context.Cause(c.ctx)
 	}
 	c.fail(nil)
-	c.onClose()
+	c.reader.wait()
 	return err
 }
 
