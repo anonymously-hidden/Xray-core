@@ -118,9 +118,8 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 
 	if streamSettings.Destination == nil && dest.Address != nil {
-		dest.Network = net.Network_TCP
 		streamSettings = new(*streamSettings)
-		streamSettings.Destination = &dest
+		streamSettings.Destination = new(net.TCPDestination(dest.Address, dest.Port))
 	}
 
 	root, err := newStorage(streamSettings, config)
@@ -160,7 +159,7 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 			if len(announce) <= driveInlineLimit {
 				description, announce = base64.StdEncoding.EncodeToString(announce), nil
 			}
-			if err := slots.writeFile(conn.ctx, ids[len(ids)-1], announceName(session, time.Now()), description, announce, nil); err != nil {
+			if err := slots.writeFile(conn.ctx, ids[len(ids)-1], announceName(session, time.Now()), driveFile{Description: description}, announce, nil, nil); err != nil {
 				conn.fail(errors.New("failed to announce session ", session).Base(err))
 			}
 		})
@@ -266,9 +265,8 @@ func (l *Listener) acceptPending(logCtx context.Context) (bool, error) {
 	now := time.Now()
 	for i, listed := range sessions {
 		// Drive translates future creation dates to now; WAL supplies no date.
-		first := cmp.Or(l.announcements[listed.Name].first, listed.created, now)
-		l.announcements[listed.Name] = seenAnnouncement{first: first, last: now}
-		sessions[i].created = first
+		sessions[i].created = cmp.Or(l.announcements[listed.Name].first, listed.created, now)
+		l.announcements[listed.Name] = seenAnnouncement{first: sessions[i].created, last: now}
 		if id, ok := announceParts(listed.Name); ok && l.sessions[id] != nil {
 			l.sessions[id].keepUntil = now.Add(2 * l.sessionTTL)
 		}
@@ -395,10 +393,9 @@ func (l *Listener) drop(logCtx context.Context, name string, periodic bool) {
 	delete(l.cleanupPending, name)
 	if session, ok := strings.CutPrefix(name, streamsDir+"/"); ok {
 		s := l.sessions[session]
-		switch {
-		case err == nil && periodic:
+		if err == nil && periodic {
 			s.idle = time.Time{} // A new listing starts a new inactivity period.
-		case err == nil || err == errSessionInUse || s.idle.IsZero():
+		} else if err == nil || err == errSessionInUse || s.idle.IsZero() {
 			s.idle = time.Now()
 		}
 	}

@@ -49,36 +49,31 @@ func (t *serviceTransport) Close() error {
 	return nil
 }
 
-// Cancel stalled requests, not long transfers that continue to make progress.
 func (t *serviceTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return t.roundTrip(r, func() {})
 }
 
 func (t *serviceTransport) roundTrip(r *http.Request, release func()) (*http.Response, error) {
-	var next http.RoundTripper = t.plain
-	if r.URL.Scheme == "https" {
-		next = t.secure
-		if _, known := t.h1Hosts.Load(r.URL.Host); t.parallel != nil && known {
-			next = t.parallel
-		}
+	next := t.secure
+	if r.URL.Scheme != "https" {
+		next = t.plain
+	} else if _, known := t.h1Hosts.Load(r.URL.Host); t.parallel != nil && known {
+		next = t.parallel
 	}
 	ctx, cancel := context.WithCancelCause(r.Context())
 	alive := t.watch(ctx, cancel)
 	r = r.WithContext(ctx)
 	r.Header = r.Header.Clone()
 	utils.TryDefaultHeadersWith(r.Header, "fetch")
-	upload := func(body io.ReadCloser) io.ReadCloser {
-		if body == nil || body == http.NoBody {
-			return body
+	upload := func(body io.ReadCloser, err error) (io.ReadCloser, error) {
+		if body != nil && body != http.NoBody {
+			body = &progressBody{Reader: body, close: body.Close, alive: alive}
 		}
-		return &progressBody{Reader: body, close: body.Close, alive: alive}
+		return body, err
 	}
-	r.Body = upload(r.Body)
+	r.Body, _ = upload(r.Body, nil)
 	if getBody := r.GetBody; getBody != nil {
-		r.GetBody = func() (io.ReadCloser, error) {
-			body, err := getBody()
-			return upload(body), err
-		}
+		r.GetBody = func() (io.ReadCloser, error) { return upload(getBody()) }
 	}
 	resp, err := next.RoundTrip(r)
 	if err != nil {
@@ -169,11 +164,10 @@ func (b *progressBody) Read(p []byte) (int, error) {
 
 func (b *progressBody) Close() error { return b.close() }
 
-// A request or the transport owner can cancel the socket dial and its handshake.
 func dialService[T any](ctx, owner context.Context, settings *internet.MemoryStreamConfig, network, addr string, handshake func(context.Context, net.Conn, net.Destination) (T, error)) (T, error) {
 	var zero T
 	ctx, cancel := context.WithCancel(ctx)
-	defer context.AfterFunc(owner, cancel)()
+	defer context.AfterFunc(owner, cancel)() // Either lifetime may cancel this dial and handshake.
 	defer cancel()
 	if err := owner.Err(); err != nil {
 		return zero, err
@@ -202,7 +196,6 @@ func dialService[T any](ctx, owner context.Context, settings *internet.MemoryStr
 	return handshake(ctx, conn, host)
 }
 
-// connCtx owns sockets; h1Hosts shares ALPN observations between clients.
 func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings *internet.MemoryStreamConfig, stall time.Duration, maxConns int) *http.Client {
 	connCtx, cancel := context.WithCancel(connCtx)
 	streamSettings = cmp.Or(streamSettings, &internet.MemoryStreamConfig{})
@@ -232,7 +225,6 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 				return conn, nil
 			}
 			tlsConn := clientTLS(conn, tlsConfig.GetTLSConfig(tls.WithDestination(host))).(tls.Interface)
-			// Bound the handshake independently of connection reuse.
 			handshakeCtx, finish := context.WithTimeout(ctx, stall)
 			defer finish()
 			if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
@@ -260,7 +252,6 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 		return &http.Client{Transport: t}
 	}
 	quicParams := cmp.Or(streamSettings.QuicParams, &internet.QuicParams{BbrProfile: string(bbr.ProfileStandard)})
-	// QUIC idle timeout and connCtx bound unused connections.
 	h3 := &http3.Transport{QUICConfig: &quic.Config{
 		InitialStreamReceiveWindow:     quicParams.InitStreamReceiveWindow,
 		MaxStreamReceiveWindow:         quicParams.MaxStreamReceiveWindow,
@@ -297,8 +288,7 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 			if !quicParams.DisableChromeParrot {
 				tr.ConnectionIDGenerator = quic.ZeroLengthConnectionIDGenerator{}
 			}
-			// Some packet conns ignore read deadlines. Close the socket before
-			// joining QUIC's receive loop on both dial failure and connection exit.
+			// Some packet connections ignore deadlines: close the socket before joining QUIC's receive loop.
 			closers := common.ChainedClosable{packet.PacketConn, tr}
 			qconn, err := tr.Dial(ctx, packet.RemoteAddr(), gotlsConfig, cfg)
 			if err != nil {
@@ -318,7 +308,6 @@ func newServiceClient(connCtx context.Context, h1Hosts *sync.Map, streamSettings
 	return &http.Client{Transport: t}
 }
 
-// Closing the socket unregisters the owner-context callback.
 type ctxConn struct {
 	net.Conn
 	stop func() bool
@@ -331,8 +320,7 @@ func (c *ctxConn) Close() error {
 
 var errSessionClosed = errors.New("the session is closed")
 
-// XMUX selects a lease once, not repeatedly while looking for a connection.
-// Running references cover both the session and any response bodies still open.
+// XMUX leases count both the session and response bodies that are still open.
 type connPool struct {
 	mu     sync.Mutex
 	lanes  []connLane // One pinned manager, or one per Drive media connection.
@@ -340,7 +328,7 @@ type connPool struct {
 	next   int
 	cost   float64 // Last verified pool sample, used until a lane has a fresh one of its own.
 	ctx    context.Context
-	cancel context.CancelFunc
+	Close  context.CancelFunc
 }
 
 type connLane struct {
@@ -351,24 +339,21 @@ type connLane struct {
 	sampled   time.Time
 }
 
-// Estimate completion time from outstanding work and recent verified downloads.
 func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 	now := time.Now()
-	score := func(l *connLane) float64 {
-		if read != nil && l == read.stalled {
-			return math.Inf(1) // A retry uses a different connection when there is one.
+	best, bestScore := p.next, math.Inf(1)
+	for off := range p.lanes {
+		i := (p.next + off) % len(p.lanes)
+		lane := &p.lanes[i]
+		if read != nil && lane == read.stalled {
+			continue // A retry uses a different connection when there is one.
 		}
 		cost := cmp.Or(p.cost, 1)
-		if read != nil && now.Sub(l.sampled) < driveTimeout {
-			cost = l.cost
+		if read != nil && now.Sub(lane.sampled) < driveTimeout {
+			cost = lane.cost
 		}
-		return cost * float64(l.pending.Load()+work)
-	}
-	best := p.next
-	for off := 1; off < len(p.lanes); off++ {
-		i := (p.next + off) % len(p.lanes)
-		if score(&p.lanes[i]) < score(&p.lanes[best]) {
-			best = i
+		if score := cost * float64(lane.pending.Load()+work); score < bestScore {
+			best, bestScore = i, score
 		}
 	}
 	p.next = (best + 1) % len(p.lanes)
@@ -391,7 +376,7 @@ func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 // Positive conns spreads Drive media requests; other backends keep one manager.
 func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(context.Context) *http.Client) *connPool {
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &connPool{ctx: ctx, cancel: cancel, spread: conns > 0, lanes: make([]connLane, max(1, conns))}
+	p := &connPool{ctx: ctx, Close: cancel, spread: conns > 0, lanes: make([]connLane, max(1, conns))}
 	newConn := func() splithttp.XmuxConn {
 		c := newClient(p.ctx).Transport.(*serviceTransport)
 		context.AfterFunc(c.ctx, c.CloseIdleConnections)
@@ -410,8 +395,6 @@ func newConnPool(config *splithttp.XmuxConfig, conns int32, newClient func(conte
 	}
 	return p
 }
-
-func (p *connPool) Close() { p.cancel() }
 
 type sessionTransport struct {
 	pool   *connPool

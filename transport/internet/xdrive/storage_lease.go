@@ -6,8 +6,7 @@ import (
 	"sync"
 )
 
-// sharedMu protects the owners and their holders. The empty ID counts root
-// handles; session IDs count open connections or mark exclusive cleanup (-1).
+// Under sharedMu, the empty ID counts roots; session IDs count connections or mark exclusive cleanup (-1).
 type storageOwner struct {
 	backend
 	key      string
@@ -17,12 +16,11 @@ type storageOwner struct {
 func (o *storageOwner) hold(id string, delta int) bool {
 	sharedMu.Lock()
 	defer sharedMu.Unlock()
-	n := o.sessions[id]
-	if n < 0 || delta < 0 && n != 0 {
-		return false
+	if n := o.sessions[id]; n >= 0 && (n == 0 || delta >= 0) {
+		o.sessions[id] = n + delta
+		return true
 	}
-	o.sessions[id] = n + delta
-	return true
+	return false
 }
 
 func (o *storageOwner) release(id string) error {
@@ -39,8 +37,7 @@ func (o *storageOwner) release(id string) error {
 	return nil
 }
 
-// Called with a live root reference: Dial still owns it, and Listener.Close joins
-// the accept loop before releasing it. Only remote backends need child clients.
+// Dial and the listener retain a root until session admission finishes.
 func (o *storageOwner) session(id string) (backend, func(), error) {
 	if !o.hold(id, 1) {
 		return nil, nil, errSessionInUse

@@ -143,22 +143,19 @@ func (c *Conn) Close() error {
 		close(c.closing)
 		c.readDeadline.stop()
 		c.writeDeadline.stop()
-		done := make(chan error, 1)
+		result := make(chan error, 2) // The ordered close and its watchdog can each report once.
 		c.markProgress()
-		go func() { done <- c.closeOrdered() }()
+		go func() { result <- c.closeOrdered() }()
 		defer c.fail(nil)
 		for wait := slotStallTimeout; wait > 0; wait = slotStallTimeout - time.Since(*c.progress.Load()) {
 			select {
-			case c.closeErr = <-done:
+			case c.closeErr = <-result:
 				return
 			case <-time.After(wait):
 			}
 		}
-		select { // Prefer completion if it raced the last timer tick.
-		case c.closeErr = <-done:
-		default:
-			c.closeErr = context.DeadlineExceeded
-		}
+		result <- context.DeadlineExceeded
+		c.closeErr = <-result // A completion already in the queue wins.
 	})
 	return c.closeErr
 }

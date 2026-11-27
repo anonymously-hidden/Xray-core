@@ -47,8 +47,8 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
   If the first range returns a full HTTP 200 body, keep it and cancel the other
   ranges instead of downloading the full body four times. Validate every
   block's sequence tag, HTTP range/length and EOF. Resume an incomplete span
-  without delivering the same bytes twice (see Fetch below). No media GET runs
-  before discovering its frame description.
+  without delivering the same bytes twice (see Fetch below). A media GET requires
+  a descriptor, obtained from the slot itself or, for a blocked head, its successor.
 - **Close:** Close discards unread input, drains its writer and publishes END.
   It keeps verifying input and returning credit until it reads the peer's END,
   then flushes any remaining verified watermark. The peer may still have a full
@@ -118,6 +118,16 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    bypasses that budget, and a queued media request switches to the reserved
    HTTP permits when promoted. Admission waits for the previous frame's ready
    signal, not its completed download.
+   If an ordered metadata GET goes idle for five seconds with a later sequence
+   already visible, discovery can retry it outside cooldown. After publishing a
+   frame larger than 1 MiB, the writer also includes that frame's 28-character
+   descriptor in the successor's optional Drive file property `xdrivePrev`.
+   These frames have no prefix in their description: the original media contains
+   all their bytes. On a failed or stale head lookup, the reader can use this hint
+   once if the prior file ID is already bound to the session. It buffers that
+   head, checks its own tags, length and EOF, then exposes its bytes. A stale body
+   is discarded before falling back to the original metadata. Old properties on
+   a reused slot do not match the required sequence. Ordinary reads still stream.
    Promotion releases any existing look-ahead reservation, not remote ring credit.
    Thus a head discovered in advance no longer consumes both its own allowance
    and the successors' budget. Cancellation wakes waiters and retires the
@@ -145,6 +155,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    draining this specific span, and Drive is not cooling down. There must be
    evidence of progress: a later range in this frame or a later media frame
    has verified through EOF, or a later inline frame has been read in full.
+   An inline description is already the entire frame: it counts immediately,
+   even if an intervening slot is still waiting for its description or byte allowance.
+   This evidence does not deliver the inline bytes or release ring credit early.
    A verified successor also covers the last range of a frame and a progressive
    GET waiting for headers. An interrupted header wait uses the existing HTTP GET retry budget;
    a partial body uses offset-aware resume. After a stall
@@ -208,8 +221,13 @@ Announcements are also created with reserved IDs. After a lost reply, read back
 the exact slot, watermark or inline announcement description; for a media
 announcement also compare the complete body. Never replay an ambiguous write.
 After an ambiguous create or PATCH the writer has up to 45 s to confirm the
-exact contents across a reconnect, including data slots and watermarks. The
-first check is immediate; failed checks back off from 200 ms to 2 s. There
+exact contents across a reconnect. For ordinary data after sequence zero, a
+validated cumulative watermark from the same direction can also confirm that the
+peer consumed the slot. The writer never resends the mutation on this evidence.
+Sequence zero can arrive in the announcement, so its ACK cannot confirm its slot write.
+Exact readback starts immediately. If it is still unresolved after 200 ms,
+the writer also checks for a covering receipt, reusing credit it already validated.
+Failed checks back off from 200 ms to 2 s. There
 is no added wait on a successful write. An unconfirmed write still fails the
 connection. If an announcement was already deleted, a 404 is not proof of delivery. If confirmation fails,
 the original write error is preserved. Graceful close reports final ACK errors. These are
@@ -256,6 +274,22 @@ folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+### Removing ordered waits in `.109`
+
+| One-session fixture | Baseline | `.109` |
+|---|---|---|
+| Media head paused; next description hidden; only the second successor is visible and inline | `.108` finished the head at 20.00 s | Finished at 10.25 s; the inline proof became visible at 7.02 s |
+| Warm slot's metadata held for a 1,310,757-byte head, with the next slot visible | `.108` delivered zero bytes in the eight-second observation window | Exact head and successor delivered 4.97 s after the successor appeared, while direct metadata was still held |
+| Committed PATCH loses its reply; writer keeps seeing the previous lap | `.108` failed after 45 s despite a covering ACK | Writer confirmed in 0.25 s; follow-up and EOF completed on the same TCP stream at 0.41 s, without replay |
+
+On the quiet page fixture with a 29.5 s metadata delay, the document's first byte
+arrived in 5.35 s (29.71 s on the earlier `.107` control); all 12 assets and the
+follow-up matched. These are injected faults on a local Drive service, not live
+GitHub timings or measurements of sustained throughput. Media parity was modeled
+but is not sent: the repair carrier can itself be beyond the sender's credit window.
+The slot body and watermark formats are unchanged. Both peers are needed for the
+descriptor hint; there is no configuration change.
 
 ### GitHub first-byte delays on `.107`
 
@@ -642,14 +676,14 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 888 |
-| `slots.go` | whole file | 690 |
-| `client.go` | whole file | 467 |
-| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–178 | 58 |
-| `xdrive.go` | 4, 7, 11, 114–177, 187–188, 196, 198–201, 221–222, 259–285, 287–345, 353–358, 378–405, 407–426, 428–464 | 253 |
+| `drive.go` | whole file | 874 |
+| `slots.go` | whole file | 730 |
+| `client.go` | whole file | 450 |
+| `conn.go` | 8, 11, 33, 62–72, 74–80, 141–161, 163–175 | 55 |
+| `xdrive.go` | 4, 7, 11, 114–176, 186–187, 195, 197–200, 220–221, 258–283, 285–343, 351–356, 376–402, 404–423, 425–461 | 250 |
 | `params.go` | 74–82 | 9 |
 | `storage.go` | 9, 20–25, 29–34, 45–77 | 46 |
-| `storage_lease.go` | whole file | 64 |
+| `storage_lease.go` | whole file | 61 |
 | `infra/conf/transport_method.go` | 1020–1027, 1037, 1045–1050 | 15 |
 | `infra/conf/transport_internet.go` | 266–275 | 10 |
 | **Total** | | **2500** |
