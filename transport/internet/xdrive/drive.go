@@ -49,8 +49,14 @@ type (
 	headKey       struct{}
 	mediaHeadKey  struct{} // <-chan struct{}, closed on promotion
 	mediaSeqKey   struct{} // int64, for request retry diagnostics
+	mediaReadKey  struct{}
 	spanRescueKey struct{} // func() bool for the ordered span, cleared on resume
 )
+
+type mediaRead struct {
+	size     int
+	verified func(int) // Set by the selected lane; only exact EOF supplies a timing sample.
+}
 
 type driveLane int
 
@@ -325,7 +331,7 @@ func multipartBody(metadata, data, tag []byte) ([]byte, string) {
 // Serialize refreshes with a cancelable permit. A 401 invalidates the cached
 // entry independently, without waiting behind a network call.
 func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
-	if err := acquirePermit(ctx, s.tokenLock); err != nil {
+	if err := sendUntil(ctx, s.tokenLock, struct{}{}, nil, nil); err != nil {
 		return "", err
 	}
 	defer func() { <-s.tokenLock }()
@@ -351,15 +357,6 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 	return token.AccessToken, token.err
 }
 
-func acquirePermit(ctx context.Context, permits chan struct{}) error {
-	select {
-	case permits <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
 func sleepContext(ctx context.Context, d time.Duration) error {
 	return waitFor(ctx, time.After(d), nil)
 }
@@ -367,11 +364,10 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 func waitFor[T any](ctx context.Context, event <-chan T, wake <-chan struct{}) error {
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
 	case <-event:
 	case <-wake:
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (s *driveStorage) cooling() bool {
@@ -436,9 +432,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
-		if upload {
-			req.GetBody = nil // Never let the transport rewind an upload.
-		}
+		req.GetBody = nil // Reads have no body; never let the transport rewind an upload.
 		resp, err := s.clients[lane].Do(req)
 		if err != nil {
 			cause := errors.Cause(err)
@@ -629,7 +623,8 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 		var headers time.Time
 		var readErr error // Only interrupted reads qualify for further resumes.
 		started := time.Now()
-		err := s.request(ctx, mediaLane, http.MethodGet, driveMediaURL(id), "", nil, header, false, func(resp *http.Response) error {
+		read := &mediaRead{size: end - start}
+		err := s.request(context.WithValue(ctx, mediaReadKey{}, read), mediaLane, http.MethodGet, driveMediaURL(id), "", nil, header, false, func(resp *http.Response) error {
 			headers = time.Now()
 			from, to, length := first, hi, end-start
 			switch resp.StatusCode {
@@ -678,6 +673,7 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 				return errors.New("Drive media did not end at the declared length").Base(readErr)
 			}
 			errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
+			read.verified(length)
 			return nil
 		})
 		firstRetry := attempt == 1 && (!headers.IsZero() || err == errNotFound || err == errDriveRange)
@@ -749,7 +745,7 @@ func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFra
 // One ID for the announcement and two tables, each with a watermark.
 func (s *driveStorage) takeIDs(ctx context.Context, depth int) ([]string, error) {
 	n := 2*(depth+1) + 1 // depth is capped at maxConcurrency (256).
-	if err := acquirePermit(ctx, s.idLock); err != nil {
+	if err := sendUntil(ctx, s.idLock, struct{}{}, nil, nil); err != nil {
 		return nil, err
 	}
 	defer func() { <-s.idLock }()

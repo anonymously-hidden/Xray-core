@@ -19,16 +19,17 @@ can carry its first 14 KiB in the same publication's description. Modes 3 and
 
 - **Write:** one goroutine batches caller input and assigns sequence numbers.
   Input is normally gathered for 25 ms. A small first write with no uploads
-  in flight gets a 2 ms window outside cooldown. A burst that fits in four
-  inline positions can avoid a media GET. There are at most 32 upload workers per direction
-  and never more than the ring depth.
+  in flight gets a 2 ms window outside cooldown. A quiet burst can use up to
+  24 inline positions; during streaming the limit is four. There are at most
+  32 upload workers per direction and never more than the ring depth.
   Reuse requires previous local completion and cumulative remote credit.
 - **Read:** idle polling focuses on the head. After a minute without a head,
   one bounded background probe at a time rotates through other slot descriptions
   to distinguish a gap from a genuinely idle peer. During activity, up to
   24 known descriptions are prefetched, with one metadata GET per worker at a
-  time. Empty-slot polling reaches only four positions beyond the observed
-  frontier (or head); new observations advance that frontier immediately.
+  time. Repeated empty-slot polling reaches only four positions beyond the
+  observed frontier (or head). A full inline slot allows a single earlier
+  probe of each position in the rest of the 24-slot window.
   All media sizes may be prefetched; byte admission follows sequence
   order, bounded to 4 MiB per media connection and held until head promotion.
   Ordinary media has four HTTP permits per connection (capped at 64); head
@@ -68,21 +69,18 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    gathering while input keeps arriving, up to 200 ms or a full frame, and
    sends once input pauses for 25 ms. Bytes that cross a full-frame boundary
    start the next gather; a small overflow does not cost an immediate extra slot.
-2. **Frame size grows every round.** It starts at `segmentBytes` (512 KiB)
+2. **Frame size grows on demand.** It starts at `segmentBytes` (512 KiB)
    and doubles after each round that filled a whole frame, up to 4 MiB (below
-   Drive's 5 MB multipart limit). It halves (not below the start) when an
-   upload acquired credit after waiting more than 5 s outside Drive cooldown.
-   A blocked worker reports strain once on acquiring credit, not every poll.
-   Cooldown freezes frame size instead of shrinking it: smaller frames spend
-   more requests per byte. Routine credit takes 1-3 s; shorter waits only mean
-   the writer is a ring ahead. Larger frames carry more bytes per position.
+   Drive's 5 MB multipart limit). Cooldown freezes growth. A full ring pauses
+   the writer before it starts another upload. Delayed credit leaves the frame
+   size alone rather than increasing the request count for the same payload.
 3. **Publish.** Up to 14 KiB goes inline in a file description. With fewer
    than eight uploads in flight and outside cooldown, the writer splits a
-   burst only if it fits entirely in at most four free slots (56 KiB). Four
-   positions fit in the reader's discovery window even past the frontier.
-   Larger bursts use one media publication instead of multiple waves of GETs
-   for descriptions. Tags are written directly into the multipart upload
-   buffer, avoiding an intermediate copy of the entire media body.
+   burst only if its entire run fits both free workers and known remote credit.
+   Normally the limit is four (56 KiB); for a partial frame with fewer than four
+   uploads and no burst over 56 KiB in the last eager window, it is 24 (336 KiB).
+   A larger burst uses one media publication. Tags go directly into the multipart
+   upload buffer, avoiding an intermediate copy of the entire media body.
    A media frame is one multipart create or PATCH: the description holds
    `XDRVSL04`, sequence, mode and total payload length. For media frames up to
    1 MiB it also holds the first 14 KiB of payload. The reader can deliver
@@ -90,8 +88,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    request. The rest (all payload for larger frames) is stored in blocks of an
    8-byte sequence tag and up to 256 KiB of data. At most 32 uploads and
    4 MiB of unfinished uploads per media connection run per direction (one
-   frame may exceed it alone). Each media request uses the lane with the
-   fewest unfinished requests, rotating ties (XMUX `maxConnections`, default 4): one Google
+   frame may exceed it alone). Media requests are charged by payload size plus
+   one block of request overhead. A download chooses the lowest estimated
+   completion time, rotating ties (XMUX `maxConnections`, default 4): one Google
    connection carries only a fraction of a link (a measured single-connection
    client download averaged ~0.22 MB/s). The byte bound,
    about one 4 MiB frame per connection, bounds payload bytes, not request count
@@ -100,8 +99,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    instead of forcing one large frame to finish before starting the next.
 4. **Discover.** The reader polls the head slot's description (25 ms while
    active; no duplicate hedged GET) and prefetches up to 24 descriptions. Slots
-   beyond the observed frontier plus four wait without polling; the head always
-   polls, and the existing gap probe still covers otherwise unobserved gaps.
+   beyond the observed frontier plus four wait without repeated polling. A full
+   inline slot suggests a split burst, so each successor in the window can try
+   once before the frontier reaches it. A prediction never counts as evidence of a gap.
    Bodies of all sizes download ahead within the byte budget, admitted in sequence
    order so distant successors cannot reserve it before nearer frames. The head
    bypasses that budget, and a queued media request switches to the reserved
@@ -138,9 +138,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    triggers a retry, subsequent attempts use the ordinary timeout. Any positive
    body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
 6. **Credit.** The reader writes its cumulative watermark every `depth/6`
-   frames or 1.5 s. A slot is rewritten only after that credit. Frame size
-   changes are logged at debug level (`xdrive frame size A -> B`), as is
-   each media frame: `xdrive upload seq` (credit wait, PUT time) and
+   frames or 1.5 s. One writer waits for cumulative credit in sequence order;
+   a slot also waits for its previous local upload to finish. Each media frame
+   is logged at debug level: `xdrive upload seq` (credit wait, PUT time) and
    `xdrive read seq` (time to find, admission/byte-budget wait, body time).
    `xdrive watermark seq N put P` records successful ACK publications, and
    `xdrive credit seq N ack A` records the writer observing newer credit.
@@ -168,9 +168,12 @@ cannot collect their files while either peer still holds the profile locally.
 `client.go` is shared with the URL-template and S3 transports. It retains the
 configured TLS/QUIC dial path, socket and mask settings, stall timeout, HTTP/2
 keepalive and XMUX leases. Drive uses distinct metadata, priority and media
-pools. Metadata and priority select a lease once per session. Media chooses
-among one-connection XMUX lanes by outstanding requests, counting a response
-until its body closes, including across lease rotation. Request/reuse/lifetime limits
+pools. Metadata and priority select a lease once per session. Each media lane
+keeps its assigned work until the body closes. A verified GET measures elapsed
+time against work completed on that lane during the request, including overlapping
+GETs. Each lane averages its estimate with the new sample. New lanes and lanes
+without a sample in the last minute use the latest pool sample. Uploads
+use outstanding work alone. Request/reuse/lifetime limits
 still apply within each lane; the media byte budget follows the same count.
 Peer-supplied IDs are checked for valid syntax and uniqueness. An existing
 object must match its announced session name and configured parent on first
@@ -233,6 +236,36 @@ folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+### Download throughput since `.101`
+
+`.102` replaced `.101`'s quiet inline window with a four-slot maximum and
+changed media selection from round-robin to the fewest outstanding requests.
+`.103` retained those policies; `.104` changed outage and retry handling. In
+the matched `.104` capture, 15 of 52 media frames took over 10 s to fetch.
+Frame 101 took 1.20 s to publish and 35.99 s to fetch; frame 170 took 1.25 s
+and 27.95 s. Neither peer logged a quota cooldown. Waiting to deliver an early
+range also delayed credit for already downloaded successors.
+
+On a loopback HTTP/2 Drive service with a 64-slot ring, `.101` carried an idle
+192 KiB response in descriptions. `.102`, `.103` and `.104` used a media GET.
+On 16 MiB responses all four releases assigned several MiB to the slowest
+connection; the bulk comparison did not isolate a `.103`-specific regression.
+With three connections shaped at 2.4 MiB/s and one at 0.18 MiB/s, three
+consecutive 16 MiB + 329 byte responses on `.104` took 19.38, 25.08 and
+31.20 s. With the current scheduler they took 24.98, 7.14 and 8.02 s. On
+the first transfer there was no rate history. On the next two, the slow
+connection received 0.08 and 1.08 MiB instead of 4 and 5 MiB. These are
+application completion times checked byte-for-byte, not live Drive goodput.
+With four equally shaped connections, alternating build order over two runs
+gave median times of 5.80 s on `.104` and 5.90 s here (six responses per build).
+For repeated 192 KiB responses with 220 ms metadata delay, the medians were
+1.31 s and 1.33 s. The gain was on uneven connections after their rates were learned.
+
+Race-instrumented peers also delivered two 8 MiB responses through a two-slot
+ring, recovered four interrupted media reads and a lost watermark reply, and
+rejected a repeated wrong block tag. Mixed `.104` and current peers transferred
+16 MiB + 329 bytes and a follow-up with each version acting as the reader.
 
 ### Slow-link recovery
 
@@ -454,9 +487,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 918 |
-| `slots.go` | whole file | 678 |
-| `client.go` | whole file | 438 |
+| `drive.go` | whole file | 914 |
+| `slots.go` | whole file | 647 |
+| `client.go` | whole file | 473 |
 | `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–180 | 60 |
 | `xdrive.go` | 4, 7, 11, 114–178, 188–189, 197, 199–202, 222–223, 260–286, 288–333, 341–346, 366–394, 397–413, 415–434, 436–473 | 260 |
 | `params.go` | 74–82 | 9 |

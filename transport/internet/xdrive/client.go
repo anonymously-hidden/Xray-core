@@ -334,13 +334,50 @@ type connPool struct {
 	lanes  []connLane // One pinned manager, or one per Drive media connection.
 	spread bool
 	next   int
+	cost   float64 // Last verified pool sample, used until a lane has a fresh one of its own.
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 type connLane struct {
-	manager *splithttp.XmuxManager
-	active  atomic.Int32 // Includes open response bodies, even across XMUX lease rotation.
+	manager   *splithttp.XmuxManager
+	pending   atomic.Int64 // Charged until the body closes, including across lease rotation.
+	delivered int64        // Verified work on this connection, including overlapping GETs.
+	cost      float64      // Nanoseconds per charged byte of a verified media GET; guarded by pool.mu.
+	sampled   time.Time
+}
+
+// Estimate completion time from outstanding work and recent verified downloads.
+func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
+	now := time.Now()
+	score := func(l *connLane) float64 {
+		cost := cmp.Or(p.cost, 1)
+		if read != nil && now.Sub(l.sampled) < driveTimeout {
+			cost = l.cost
+		}
+		return cost * float64(l.pending.Load()+work)
+	}
+	best := p.next
+	for off := 1; off < len(p.lanes); off++ {
+		i := (p.next + off) % len(p.lanes)
+		if score(&p.lanes[i]) < score(&p.lanes[best]) {
+			best = i
+		}
+	}
+	p.next = (best + 1) % len(p.lanes)
+	lane := &p.lanes[best]
+	if read != nil {
+		before := lane.delivered
+		read.verified = func(bytes int) {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			lane.sampled = time.Now()
+			lane.delivered += int64(slotTagBlock + bytes)
+			p.cost = float64(lane.sampled.Sub(now)) / float64(lane.delivered-before)
+			lane.cost = (p.cost + cmp.Or(lane.cost, p.cost)) / 2 // Smooth queueing noise between completions.
+		}
+	}
+	return lane
 }
 
 type poolConn struct {
@@ -398,16 +435,15 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	c := t.client
 	lane := &p.lanes[0]
+	var work int64
 	if p.spread {
-		// Rotate ties, but avoid stacking new requests on a slow connection while peers are free.
-		best := p.next
-		for off := 1; off < len(p.lanes) && p.lanes[best].active.Load() != 0; off++ {
-			i := (p.next + off) % len(p.lanes)
-			if p.lanes[i].active.Load() < p.lanes[best].active.Load() {
-				best = i
-			}
+		read, _ := r.Context().Value(mediaReadKey{}).(*mediaRead)
+		work = slotTagBlock + max(0, r.ContentLength)
+		if read != nil {
+			work = int64(slotTagBlock + read.size)
 		}
-		lane, p.next = &p.lanes[best], (best+1)%len(p.lanes)
+		lane = p.pickMedia(work, read)
+		lane.pending.Add(work)
 		c = lane.manager.GetXmuxClient(r.Context())
 	} else if c == nil || c.XmuxConn.IsClosed() || c.LeftRequests.Load() <= 0 || (!c.UnreusableAt.IsZero() && time.Now().After(c.UnreusableAt)) {
 		if c != nil {
@@ -419,10 +455,9 @@ func (t *sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	c.LeftRequests.Add(-1)
 	c.AddRunning()
-	lane.active.Add(1)
 	p.mu.Unlock()
 	return c.XmuxConn.(*poolConn).roundTrip(r, func() {
-		lane.active.Add(-1)
+		lane.pending.Add(-work)
 		c.DoneRunning()
 	})
 }
