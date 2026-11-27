@@ -169,8 +169,7 @@ type slotDirection struct {
 	params
 }
 
-// Outbound: run assigns sequence numbers and owns the coalescing buffer.
-// Uploads may finish out of order. Each physical position has a completion fence.
+// The writer owns batching and sequencing; per-slot fences order reuse across concurrent uploads.
 type slotWriter struct {
 	slotDirection
 	input                 chan []byte
@@ -239,8 +238,8 @@ func (w *slotWriter) writeUntil(p []byte, deadline, _ <-chan struct{}) (int, err
 
 func (c *Conn) markProgress() { c.progress.Store(new(time.Now())) }
 
-func (w *slotWriter) frameSize() int {
-	seed := min(max(w.segmentBytes, slotTagBlock), slotProgressiveMax)
+func (w *slotWriter) frameSize(seedFloor int) int {
+	seed := min(max(w.segmentBytes, seedFloor), slotProgressiveMax)
 	return int(min(slotMaxFrame, max(slotTagBlock, cmp.Or(w.rate, int64(seed)))))
 }
 
@@ -250,8 +249,8 @@ func (w *slotWriter) waitCredit(size int64) (time.Duration, bool) {
 	depth, media := int64(len(w.through)), size > slotInlineLimit
 	for w.ctx.Err() == nil {
 		// Keep a pair of requests per lane in flight plus the bytes deliverable between ACK ticks.
-		window := int64(max(4, 2*len(w.store.pools[mediaLane].lanes))) * int64(max(defaultSegmentBytes, w.frameSize()))
-		window = min(w.limit+int64(w.frameSize()), window+w.rate/4) // One head beyond look-ahead; allow for the media ACK interval.
+		window := int64(max(4, 2*len(w.store.pools[mediaLane].lanes))) * int64(w.frameSize(defaultSegmentBytes))
+		window = min(w.limit+int64(w.frameSize(slotTagBlock)), window+w.rate/4) // One head beyond look-ahead.
 		queued := w.mediaSent - w.mediaAcked
 		full := w.next-w.acked > depth || media && queued+size > max(window, size)
 		if !full && (!media || queued < window/2 || time.Since(w.nextCredit) < slotIdleAck) {
@@ -277,7 +276,7 @@ func (w *slotWriter) waitCredit(size int64) (time.Duration, bool) {
 				}
 				w.acked, w.mediaAcked = ack.Seq, w.through[ack.Seq%depth]
 				w.markProgress()
-				errors.LogDebug(w.ctx, "xdrive credit seq ", w.next, " ack ", w.acked, " frame ", w.frameSize())
+				errors.LogDebug(w.ctx, "xdrive credit seq ", w.next, " ack ", w.acked, " frame ", w.frameSize(slotTagBlock))
 			}
 		case isAuthError(err), err == errDriveScope, err == errNotFound && !w.table.lazy:
 			w.fail(err)
@@ -322,7 +321,7 @@ func (w *slotWriter) gather(yield func([]byte) bool) {
 	defer timer.Stop()
 	closing := false
 	for !closing {
-		frame := w.frameSize()
+		frame := w.frameSize(slotTagBlock)
 		if len(pending) == 0 {
 			pending = nil // Release the last handoff before waiting on an idle stream.
 			select {
@@ -393,18 +392,16 @@ func (w *slotWriter) run() {
 			<-w.permits
 			break
 		}
-		f := slotFrame{seq: w.next, mode: slotStream, size: len(chunk), data: chunk}
+		f := slotFrame{seq: w.next, mode: slotInline, size: len(chunk), data: chunk}
 		w.next++
 		i := f.seq % int64(len(fences))
 		prev, done := fences[i], make(chan struct{})
 		fences[i] = done
-		if f.size <= slotInlineLimit {
-			f.mode = slotInline
-			if f.seq == 0 {
-				w.first <- chunk
-			}
-		} else {
+		if f.size > slotInlineLimit {
+			f.mode = slotStream
 			w.mediaSent += charge
+		} else if f.seq == 0 {
+			w.first <- chunk
 		}
 		w.through[i] = w.mediaSent // Inline ACKs may cover earlier media.
 		workers.Go(func() {

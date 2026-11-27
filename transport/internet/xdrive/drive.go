@@ -54,10 +54,11 @@ type (
 )
 
 type mediaRead struct {
-	size      int
-	byteRange string
-	progress  func(int) // Timing only: receipt of a tagged block does not release ring credit.
-	consume   func(*http.Response) error
+	lane, stalled *connLane // This span's last GET and the lane to skip on its next attempt.
+	size          int
+	byteRange     string
+	progress      func(int) // Timing only: receipt of a tagged block does not release ring credit.
+	consume       func(*http.Response) error
 }
 
 type driveLane int
@@ -113,8 +114,7 @@ func newDriveStorage(settings *internet.MemoryStreamConfig, config *Config) (*dr
 	if s.folder == "appDataFolder" {
 		s.space = s.folder
 	}
-	// Four ordinary media requests per connection hide request latency;
-	// the byte budget and separate head permits bound speculative load.
+	// Four ordinary reads per lane hide latency; head permits and the byte budget bound look-ahead.
 	for i, limit := range [laneCount]int{48, 8, min(driveMaxInflight, 4*int(mediaConns))} {
 		s.pools[i] = newConnPool(config.Xmux, [laneCount]int32{0, 0, mediaConns}[i], client)
 		s.permits[i] = make(chan struct{}, limit)
@@ -157,8 +157,6 @@ func (s *driveStorage) Close() error {
 	}
 	return nil
 }
-
-var errSessionInUse = errors.New("session is live or already being collected")
 
 func flatten(name string) string { return strings.ReplaceAll(name, "/", flatSeparator) }
 
@@ -381,9 +379,10 @@ func (s *driveStorage) cooling() bool {
 }
 
 var (
-	errDriveSize  = errors.New("Drive response exceeds size limit")
-	errDriveScope = errors.New("Drive file does not belong to the announced session")
-	errDriveRange = errors.New("Drive range not yet available")
+	errSessionInUse = errors.New("session is live or already being collected")
+	errDriveSize    = errors.New("Drive response exceeds size limit")
+	errDriveScope   = errors.New("Drive file does not belong to the announced session")
+	errDriveRange   = errors.New("Drive range not yet available")
 )
 
 func readLimited(r io.Reader, limit int64) ([]byte, error) {
@@ -439,11 +438,7 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 		req.GetBody = nil // Reads have no body; never let the transport rewind an upload.
 		resp, err := s.clients[lane].Do(req)
 		if err != nil {
-			cause := errors.Cause(err)
-			if cause == errStalled {
-				ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // Ordinary timeout on subsequent HTTP attempts.
-			}
-			return read && cause != errSessionClosed, err
+			return read && errors.Cause(err) != errSessionClosed, err
 		}
 		defer resp.Body.Close()
 		status := resp.StatusCode
@@ -486,6 +481,10 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 	}
 	for attempt := 1; ; attempt++ {
 		retry, err := once()
+		if stream != nil && errors.Cause(err) == errStalled {
+			stream.stalled = stream.lane // Covers stalls before headers and during the body.
+			ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil))
+		}
 		if err == nil || !retry || attempt == driveMaxAttempts || ctx.Err() != nil {
 			return data, err
 		}
@@ -548,9 +547,8 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 		d, readErr := s.readDescription(verify, id)
 		matches := readErr == nil && d == description
 		if matches && description == "" && payload != nil { // A media announcement needs a full body comparison.
-			var media []byte
-			media, readErr = s.getMedia(verify, id, int64(len(payload)))
-			matches = readErr == nil && bytes.Equal(media, payload)
+			data, readErr = s.getMedia(verify, id, int64(len(payload)))
+			matches = readErr == nil && bytes.Equal(data, payload)
 		}
 		if matches {
 			return nil
@@ -597,11 +595,12 @@ func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo,
 	const stride = slotBodyHeader + slotTagBlock
 	total := f.size + slotBodyHeader*slotBlocks(f.size)
 	pos := lo * slotTagBlock // Payload offset of the next undelivered chunk.
+	read := new(mediaRead)
 	for attempt, stalled := 1, false; ; attempt++ {
 		before, started := pos, time.Now()
 		first := min(pos/slotTagBlock, hi-1)
 		start, end := first*stride, min(hi*stride, total)
-		read := &mediaRead{size: end - start}
+		read.size, read.byteRange = end-start, ""
 		if read.size != total {
 			read.byteRange = fmt.Sprintf("bytes=%d-%d", start, end-1)
 		}
@@ -856,15 +855,13 @@ func (s *driveStorage) readRing(ctx context.Context, session string, e Entry) (*
 	}
 	r := decodeRing(data, session, &s.unchecked)
 	s.boundFolder = s.folder
-	if r == nil || s.folder != "root" && s.folder != "appDataFolder" {
-		return r, nil
+	if r != nil && (s.folder == "root" || s.folder == "appDataFolder") {
+		var folder driveFile
+		if err := s.getJSON(ctx, filesURL+"/"+s.folder+"?fields=id", 4096, &folder, nil); err != nil || folder.ID == "" {
+			return nil, cmp.Or[error](err, errDriveScope)
+		}
+		s.boundFolder = folder.ID
 	}
-	var folder driveFile
-	err = s.getJSON(ctx, filesURL+"/"+s.folder+"?fields=id", 4096, &folder, nil)
-	if err != nil || folder.ID == "" {
-		return nil, cmp.Or[error](err, errDriveScope)
-	}
-	s.boundFolder = folder.ID
 	return r, nil
 }
 

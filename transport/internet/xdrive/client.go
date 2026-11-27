@@ -6,6 +6,7 @@ import (
 	gotls "crypto/tls"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"runtime"
 	"slices"
@@ -91,7 +92,8 @@ func (t *serviceTransport) roundTrip(r *http.Request, release func()) (*http.Res
 	if next == t.secure && t.parallel != nil && resp.ProtoMajor == 1 {
 		t.h1Hosts.Store(r.URL.Host, true)
 	}
-	alive(resp.StatusCode != http.StatusPartialContent)
+	wholeGET := r.Method == http.MethodGet && r.Header.Get("Range") == "" && resp.StatusCode == http.StatusOK
+	alive(resp.StatusCode != http.StatusPartialContent && !wholeGET) // Only a tagged span has a shorter watchdog to retain.
 	body := resp.Body
 	closeBody := sync.OnceValue(func() error {
 		defer release()
@@ -353,6 +355,9 @@ type connLane struct {
 func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 	now := time.Now()
 	score := func(l *connLane) float64 {
+		if read != nil && l == read.stalled {
+			return math.Inf(1) // A retry uses a different connection when there is one.
+		}
 		cost := cmp.Or(p.cost, 1)
 		if read != nil && now.Sub(l.sampled) < driveTimeout {
 			cost = l.cost
@@ -369,6 +374,7 @@ func (p *connPool) pickMedia(work int64, read *mediaRead) *connLane {
 	p.next = (best + 1) % len(p.lanes)
 	lane := &p.lanes[best]
 	if read != nil {
+		read.lane, read.stalled = lane, nil
 		before := lane.delivered - slotTagBlock // Include this GET's start cost once in every estimate.
 		read.progress = func(bytes int) {
 			p.mu.Lock()

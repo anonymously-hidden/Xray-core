@@ -79,8 +79,10 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    actually reached the ordered stream. The writer targets one second at that
    rate, bounded to 256 KiB–4 MiB; a partial gather can still be smaller.
    The sender also limits *unacknowledged media bytes*: two frame allowances per
-   lane (at least four, each at least 512 KiB), plus a quarter second of measured
-   delivery, capped at the local look-ahead byte budget plus one head frame.
+   lane (at least four allowances), plus a quarter second of measured delivery,
+   capped at the local look-ahead byte budget plus one head frame. Each allowance
+   starts at no less than 512 KiB; once a positive rate arrives it tracks the
+   measured frame target down to 256 KiB.
    Inline slots still use ordinary ring credit. A successful upload alone cannot
    open the media window. Quota cooldown freezes the sender's rate estimate.
 3. **Publish.** Up to 14 KiB goes inline in a file description. With fewer
@@ -137,7 +139,8 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    The offset is relative to the media body, excluding any description prefix.
    Duplicate bytes are skipped; tags, declared length and exact EOF are checked.
    For a multi-range frame, the first range streams straight into the frame queue.
-   Each span checks after five seconds without headers or new HTTP 206 body bytes.
+    Each span checks after five seconds without headers or new body bytes on an
+    HTTP 206 or an ordinary (unranged) HTTP 200 media GET.
    It can restart early only if its frame is the ordered head, the coordinator is
    draining this specific span, and Drive is not cooling down. There must be
    evidence of progress: a later range in this frame or a later media frame
@@ -145,8 +148,9 @@ by the reader. Sequence `n` always lives in `slots[n % depth]`.
    A verified successor also covers the last range of a frame and a progressive
    GET waiting for headers. An interrupted header wait uses the existing HTTP GET retry budget;
    a partial body uses offset-aware resume. After a stall
-   triggers a retry, subsequent attempts use the ordinary timeout. Any positive
-   body read resets the idle clock. A full-body HTTP 200 retains the ordinary timeout.
+    triggers a retry, the next GET uses a different media lane if available and
+    the ordinary timeout. Any positive body read resets the idle clock. An HTTP
+    200 answering a **Range** request keeps its ordinary timeout.
 6. **Credit.** The watermark description is JSON: `s` is the last completely
    delivered sequence and `r` is ordered payload bytes per second (zero until
    measured). The reader coalesces writes at `depth/6` frames, or checks every
@@ -252,6 +256,62 @@ folders and Google-native objects. Conflicting regular files with the exact same
 announcement name are not selected or deleted as a group; resolve them manually.
 The admission deadline also applies while loading or binding the announcement,
 not to the resulting connection. Use a dedicated folder for one listener and its clients.
+
+### GitHub first-byte delays on `.107`
+
+DevTools showed 29.51 s waiting for the first byte of `/pulls`, then 81 ms to
+download the document. The paired logs show a single 64-slot session. From the
+first GitHub connection through the end of the capture, all 70 completed client
+media frames matched server publications. Median server publication was 1.47 s;
+median client fetch was 9.42 s. All 70 were ordinary HTTP 200 media reads. The
+server opened the GitHub TCP connection within 22 ms of receiving it. Neither
+peer logged a Drive quota cooldown.
+
+Frame 2474 received headers in 0.97 s, then took 25.10 s to read its body.
+Nine later media frames completed before it. Frame 2551 took 32.57 s despite a
+retry before headers; the server subsequently waited 36.09 s for receiver
+credit before frame 2569. Small browser responses share the same ordered bytes
+as other traffic. The logs show this bottleneck, but cannot identify which
+frame carried `/pulls`, measure GitHub's own HTTP response time, or distinguish
+a continuous trickle from a pause within frame 2474.
+
+`.101` and `.107` both stopped checking for an early stall after *any* HTTP 200
+headers. This included ordinary media GETs as well as servers ignoring Range.
+The reader now keeps checking ordinary media bodies. It restarts an idle head
+only with verified later data, and resumes from a tagged block on another lane
+when possible. It does not restart a body that is still receiving bytes.
+
+With two local peers and a 20 s pause after 48 KiB of an HTTP 200 body,
+the next media frame verified at 7 s. `.107` finished the head at 20.00 s;
+the updated reader retried on another connection and finished at 10.24 s.
+After 288 KiB, the retry started at the second tag (wire offset 262,152).
+Both a 206 resume and a server ignoring that range delivered the exact bytes
+through EOF. A steady trickle, an idle head with no successor, and a paused
+full-body fallback to an original range request each kept their original GET.
+
+In the capture the sender also queued 4.046 MiB (sequences 2534–2549) before
+admitting 2550. `.107` sized each allowance at no less than 512 KiB even after
+the receiver reported a 256 KiB frame target. With four media lanes that left
+room for about sixteen of the smallest frames. Using the measured target for
+the allowance as well cut the observed peak in that state from 4.04 to 2.05
+MiB on the 500 KB/s fixture. Holding the `.107` reader fixed, browser first-byte
+p95 fell from 26.05 to 11.67 s; average full-request bulk throughput fell from
+263 to 253 KB/s. Those figures cover two runs per sender, not live GitHub.
+With both changes, the same slow profile gave 12.35 s first-byte p95 and
+13.97 s completion p95, versus 26.05 s for each on `.107`. Bulk averaged
+252 KB/s (3.9% lower); all 40 probes finished during a download. A separate
+fast run delivered 219 Mbit/s with all 16 probes overlapping the download.
+
+A separate fixture requested a document and its 12 assets during background
+traffic. One media connection sent 320 KiB of the 576,929-byte frame, then
+paused for 25.10 s while the other connections kept working. Document time to
+first byte was 30.19 s with `.101` peers, 28.60–28.63 s with `.107`, and
+8.81–9.05 s with both fixes. Full page completion went from 31.11–32.19 s on
+`.107` to 15.75–17.90 s. When bytes trickled continuously over the same interval,
+the updated reader did not retry and the document still took about 26 s to
+start. This reproduces the timing pattern without assuming the live GET paused.
+The `.107` wire format is unchanged. For downloads, the client supplies the
+new recovery behavior and the server supplies the smaller measured window.
 
 ### Browsing during a download on one session
 
@@ -582,9 +642,9 @@ for this snapshot, relative to `transport/internet/xdrive` unless marked `infra/
 
 | Source | Inclusive lines counted | Count |
 |---|---|---:|
-| `drive.go` | whole file | 891 |
-| `slots.go` | whole file | 693 |
-| `client.go` | whole file | 461 |
+| `drive.go` | whole file | 888 |
+| `slots.go` | whole file | 690 |
+| `client.go` | whole file | 467 |
 | `conn.go` | 8, 11, 33, 62–72, 74–80, 141–164, 166–178 | 58 |
 | `xdrive.go` | 4, 7, 11, 114–177, 187–188, 196, 198–201, 221–222, 259–285, 287–345, 353–358, 378–405, 407–426, 428–464 | 253 |
 | `params.go` | 74–82 | 9 |
