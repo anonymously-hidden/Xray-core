@@ -74,8 +74,9 @@ func paramsFromConfig(c *Config) params {
 func paramsForStorage(c *Config, storage backend) params {
 	p := paramsFromConfig(c)
 	if _, ok := storage.(*driveStorage); ok {
-		p.concurrency = capped(c.Concurrency, 64, maxConcurrency)
-		p.flushInterval = millis(c.FlushIntervalMs, 25*time.Millisecond)
+		p.concurrency = capped(c.Concurrency, 100, maxConcurrency)
+		p.segmentBytes = capped(c.SegmentBytes, slotMaxFrame, slotMaxFrame)
+		p.flushInterval = min(time.Second, max(25*time.Millisecond, millis(c.FlushIntervalMs, 100*time.Millisecond)))
 		p.maxPollInterval = max(p.minPollInterval, millis(c.MaxPollIntervalMs, 200*time.Millisecond))
 	}
 	return p

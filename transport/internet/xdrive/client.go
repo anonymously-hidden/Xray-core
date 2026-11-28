@@ -6,7 +6,6 @@ import (
 	gotls "crypto/tls"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"runtime"
 	"slices"
@@ -64,8 +63,7 @@ func (t *serviceTransport) roundTrip(r *http.Request, release func()) (*http.Res
 	}
 	ctx, cancel := context.WithCancelCause(r.Context())
 	alive := t.watch(ctx, cancel)
-	r = r.WithContext(ctx)
-	r.Header = r.Header.Clone()
+	r = r.Clone(ctx)
 	utils.TryDefaultHeadersWith(r.Header, "fetch")
 	upload := func(body io.ReadCloser, err error) (io.ReadCloser, error) {
 		if body != nil && body != http.NoBody {
@@ -94,44 +92,34 @@ func (t *serviceTransport) roundTrip(r *http.Request, release func()) (*http.Res
 	if next == t.secure && t.parallel != nil && resp.ProtoMajor == 1 {
 		t.h1Hosts.Store(r.URL.Host, true)
 	}
-	wholeGET := r.Method == http.MethodGet && r.Header.Get("Range") == "" && resp.StatusCode == http.StatusOK
-	alive(resp.StatusCode != http.StatusPartialContent && !wholeGET) // Only a tagged span has a shorter watchdog to retain.
+	alive()
 	body = resp.Body
 	resp.Body = &progressBody{Reader: body, alive: alive, ctx: ctx, close: finish}
 	return resp, nil
 }
 
-func (t *serviceTransport) watch(ctx context.Context, cancel context.CancelCauseFunc) func(bool) {
+func (t *serviceTransport) watch(ctx context.Context, cancel context.CancelCauseFunc) func() {
 	rescue, _ := ctx.Value(spanRescueKey{}).(func() bool)
 	gap := t.stall
 	if rescue != nil {
 		gap = min(gap, 5*time.Second)
 	}
-	last := time.Now()
-	var mu sync.Mutex
-	go func(next time.Time) {
-		for sleepContext(ctx, time.Until(next)) == nil {
-			mu.Lock()
-			idle := time.Since(last)
-			switch {
-			case idle < gap:
-				next = last.Add(gap)
-			case idle >= t.stall || rescue != nil && rescue():
+	start := time.Now()
+	var progress atomic.Int64
+	go func() {
+		for delay := gap; sleepContext(ctx, delay) == nil; {
+			idle := time.Since(start) - time.Duration(progress.Load())
+			if idle >= t.stall || idle >= gap && rescue != nil && rescue() {
 				cancel(errStalled)
-			default:
-				next = last.Add(min(t.stall, idle+gap))
+				return
 			}
-			mu.Unlock()
+			delay = gap - idle
+			if delay <= 0 {
+				delay = min(gap, t.stall-idle)
+			}
 		}
-	}(last.Add(gap))
-	return func(ordinary bool) {
-		mu.Lock()
-		if ordinary {
-			gap = t.stall
-		}
-		last = time.Now()
-		mu.Unlock()
-	}
+	}()
+	return func() { progress.Store(int64(time.Since(start))) }
 }
 
 func (t *serviceTransport) CloseIdleConnections() {
@@ -144,7 +132,7 @@ func (t *serviceTransport) CloseIdleConnections() {
 
 type progressBody struct {
 	io.Reader
-	alive func(bool)
+	alive func()
 	close func() error
 	ctx   context.Context // response request context; nil for uploads
 }
@@ -156,7 +144,7 @@ func (b *progressBody) Read(p []byte) (int, error) {
 	}
 	n, err := b.Reader.Read(p)
 	if n > 0 {
-		b.alive(false)
+		b.alive()
 	}
 	if err != nil && err != io.EOF && b.ctx != nil && context.Cause(b.ctx) == errStalled {
 		err = errStalled // HTTP/2 can surface a stall as ordinary cancellation.
@@ -325,17 +313,13 @@ type connPool struct {
 	lanes  []connLane // One pinned manager, or one per Drive media connection.
 	spread bool
 	next   int
-	cost   float64 // Last verified pool sample, used until a lane has a fresh one of its own.
 	ctx    context.Context
 	Close  context.CancelFunc
 }
 
 type connLane struct {
-	manager   *splithttp.XmuxManager
-	pending   atomic.Int64 // Charged until the body closes, including across lease rotation.
-	delivered int64        // Tagged wire bytes consumed across overlapping GETs.
-	cost      float64      // Nanoseconds per charged byte; guarded by pool.mu.
-	sampled   time.Time
+	manager *splithttp.XmuxManager
+	pending atomic.Int64 // Charged until the body closes, including across lease rotation.
 }
 
 // Charge the lane until this request's response body closes, even across lease rotation.
@@ -344,39 +328,25 @@ func (p *connPool) charge(r *http.Request) (*connLane, int64) {
 		return &p.lanes[0], 0
 	}
 	read, _ := r.Context().Value(mediaReadKey{}).(*mediaRead)
-	work := max(0, r.ContentLength) + slotTagBlock
+	work := max(0, r.ContentLength) + (256 << 10)
 	if read != nil {
-		work = int64(read.size) + slotTagBlock
+		work += int64(read.size)
 	}
-	now := time.Now()
-	best, bestScore := p.next, math.Inf(1)
+	best := -1
 	for off := range p.lanes {
 		i := (p.next + off) % len(p.lanes)
 		lane := &p.lanes[i]
-		if read != nil && lane == read.stalled {
+		if len(p.lanes) > 1 && read != nil && lane == read.stalled {
 			continue // A retry uses a different connection when there is one.
 		}
-		cost := cmp.Or(p.cost, 1)
-		if read != nil && now.Sub(lane.sampled) < driveTimeout {
-			cost = lane.cost
-		}
-		if score := cost * float64(lane.pending.Load()+work); score < bestScore {
-			best, bestScore = i, score
+		if best < 0 || lane.pending.Load() < p.lanes[best].pending.Load() {
+			best = i
 		}
 	}
 	p.next = (best + 1) % len(p.lanes)
 	lane := &p.lanes[best]
 	if read != nil {
 		read.lane, read.stalled = lane, nil
-		before := lane.delivered - slotTagBlock // Include this GET's start cost once in every estimate.
-		read.progress = func(bytes int) {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			lane.sampled = time.Now()
-			lane.delivered += int64(bytes)
-			p.cost = float64(lane.sampled.Sub(now)) / float64(lane.delivered-before)
-			lane.cost = (p.cost + cmp.Or(lane.cost, p.cost)) / 2
-		}
 	}
 	lane.pending.Add(work)
 	return lane, work

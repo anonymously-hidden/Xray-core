@@ -5,8 +5,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +26,6 @@ import (
 
 const (
 	flatSeparator       = "~"
-	driveInlineLimit    = 12000
 	driveMaxAnnounce    = 1 << 20
 	driveMaxInflight    = 64
 	driveMaxAttempts    = 8
@@ -47,7 +44,6 @@ type (
 	maxBodyKey    struct{}
 	headKey       struct{}
 	mediaHeadKey  struct{} // <-chan struct{}, closed on promotion
-	mediaSeqKey   struct{} // int64, for request retry diagnostics
 	mediaReadKey  struct{}
 	spanRescueKey struct{} // func() bool for the ordered span, cleared on resume
 )
@@ -56,7 +52,6 @@ type mediaRead struct {
 	lane, stalled *connLane // This span's last GET and the lane to skip on its next attempt.
 	size          int
 	byteRange     string
-	progress      func(int) // Timing only: receipt of a tagged block does not release ring credit.
 	consume       func(*http.Response) error
 }
 
@@ -71,10 +66,8 @@ const (
 
 type driveStorage struct {
 	*driveShared
-	clients     [laneCount]*http.Client
-	child       bool
-	boundFolder string
-	unchecked   sync.Map // peer-selected ID -> expected name, until first verified access
+	clients [laneCount]*http.Client
+	child   bool
 }
 
 type driveShared struct {
@@ -287,19 +280,14 @@ func (s *driveStorage) pace(ctx context.Context, next *time.Time, interval time.
 	}
 }
 
-// Join the wire parts once. A nil tag leaves an announcement body unchanged.
-func multipartBody(metadata, data, tag []byte) ([]byte, string) {
+func multipartBody(metadata, data []byte) ([]byte, string) {
 	for {
 		boundary := rand.Text()
-		parts := [][]byte{
-			[]byte("--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"), metadata,
-			[]byte("\r\n--" + boundary + "\r\nContent-Type: application/octet-stream\r\n\r\n"),
-		}
-		for block := range slices.Chunk(data, slotTagBlock) {
-			parts = append(parts, tag, block)
-		}
-		parts = append(parts, []byte("\r\n--"+boundary+"--\r\n"))
-		body := slices.Concat(parts...)
+		body := slices.Concat(
+			[]byte("--"+boundary+"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"), metadata,
+			[]byte("\r\n--"+boundary+"\r\nContent-Type: application/octet-stream\r\n\r\n"),
+			data, []byte("\r\n--"+boundary+"--\r\n"),
+		)
 		if bytes.Count(body, []byte(boundary)) == 3 { // No collision in metadata, media, or across a tag.
 			return body, "multipart/related; boundary=" + boundary
 		}
@@ -334,14 +322,9 @@ func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
-	return waitFor(ctx, time.After(d), nil)
-}
-
-func waitFor[T any](ctx context.Context, event <-chan T, wake <-chan struct{}) error {
 	select {
 	case <-ctx.Done():
-	case <-event:
-	case <-wake:
+	case <-time.After(d):
 	}
 	return ctx.Err()
 }
@@ -447,18 +430,14 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 			permits, head = s.headMedia, nil // Promotion also moves waiters out of the ordinary queue.
 		}
 		retry, err := send()
-		if errors.Cause(err) == errStalled {
-			if stream != nil {
-				stream.stalled = stream.lane
-			} else if ctx.Value(spanRescueKey{}) != nil {
-				return nil, err // Let slot discovery use a successor's descriptor before another GET.
-			}
-			ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil))
+		if stream != nil && errors.Cause(err) == errStalled {
+			stream.stalled = stream.lane
+			return nil, err // Resume the verified prefix on a different connection.
 		}
 		if err == nil || !retry || attempt == driveMaxAttempts || ctx.Err() != nil {
 			return data, err
 		}
-		errors.LogDebug(ctx, "xdrive request retry seq ", ctx.Value(mediaSeqKey{}), " method ", method, " attempt ", attempt+1, " err ", err)
+		errors.LogDebug(ctx, "xdrive request retry ", method, " attempt ", attempt+1, " err ", err)
 		if err := sleepContext(ctx, jitter(min(driveMaxBackoff, driveInitialBackoff<<(attempt-1)))); err != nil {
 			return data, err
 		}
@@ -466,42 +445,36 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 }
 
 type driveFile struct {
-	Properties  map[string]string `json:"properties,omitempty"`
-	MimeType    string            `json:"mimeType,omitempty"`
-	Trashed     bool              `json:"trashed,omitempty"`
-	CreatedTime string            `json:"createdTime,omitempty"`
-	ID          string            `json:"id,omitempty"`
-	Name        string            `json:"name,omitempty"`
-	Description string            `json:"description,omitempty"`
-	Parents     []string          `json:"parents,omitempty"`
+	MimeType    string   `json:"mimeType,omitempty"`
+	Trashed     bool     `json:"trashed,omitempty"`
+	CreatedTime string   `json:"createdTime,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	Name        string   `json:"name,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Parents     []string `json:"parents,omitempty"`
 }
 
-func (f driveFile) regular() bool {
-	return f.MimeType != "" && !strings.HasPrefix(f.MimeType, "application/vnd.google-apps.")
-}
-
-func (s *driveStorage) writeFile(ctx context.Context, id, name string, f driveFile, payload, tag []byte, checkACK func(context.Context) (bool, error)) error {
+func (s *driveStorage) writeFile(ctx context.Context, id, name, description string, payload []byte, covered func() bool) error {
+	f := driveFile{Description: description}
 	method, path := http.MethodPatch, "/"+url.PathEscape(id)
 	if name != "" {
 		method, path = http.MethodPost, ""
 		f.ID, f.Name = id, flatten(name)
 		f.MimeType, f.Parents = "application/octet-stream", []string{s.folder}
-	} else if _, pending := s.unchecked.Load(id); pending {
-		if _, err := s.readFile(ctx, id, "description"); err != nil {
-			return err
-		}
 	}
 	md, _ := json.Marshal(f)
 	path += "?fields=id&supportsAllDrives=true"
 	lane, target, typ := metadataLane, filesURL+path, "application/json"
 	if payload != nil {
-		lane, target = mediaLane, uploadURL+path+"&uploadType=multipart"
-		md, typ = multipartBody(md, payload, tag)
+		target = uploadURL + path + "&uploadType=multipart"
+		if len(payload) > slotHeader {
+			lane = mediaLane
+		} // Tiny clears do not queue behind bulk uploads.
+		md, typ = multipartBody(md, payload)
 	}
 	data, err := s.request(ctx, lane, method, target, typ, md, 4096, nil)
 	var reply driveFile
 	if err == nil && json.Unmarshal(data, &reply) == nil && reply.ID == id {
-		s.unchecked.Delete(id)
 		return nil
 	}
 	err = cmp.Or[error](err, errors.New("unexpected Drive file ID in write response"))
@@ -509,39 +482,26 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name string, f driveFi
 		return err
 	}
 	verify, cancel := context.WithTimeout(ctx, driveReconnectGrace) // GETs only; never replay an ambiguous mutation.
-	var probes sync.WaitGroup
-	defer probes.Wait() // Release neither the slot nor the session lease with a confirmation GET still running.
+	var watcher sync.WaitGroup
+	defer watcher.Wait()
 	defer cancel()
-	confirmed := make(chan struct{}, 2) // Either probe can finish while the other GET is stuck.
-	priority := context.WithValue(verify, headKey{}, true)
-	probe := func(ctx context.Context, delay time.Duration, check func(context.Context) (bool, error)) {
-		for backoff := driveInitialBackoff; sleepContext(ctx, delay) == nil; backoff = min(2*backoff, 2*time.Second) {
-			switch match, err := check(ctx); {
-			case match:
-				confirmed <- struct{}{}
-			case err != errDriveScope && !isAuthError(err):
-				delay = backoff
-				continue
-			case ctx == priority:
-				cancel() // Only a failed exact probe can end confirmation early.
+	if covered != nil {
+		watcher.Go(func() {
+			for !covered() && sleepContext(verify, driveInitialBackoff) == nil {
 			}
-			return
+			cancel() // A covering receipt also interrupts a stuck exact readback.
+		})
+	}
+	for delay := driveInitialBackoff; verify.Err() == nil; delay = min(2*delay, 2*time.Second) {
+		stored, e := s.readFile(context.WithValue(verify, headKey{}, true), id, "name,description")
+		if e == nil && stored.Description == description && (name == "" || stored.Name == f.Name) {
+			return nil
+		}
+		if isAuthError(e) || sleepContext(verify, delay) != nil {
+			break
 		}
 	}
-	if checkACK != nil {
-		probes.Go(func() { probe(context.WithValue(verify, headKey{}, nil), driveInitialBackoff, checkACK) })
-	}
-	exact := func(ctx context.Context) (bool, error) {
-		stored, err := s.readFile(ctx, id, "description")
-		match := err == nil && stored.Description == f.Description
-		if match && f.Description == "" && payload != nil { // A media announcement needs a full body comparison.
-			data, err := s.getMedia(ctx, id, int64(len(payload)))
-			return err == nil && bytes.Equal(data, payload), err
-		}
-		return match, err
-	}
-	probes.Go(func() { probe(priority, 0, exact) })
-	if waitFor(verify, confirmed, nil) == nil {
+	if covered != nil && covered() {
 		return nil
 	}
 	return err
@@ -559,166 +519,9 @@ func (s *driveStorage) getJSON(ctx context.Context, target string, limit int64, 
 
 func (s *driveStorage) readFile(ctx context.Context, id, fields string) (driveFile, error) {
 	var f driveFile
-	name, pending := s.unchecked.Load(id)
-	if pending {
-		fields += ",name,parents,trashed,mimeType"
-	}
 	target := filesURL + "/" + url.PathEscape(id) + "?fields=" + fields + "&supportsAllDrives=true"
-	if err := s.getJSON(ctx, target, 64<<10, &f, nil); err != nil || !pending {
-		return f, err
-	}
-	if !f.regular() || f.Trashed || f.Name != name || !slices.Contains(f.Parents, s.boundFolder) {
-		return driveFile{}, errDriveScope
-	}
-	s.unchecked.Delete(id)
-	return f, nil
-}
-
-// Emit tagged blocks [lo, hi) exactly once; allow one interrupted resume without new bytes.
-func (s *driveStorage) readSpan(ctx context.Context, id string, f slotFrame, lo, hi int, out chan<- []byte, whole func(), firstBlock chan struct{}) error {
-	blocks := slotBlocks(f.size)
-	wire := func(i int) int { return i*slotBodyHeader + min(i*slotTagBlock, f.size) }
-	pos := lo * slotTagBlock // Payload offset of the next undelivered chunk.
-	read := new(mediaRead)
-	var started, headers time.Time
-	var readErr error // Only an interrupted body read can resume again after the first retry.
-	var first int     // Requested block containing pos, or the last block if only EOF is missing.
-	read.consume = func(resp *http.Response) error {
-		headers = time.Now()
-		from, to := first, hi
-		if resp.StatusCode == http.StatusOK {
-			from, to = 0, blocks
-			if whole != nil && lo == 0 {
-				hi = blocks
-				whole() // Keep this response; cancel redundant full-body downloads.
-			}
-		} else if resp.StatusCode != http.StatusPartialContent || resp.Header.Get("Content-Range") != fmt.Sprintf("bytes %d-%d/%d", wire(from), wire(to)-1, wire(blocks)) {
-			return fmt.Errorf("unexpected Drive media response: HTTP %d, Content-Range %q", resp.StatusCode, resp.Header.Get("Content-Range"))
-		}
-		length := wire(to) - wire(from)
-		if resp.ContentLength >= 0 && resp.ContentLength != int64(length) {
-			return errors.New("unexpected Drive media length")
-		}
-		var tag [slotBodyHeader]byte
-		for block, at := from, from*slotTagBlock; block < to; block++ {
-			if _, readErr = io.ReadFull(resp.Body, tag[:]); readErr != nil || int64(binary.BigEndian.Uint64(tag[:])) != f.seq {
-				return cmp.Or[error](readErr, errDriveRange)
-			}
-			for end := min(at+slotTagBlock, f.size); at < end; {
-				size := slotReadChunk
-				if at == 0 { // Expose the earliest bytes without waiting for 32 KiB.
-					size = 4 << 10
-				}
-				b := make([]byte, min(size, end-at))
-				if _, readErr = io.ReadFull(resp.Body, b); readErr != nil {
-					return readErr
-				}
-				if at == pos && block < hi {
-					out <- b
-					pos += len(b)
-				}
-				at += len(b)
-			}
-			read.progress(wire(block+1) - wire(block))
-			if firstBlock != nil {
-				close(firstBlock)
-				firstBlock = nil
-			}
-		}
-		if _, readErr = io.ReadFull(resp.Body, tag[:1]); readErr != io.EOF {
-			return errors.New("Drive media did not end at the declared length").Base(readErr)
-		}
-		errors.LogDebug(ctx, "xdrive span seq ", f.seq, " blocks ", lo, "-", hi, " status ", resp.StatusCode, " bytes ", length, " headers ", headers.Sub(started), " body ", time.Since(headers))
-		return nil
-	}
-	for attempt, previousStart := 1, -1; attempt == 1 || sleepContext(ctx, driveInitialBackoff) == nil; attempt++ {
-		before := pos
-		started, headers, readErr = time.Now(), time.Time{}, nil
-		first = min(pos/slotTagBlock, hi-1)
-		read.byteRange, read.size = "", wire(hi)-wire(first)
-		if first != 0 || hi != blocks {
-			read.byteRange = fmt.Sprintf("bytes=%d-%d", wire(first), wire(hi)-1)
-		}
-		_, err := s.getMedia(context.WithValue(ctx, mediaReadKey{}, read), id, 0)
-		firstRetry := attempt == 1 && (!headers.IsZero() || err == errNotFound || err == errDriveRange)
-		progressRetry := attempt < driveMaxAttempts && readErr != nil && pos > previousStart
-		if err == nil || ctx.Err() != nil || !firstRetry && !progressRetry {
-			return err
-		}
-		previousStart = before // Two consecutive attempts must not both end at this offset.
-		errors.LogDebug(ctx, "xdrive span retry seq ", f.seq, " blocks ", lo, "-", hi, " emitted ", pos-lo*slotTagBlock, " elapsed ", time.Since(started), " err ", err)
-		ctx = context.WithValue(ctx, spanRescueKey{}, (func() bool)(nil)) // Never shorten the resume.
-	}
-	return ctx.Err()
-}
-
-// Speculative frames start with the first two ranges. The ordered head may use all lanes.
-func (s *driveStorage) readFrameStream(ctx context.Context, id string, f slotFrame, out chan<- []byte, verifiedFrame *atomic.Int64) error {
-	ctx = context.WithValue(ctx, mediaSeqKey{}, f.seq)
-	count := min(cap(s.headMedia), f.size/(2*slotTagBlock))
-	if f.size <= slotProgressiveMax || s.cooling() {
-		count = 1
-	}
-	boundary := func(i int) int { return i * slotBlocks(f.size) / count }
-	var draining, verified atomic.Int64 // Ordered range and highest range verified through EOF.
-	head := ctx.Value(mediaHeadKey{}).(<-chan struct{})
-	read := func(ctx context.Context, i int, chunks chan<- []byte, whole func(), firstBlock chan struct{}) error {
-		rescue := func() bool {
-			later := verifiedFrame.Load() > f.seq || verified.Load() > int64(i)
-			return later && isClosedChan(head) && draining.Load() == int64(i) && !s.cooling()
-		}
-		return s.readSpan(context.WithValue(ctx, spanRescueKey{}, rescue), id, f, boundary(i), boundary(i+1), chunks, whole, firstBlock)
-	}
-	if count == 1 {
-		return read(ctx, 0, out, nil, nil)
-	}
-	tailCtx, stopTails := context.WithCancel(ctx)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	defer stopTails()
-	firstBlock := make(chan struct{})
-	queues := make([]chan []byte, count) // Range zero streams directly to out.
-	results := make([]error, count)      // Published by closing the corresponding queue.
-	for i := 1; i < count; i++ {
-		queues[i] = make(chan []byte, (boundary(i+1)-boundary(i))*(slotTagBlock/slotReadChunk))
-		wg.Go(func() {
-			defer close(queues[i])
-			if i > 1 && waitFor(tailCtx, firstBlock, head) != nil {
-				return
-			}
-			if results[i] = read(tailCtx, i, queues[i], nil, nil); results[i] == nil {
-				advance(&verified, int64(i))
-			}
-		})
-	}
-	err := read(ctx, 0, out, stopTails, firstBlock)
-	for i := 1; i < count && err == nil && tailCtx.Err() == nil; i++ {
-		draining.Store(int64(i))
-		for b := range queues[i] {
-			out <- b
-		}
-		err = results[i]
-	}
-	return cmp.Or(err, ctx.Err()) // Full HTTP 200 cancels only the tails.
-}
-
-func (s *driveStorage) takeIDs(ctx context.Context, depth int) ([]string, error) {
-	count := 2*(depth+1) + 1 // Both slot tables, their watermarks and the announcement.
-	var batch struct{ IDs []string }
-	target := fmt.Sprintf("%s/generateIds?count=%d&space=%s", filesURL, count, s.space)
-	if err := s.getJSON(ctx, target, 256<<10, &batch, nil); err != nil {
-		return nil, err
-	}
-	seen := make(map[string]bool, count)
-	for _, id := range batch.IDs {
-		if slotIDPattern.MatchString(id) {
-			seen[id] = true
-		}
-	}
-	if len(batch.IDs) != count || len(seen) != count {
-		return nil, errors.New("invalid Drive ID batch")
-	}
-	return batch.IDs, ctx.Err()
+	err := s.getJSON(ctx, target, 64<<10, &f, nil)
+	return f, err
 }
 
 // The listener lists two directories and collects one announcement or stream namespace.
@@ -765,12 +568,12 @@ func (s *driveStorage) lookup(ctx context.Context, path string, cleanup bool) (m
 		for _, f := range page.Files {
 			rest, under := strings.CutPrefix(f.Name, prefix)
 			switch {
-			case !f.regular() || f.Trashed:
+			case f.Trashed || f.MimeType == "" || strings.HasPrefix(f.MimeType, "application/vnd.google-apps."):
 			case cleanup && (f.Name == flat || dir == streamsDir && under):
 				if dir == sessionsDir && len(entries) != 0 {
 					return nil, errors.New("multiple Drive files have the requested name")
 				}
-				entries[f.ID] = Entry{} // Cleanup uses physical IDs, including duplicate stream names.
+				entries[f.ID] = Entry{Name: f.Name} // Keep physical IDs, including duplicate stream names.
 			case path == streamsDir && under && f.ID != "":
 				name, _, _ := strings.Cut(rest, flatSeparator)
 				entries[name] = Entry{Name: name}
@@ -799,25 +602,35 @@ func (s *driveStorage) List(ctx context.Context, dir string) ([]Entry, error) {
 }
 
 func (s *driveStorage) readRing(ctx context.Context, session string, e Entry) (*ring, error) {
-	data, err := base64.StdEncoding.DecodeString(e.driveDescription)
-	if e.driveDescription == "" {
-		data, err = s.getMedia(ctx, e.driveID, driveMaxAnnounce)
-	} else if err != nil {
+	if e.driveDescription != slotMagic {
 		return nil, nil
 	}
+	data, err := s.getMedia(ctx, e.driveID, driveMaxAnnounce)
 	if err != nil {
 		return nil, err
 	}
-	r := decodeRing(data, session, &s.unchecked)
-	s.boundFolder = s.folder
-	if r != nil && (s.folder == "root" || s.folder == "appDataFolder") { // First-use scope checks need the canonical ID.
-		folder, err := s.readFile(ctx, s.folder, "id")
-		if err != nil || folder.ID == "" {
-			return nil, cmp.Or[error](err, errDriveScope)
-		}
-		s.boundFolder = folder.ID
+	var r ring
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, err
 	}
-	return r, nil
+	depth := len(r.Up.Slots)
+	if depth < 2 || depth > maxConcurrency || len(r.Down.Slots) != depth || r.Tick < 25 || r.Tick > 1000 {
+		return nil, errDriveScope
+	}
+	r.Up.name, r.Down.name = uplinkPrefix(session), downlinkPrefix(session)
+	// Bind every peer-selected ID before allowing either media reads or clears.
+	files, err := s.lookup(ctx, sessionPrefix(session), true)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range []slotTable{r.Up, r.Down} {
+		for i, id := range t.ids() {
+			if files[id].Name != flatten(t.filename(i)) {
+				return nil, errDriveScope
+			}
+		}
+	}
+	return &r, nil
 }
 
 func (s *driveStorage) Delete(ctx context.Context, name string) error {

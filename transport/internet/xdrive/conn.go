@@ -30,7 +30,6 @@ type Conn struct {
 	closing       chan struct{}
 	progress      atomic.Pointer[time.Time] // Last outbound or graceful drain progress.
 
-	publishWG sync.WaitGroup // registered before Dial exposes the connection
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -57,10 +56,10 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 	return c
 }
 
-func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, first []byte, onClose func()) *Conn {
+func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, onClose func()) *Conn {
 	c := baseConn(ctx, onClose)
 	w := newSlotWriter(slotDirection{Conn: c, store: store, table: write, params: p})
-	c.writer, c.reader = w, newSlotReader(slotDirection{Conn: c, store: store, table: read, params: p}, first, w.done)
+	c.writer, c.reader = w, newSlotReader(slotDirection{Conn: c, store: store, table: read, params: p})
 	return c
 }
 
@@ -157,7 +156,6 @@ func (c *Conn) closeOrdered() error {
 	defer c.onClose()
 	err := c.writer.Close()
 	if _, slots := c.writer.(*slotWriter); slots {
-		c.publishWG.Wait()
 		c.reader.wait() // Drain through END, including the final watermark.
 		err = context.Cause(c.ctx)
 	} else {

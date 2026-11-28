@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -134,34 +133,20 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 	}
 	p := paramsForStorage(config, storage)
 	if slots, ok := storage.(*driveStorage); ok {
-		depth := max(2, p.concurrency)
-		ids, err := slots.takeIDs(ctx, depth)
+		r, id, err := slots.createRing(ctx, session, p)
 		if err != nil {
 			release()
 			return nil, err
 		}
-		r := lazyRing(session, depth, ids)
-		errors.LogInfo(ctx, "opened session ", session, " in ", depth, " slots")
-		conn := newSlotConn(context.Background(), slots, r.Up, r.Down, p, nil, release)
-		conn.publishWG.Go(func() {
-			announce, _ := json.Marshal(r)
-			file := driveFile{}
-			if len(announce) <= driveInlineLimit {
-				select {
-				case r.First = <-conn.writer.(*slotWriter).first:
-					if withFirst, _ := json.Marshal(r); len(withFirst) <= driveInlineLimit {
-						announce = withFirst
-					}
-				case <-time.After(25 * time.Millisecond):
-				case <-conn.ctx.Done():
-					return
-				}
-				file.Description, announce = base64.StdEncoding.EncodeToString(announce), nil
-			}
-			if err := slots.writeFile(conn.ctx, ids[len(ids)-1], announceName(session, time.Now()), file, announce, nil, nil); err != nil {
-				conn.fail(errors.New("failed to announce session ", session).Base(err))
-			}
-		})
+		conn := newSlotConn(context.Background(), slots, r.Up, r.Down, p, release)
+		announce, _ := json.Marshal(r)
+		// The listener may delete the announcement before its POST reply arrives.
+		if err := slots.writeFile(ctx, id, announceName(session, time.Now()), slotMagic, announce, func() bool { return conn.writer.(*slotWriter).acked.Load() >= 0 }); err != nil {
+			conn.fail(err)
+			conn.Close()
+			return nil, err
+		}
+		errors.LogInfo(ctx, "opened session ", session, " in ", len(r.Up.Slots), " slots")
 		return conn, nil
 	}
 
@@ -314,7 +299,9 @@ func (l *Listener) accept(logCtx context.Context, id string, listed Entry, expir
 		r, err = slots.readRing(admit, id, listed)
 		if r != nil && admit.Err() == nil && time.Now().Before(expires) {
 			errors.LogInfo(logCtx, "accepted session ", id, " in ", len(r.Down.Slots), " slots")
-			return newSlotConn(l.ctx, slots, r.Down, r.Up, l.params, r.First, release), nil
+			p := l.params
+			p.flushInterval = time.Duration(r.Tick) * time.Millisecond
+			return newSlotConn(l.ctx, slots, r.Down, r.Up, p, release), nil
 		}
 	} else if admit.Err() == nil && time.Now().Before(expires) {
 		errors.LogInfo(logCtx, "accepted session ", id)
