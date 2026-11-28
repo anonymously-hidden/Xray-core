@@ -42,7 +42,6 @@ const (
 
 type (
 	maxBodyKey    struct{}
-	headKey       struct{}
 	mediaHeadKey  struct{} // <-chan struct{}, closed on promotion
 	mediaReadKey  struct{}
 	spanRescueKey struct{} // func() bool for the ordered span, cleared on resume
@@ -192,9 +191,9 @@ func (s *driveStorage) refreshToken(ctx context.Context, token *driveToken) erro
 		return tokenRetry{errors.New("the token endpoint answered ", status)}
 	}
 
-	body, err := readLimited(resp.Body, 1<<20)
+	body, err := readAdapterBody(resp.Body, 1<<20)
 	switch {
-	case err == errDriveSize:
+	case isPermanentAdapterError(err):
 		return err
 	case err != nil:
 		return tokenRetry{errors.New("failed to read the token response").Base(err)}
@@ -253,29 +252,34 @@ func (s *driveStorage) delayRequests(h http.Header) {
 	defer s.mu.Unlock()
 	delay := s.coolUntil.Sub(now)
 	if delay <= 0 {
-		if delay < -time.Minute {
-			s.coolDelay = 0
-		}
-		s.coolDelay = min(30*time.Second, max(2*time.Second, 2*s.coolDelay))
+		s.coolDelay = min(30*time.Second, max(2*time.Second, 2*s.pressure(now)))
 		delay = jitter(s.coolDelay)
+		errors.LogDebug(context.Background(), "xdrive quota pause ", max(delay, retry), "; request spacing ", s.coolDelay/40)
 	}
 	s.coolUntil = now.Add(max(delay, retry))
-	if s.nextRequest.Before(s.coolUntil) {
-		s.nextRequest = s.coolUntil
-	}
-	errors.LogDebug(context.Background(), "xdrive cooldown ", time.Until(s.coolUntil))
 }
 
-// Attempts share a pacing clock and recheck cooldown; deletions have their own clock.
+// Under mu: halve the penalty after each quota-free minute, including while idle.
+func (s *driveStorage) pressure(now time.Time) time.Duration {
+	return s.coolDelay >> max(0, now.Sub(s.coolUntil)/time.Minute)
+}
+
+// Charge actual admissions. A cooldown invalidates all earlier wake-up times.
 func (s *driveStorage) pace(ctx context.Context, next *time.Time, interval time.Duration) error {
 	for {
 		s.mu.Lock()
 		now := time.Now()
-		delay := max(0, next.Sub(now))
-		*next = now.Add(delay).Add(interval)
+		delay := next.Sub(now)
+		if next == &s.nextRequest {
+			delay = max(delay, s.coolUntil.Sub(now))
+			interval = max(driveRequestSpacing, s.pressure(now)/40)
+		}
+		if delay <= 0 {
+			*next = now.Add(interval)
+		}
 		s.mu.Unlock()
-		if err := sleepContext(ctx, delay); err != nil || next != &s.nextRequest || !s.cooling() {
-			return err
+		if delay <= 0 || sleepContext(ctx, delay) != nil {
+			return ctx.Err()
 		}
 	}
 }
@@ -294,84 +298,79 @@ func multipartBody(metadata, data []byte) ([]byte, string) {
 	}
 }
 
-// Serialize refreshes; a 401 can invalidate the cache while a refresh is in flight.
-func (s *driveStorage) accessToken(ctx context.Context) (string, error) {
+// One cancellable admission queue for refreshes and file requests across lanes.
+func (s *driveStorage) admit(ctx context.Context) (string, error) {
 	if err := sendUntil(ctx, s.tokenLock, struct{}{}, nil, nil); err != nil {
 		return "", err
 	}
 	defer func() { <-s.tokenLock }()
-	if cached := s.oauth.Load(); cached != nil && (isAuthError(cached.err) || time.Now().Before(cached.expires)) {
-		if _, transient := cached.err.(tokenRetry); !transient {
-			return cached.AccessToken, cached.err
-		}
-		if err := sleepContext(ctx, time.Until(cached.expires)); err != nil {
+	for {
+		if err := s.pace(ctx, &s.nextRequest, driveRequestSpacing); err != nil {
 			return "", err
 		}
+		if cached := s.oauth.Load(); cached != nil && (isAuthError(cached.err) || time.Now().Before(cached.expires)) {
+			return cached.AccessToken, cached.err
+		}
+		var token driveToken
+		if err := s.refreshToken(ctx, &token); err != nil {
+			if ctx.Err() == nil {
+				s.oauth.Store(&driveToken{err: err, expires: time.Now().Add(time.Second)})
+			}
+			return "", err
+		}
+		s.oauth.Store(&token) // Refresh used this admission; recheck the token at dispatch.
 	}
-	if err := s.pace(ctx, &s.nextRequest, driveRequestSpacing); err != nil {
-		return "", err
-	}
-	var token driveToken
-	if err := s.refreshToken(ctx, &token); err != nil {
-		token = driveToken{err: err, expires: time.Now().Add(time.Second)}
-	}
-	if token.err == nil || ctx.Err() == nil {
-		s.oauth.Store(&token)
-	}
-	return token.AccessToken, token.err
 }
 
-func sleepContext(ctx context.Context, d time.Duration) error {
+func waitContext[T any](ctx context.Context, ready <-chan T) error {
 	select {
 	case <-ctx.Done():
-	case <-time.After(d):
+	case <-ready:
 	}
 	return ctx.Err()
 }
 
-func (s *driveStorage) cooling() bool {
+func sleepContext(ctx context.Context, d time.Duration) error { return waitContext(ctx, time.After(d)) }
+
+func (s *driveStorage) cooling() bool { return s.sinceCooldown(time.Time{}) < 0 }
+
+func (s *driveStorage) sinceCooldown(last time.Time) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return time.Now().Before(s.coolUntil)
+	return min(time.Since(last), time.Since(s.coolUntil))
+}
+
+func (s *driveStorage) cadence(tick time.Duration) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return max(tick, s.pressure(time.Now())/8) // Budget five requests per tick after throttling.
 }
 
 var (
 	errSessionInUse = errors.New("session is live or already being collected")
-	errDriveSize    = errors.New("Drive response exceeds size limit")
 	errDriveScope   = errors.New("Drive file does not belong to the announced session")
 	errDriveRange   = errors.New("Drive range not yet available")
 	errCredit       = errors.New("invalid receiver watermark")
 	driveStatusErrs = map[int]error{http.StatusNotFound: errNotFound, http.StatusRequestedRangeNotSatisfiable: errDriveRange}
 )
 
-func readLimited(r io.Reader, limit int64) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if int64(len(b)) > limit {
-		return nil, errDriveSize
-	}
-	return b, err
-}
-
 type driveClock struct{ served, observed time.Time } // Drive and local times at header arrival.
 
 func (s *driveStorage) request(ctx context.Context, lane driveLane, method, target, contentType string, body []byte, limit int64, clock *driveClock) (data []byte, err error) {
 	read := method == http.MethodGet
 	stream, _ := ctx.Value(mediaReadKey{}).(*mediaRead)
-	if lane == metadataLane && ctx.Value(headKey{}) != nil && method != http.MethodDelete {
-		lane = priorityLane
-	}
 	head, _ := ctx.Value(mediaHeadKey{}).(<-chan struct{})
 	permits := s.permits[lane]
 	unauthorized := 0
 	send := func() (bool, error) {
 		defer func() { <-permits }()
-		token, err := s.accessToken(ctx)
+		token, err := s.admit(ctx)
 		if err != nil {
 			_, retry := err.(tokenRetry) // No file request has been sent yet.
 			return retry, err
 		}
-		req, buildErr := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
-		if err := cmp.Or(s.pace(ctx, &s.nextRequest, driveRequestSpacing), buildErr); err != nil {
+		req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
+		if err != nil {
 			return false, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -398,8 +397,8 @@ func (s *driveStorage) request(ctx context.Context, lane driveLane, method, targ
 				clock.observed = time.Now()
 				clock.served, _ = http.ParseTime(resp.Header.Get("Date"))
 			}
-			data, err = readLimited(resp.Body, limit)
-			return read && err != errDriveSize, err // Only a buffered GET can discard a partial read.
+			data, err = readAdapterBody(resp.Body, limit)
+			return read && !isPermanentAdapterError(err), err // Only a buffered GET can discard a partial read.
 		case status == 429 || status == 503 && resp.Header.Get("Retry-After") != "":
 			s.delayRequests(resp.Header) // Other lanes must not wait for this error body to finish.
 			return read || status == 429, fmt.Errorf("Drive %s: HTTP %d", method, status)
@@ -481,19 +480,20 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 	if _, refused := err.(refusedPayload); refused || isAuthError(err) || ctx.Err() != nil {
 		return err
 	}
-	verify, cancel := context.WithTimeout(ctx, driveReconnectGrace) // GETs only; never replay an ambiguous mutation.
+	verify, cancel := context.WithCancel(ctx) // GETs only; never replay an ambiguous mutation.
 	var watcher sync.WaitGroup
 	defer watcher.Wait()
 	defer cancel()
-	if covered != nil {
-		watcher.Go(func() {
-			for !covered() && sleepContext(verify, driveInitialBackoff) == nil {
+	watcher.Go(func() {
+		defer cancel()
+		for start := time.Now(); s.sinceCooldown(start) < driveReconnectGrace && (covered == nil || !covered()); {
+			if sleepContext(verify, driveInitialBackoff) != nil {
+				return
 			}
-			cancel() // A covering receipt also interrupts a stuck exact readback.
-		})
-	}
+		}
+	})
 	for delay := driveInitialBackoff; verify.Err() == nil; delay = min(2*delay, 2*time.Second) {
-		stored, e := s.readFile(context.WithValue(verify, headKey{}, true), id, "name,description")
+		stored, e := s.readFile(verify, id, "name,description")
 		if e == nil && stored.Description == description && (name == "" || stored.Name == f.Name) {
 			return nil
 		}
@@ -509,8 +509,8 @@ func (s *driveStorage) writeFile(ctx context.Context, id, name, description stri
 
 type refusedPayload struct{ error }
 
-func (s *driveStorage) getJSON(ctx context.Context, target string, limit int64, v any, clock *driveClock) error {
-	data, err := s.request(ctx, metadataLane, http.MethodGet, target, "", nil, limit, clock)
+func (s *driveStorage) getJSON(ctx context.Context, lane driveLane, target string, limit int64, v any, clock *driveClock) error {
+	data, err := s.request(ctx, lane, http.MethodGet, target, "", nil, limit, clock)
 	if err != nil {
 		return err
 	}
@@ -520,7 +520,7 @@ func (s *driveStorage) getJSON(ctx context.Context, target string, limit int64, 
 func (s *driveStorage) readFile(ctx context.Context, id, fields string) (driveFile, error) {
 	var f driveFile
 	target := filesURL + "/" + url.PathEscape(id) + "?fields=" + fields + "&supportsAllDrives=true"
-	err := s.getJSON(ctx, target, 64<<10, &f, nil)
+	err := s.getJSON(ctx, priorityLane, target, 64<<10, &f, nil) // Credit and write confirmation share reserved capacity.
 	return f, err
 }
 
@@ -557,7 +557,7 @@ func (s *driveStorage) lookup(ctx context.Context, path string, cleanup bool) (m
 			NextPageToken    string
 			IncompleteSearch bool
 		}
-		switch err := s.getJSON(ctx, filesURL+"?"+q.Encode(), 32<<20, &page, &clock); {
+		switch err := s.getJSON(ctx, metadataLane, filesURL+"?"+q.Encode(), 32<<20, &page, &clock); {
 		case err != nil:
 			return nil, err
 		case page.IncompleteSearch || seen[page.NextPageToken]:

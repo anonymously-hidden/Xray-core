@@ -58,8 +58,9 @@ func newConn(ctx context.Context, storage Storage, writePrefix, readPrefix strin
 
 func newSlotConn(ctx context.Context, store *driveStorage, write, read slotTable, p params, onClose func()) *Conn {
 	c := baseConn(ctx, onClose)
-	w := newSlotWriter(slotDirection{Conn: c, store: store, table: write, params: p})
-	c.writer, c.reader = w, newSlotReader(slotDirection{Conn: c, store: store, table: read, params: p})
+	r := &slotReader{slotDirection: slotDirection{c, store, read, p}, ch: make(chan []byte, 2), done: make(chan struct{})}
+	c.reader, c.writer = r, newSlotWriter(slotDirection{c, store, write, p})
+	go r.run()
 	return c
 }
 
@@ -138,11 +139,16 @@ func (c *Conn) Close() error {
 		result := make(chan error, 2) // The ordered close and its watchdog can each report once.
 		c.markProgress()
 		go func() { result <- c.closeOrdered() }()
-		for wait := slotStallTimeout; wait > 0; wait = slotStallTimeout - time.Since(*c.progress.Load()) {
+		for wait := slotStallTimeout; wait > 0; {
 			select {
 			case c.closeErr = <-result:
 				return
 			case <-time.After(wait):
+			}
+			last := *c.progress.Load()
+			wait = slotStallTimeout - time.Since(last)
+			if w, ok := c.writer.(*slotWriter); ok {
+				wait = w.remaining(last)
 			}
 		}
 		result <- context.DeadlineExceeded

@@ -65,7 +65,7 @@ func (s *driveStorage) createRing(ctx context.Context, session string, p params)
 	count := 2*(depth+1) + 1 // Both slot tables, their watermarks and the announcement.
 	var batch struct{ IDs []string }
 	target := fmt.Sprintf("%s/generateIds?count=%d&space=%s", filesURL, count, s.space)
-	if err := s.getJSON(ctx, target, 256<<10, &batch, nil); err != nil {
+	if err := s.getJSON(ctx, metadataLane, target, 256<<10, &batch, nil); err != nil {
 		return ring{}, "", err
 	}
 	ids := batch.IDs
@@ -110,6 +110,12 @@ func sendUntil[T any](ctx context.Context, dst chan<- T, value T, deadline, clos
 
 func (c *Conn) markProgress() { c.progress.Store(new(time.Now())) }
 
+func (c *Conn) failOn(err error) {
+	if err != nil {
+		c.fail(err)
+	}
+}
+
 type slotDirection struct {
 	*Conn
 	store *driveStorage
@@ -118,6 +124,10 @@ type slotDirection struct {
 }
 
 func (d slotDirection) id(seq int64) string { return d.table.Slots[seq%int64(len(d.table.Slots))] }
+
+func (d slotDirection) remaining(last time.Time) time.Duration {
+	return max(slotStallTimeout, d.sessionTTL) - max(0, d.store.sinceCooldown(last))
+}
 
 func wireSize(size int) int { return size + max(1, (size+slotBlock-1)/slotBlock)*slotHeader }
 
@@ -172,7 +182,7 @@ func (w *slotWriter) writeUntil(p []byte, deadline, closing <-chan struct{}) (in
 }
 
 func (w *slotWriter) pollCredit(ctx context.Context) {
-	for sleepContext(ctx, 300*time.Millisecond) == nil {
+	for sleepContext(ctx, w.store.cadence(300*time.Millisecond)) == nil {
 		f, err := w.store.readFile(ctx, w.table.Watermark, "description")
 		if err == nil {
 			n, err := strconv.ParseInt(f.Description, 10, 64)
@@ -194,26 +204,22 @@ func (w *slotWriter) run() {
 	writes.SetLimit(32)
 	var poller sync.WaitGroup
 	defer poller.Wait()
-	defer func() {
-		if err := writes.Wait(); err != nil {
-			w.fail(err)
-		}
-	}() // Wait cancels the credit poller.
+	defer func() { w.failOn(writes.Wait()) }() // Wait cancels the credit poller.
 	poller.Go(func() { w.pollCredit(ctx) })
 	tick := time.NewTicker(w.flushInterval)
 	defer tick.Stop()
 	depth := int64(len(w.table.Slots))
 	through := make([]int64, depth)
 	fences := make([]chan struct{}, depth)
-	var buf []byte
-	var seq, sent, credited int64
+	var buf bytes.Buffer
+	var sent, credited int64
 	lastAck := int64(-1)
 	lastProgress := time.Now()
 	closing := w.closing
 	finished := false
 	for ctx.Err() == nil {
 		var input chan []byte
-		if len(buf) < w.segmentBytes && closing != nil {
+		if buf.Len() < w.segmentBytes && closing != nil {
 			input = w.input
 		}
 		select {
@@ -223,52 +229,51 @@ func (w *slotWriter) run() {
 			closing = nil
 			continue
 		case b := <-input:
-			buf = append(buf, b...)
+			buf.Write(b)
 			continue
 		case <-tick.C:
 		}
+		cadence := w.store.cadence(w.flushInterval)
+		tick.Reset(cadence)
 		if ack := w.acked.Load(); ack > lastAck {
 			lastAck, credited, lastProgress = ack, through[ack%depth], time.Now()
 			if closing == nil {
 				w.markProgress()
 			}
 		}
+		seq := w.started.Load() + 1
 		pos := seq % depth
 		room := slotByteWindow - (sent - credited)
 		if finished && lastAck == seq-1 {
 			return
 		}
-		if finished || seq-depth > lastAck || fences[pos] != nil && !isClosedChan(fences[pos]) || room == 0 && len(buf) > 0 {
-			if time.Since(lastProgress) > slotStallTimeout {
+		slowPeer := cadence > w.flushInterval || time.Since(lastProgress) >= 2*time.Second
+		idleAhead := slowPeer && closing != nil && buf.Len() == 0 && seq-lastAck > 8
+		blocked := seq-depth > lastAck || fences[pos] != nil && !isClosedChan(fences[pos]) || room == 0 && buf.Len() > 0
+		if finished || blocked || idleAhead || w.store.cooling() {
+			if w.remaining(lastProgress) <= 0 {
 				w.fail(errors.New("timed out waiting for slot reuse"))
 				return
 			}
 			continue
 		}
-		n := min(len(buf), w.segmentBytes, int(room))
+		n := min(buf.Len(), w.segmentBytes, int(room))
 		kind := byte('D')
-		if n == 0 {
+		switch {
+		case n == 0 && closing == nil:
+			kind, finished = 'F', true
+		case n == 0:
 			kind = 'E'
-			if closing == nil {
-				kind = 'F'
-				finished = true
-			}
 		}
-		wire := frameBody(kind, seq, buf[:n])
-		buf = buf[n:]
-		if len(buf) == 0 {
-			buf = nil
-		}
+		wire := frameBody(kind, seq, buf.Next(n))
 		sent += int64(n)
 		stored := make(chan struct{})
 		fences[pos], through[pos] = stored, sent
-		num := seq
-		w.started.Store(num)
-		seq++
+		w.started.Store(seq)
 		writes.Go(func() error {
 			defer close(stored)
-			desc := fmt.Sprintf("%c:%d", kind, num)
-			return w.store.writeFile(ctx, w.id(num), "", desc, wire, func() bool { return w.acked.Load() >= num })
+			desc := fmt.Sprintf("%c:%d", kind, seq)
+			return w.store.writeFile(ctx, w.id(seq), "", desc, wire, func() bool { return w.acked.Load() >= seq })
 		})
 	}
 }
@@ -285,20 +290,15 @@ type slotReader struct {
 }
 
 type slotRead struct {
-	seq  int64
-	data chan []byte
-	head chan struct{}
-	kind byte
-	size int
-	hit  time.Time // Local start of the GET that first observed this generation.
-	miss time.Time // Start of the last GET which saw an older generation.
-	err  error
-}
-
-func newSlotReader(d slotDirection) *slotReader {
-	r := &slotReader{slotDirection: d, ch: make(chan []byte, 2), done: make(chan struct{})}
-	go r.run()
-	return r
+	seq      int64
+	data     chan []byte
+	head     chan struct{}
+	promoted time.Time // Set before closing head.
+	kind     byte
+	size     int
+	hit      time.Time // Local start of the GET that first observed this generation.
+	miss     time.Time // Start of the last GET which saw an older generation.
+	err      error
 }
 
 func (r *slotReader) chunks() <-chan []byte { return r.ch }
@@ -384,8 +384,7 @@ func (r *slotReader) fetch(ctx context.Context, j *slotRead) error {
 	ctx = context.WithValue(ctx, spanRescueKey{}, func() bool { return isClosedChan(j.head) && !r.store.cooling() })
 	pos := 0
 	var read mediaRead
-	start := time.Now()
-	for backoff := r.flushInterval / 4; ctx.Err() == nil; backoff = min(backoff*2, 400*time.Millisecond) {
+	for backoff := r.flushInterval / 4; ; backoff = min(backoff*2, 400*time.Millisecond) {
 		issued := time.Now()
 		err := r.get(ctx, j, &read, &pos, 0, j.data)
 		if err == nil || err == errSlotFrame || isAuthError(err) {
@@ -394,15 +393,16 @@ func (r *slotReader) fetch(ctx context.Context, j *slotRead) error {
 		if j.kind == 'D' { // Resume the verified prefix without metadata discovery.
 			break
 		}
+		if isClosedChan(j.head) && r.remaining(j.promoted) <= 0 {
+			return errors.New("missing media sequence ", j.seq).Base(err)
+		}
+		if !j.miss.IsZero() && waitContext(ctx, j.head) != nil {
+			return ctx.Err()
+		}
 		if err == errSlotPending || err == errNotFound {
 			j.miss = issued
 		}
-		if !isClosedChan(j.head) || r.store.cooling() {
-			start = time.Now() // An older frame or a quota cooldown can legitimately hold this slot back.
-		} else if time.Since(start) > slotStallTimeout {
-			return errors.New("missing media sequence ", j.seq).Base(err)
-		}
-		if sleepContext(ctx, backoff) != nil {
+		if sleepContext(ctx, r.store.cadence(backoff)) != nil {
 			return ctx.Err()
 		}
 	}
@@ -416,9 +416,6 @@ func (r *slotReader) fetch(ctx context.Context, j *slotRead) error {
 				return ctx.Err()
 			}
 		}
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 	// Resume disjoint ranges in parallel, even without a readable successor.
 	mid := (pos + (j.size-pos)/2) / slotBlock * slotBlock
@@ -468,22 +465,17 @@ func (r *slotReader) run() {
 	defer close(r.done)
 	defer close(r.ch)
 	ctx, cancel := context.WithCancel(r.ctx)
-	var reads, clears sync.WaitGroup
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	acks := make(chan int64, len(r.table.Slots))
-	clears.Go(func() {
-		if err := r.receipts(acks); err != nil {
-			r.fail(err)
-		}
-	})
-	defer clears.Wait()
+	workers.Go(func() { r.failOn(r.receipts(acks)) })
 	defer close(acks)
-	defer reads.Wait()
 	defer cancel()
 	width := min(slotReadAhead, len(r.table.Slots))
 	jobs := make(chan *slotRead, width-1)
 	var phase atomic.Int64
 	origin := time.Now()
-	reads.Go(func() {
+	workers.Go(func() {
 		defer close(jobs)
 		for n := int64(0); ctx.Err() == nil; n++ {
 			due := origin.Add(time.Duration(n)*r.flushInterval + time.Duration(phase.Load()))
@@ -494,15 +486,19 @@ func (r *slotReader) run() {
 			if sendUntil(ctx, jobs, j, nil, nil) != nil {
 				return
 			}
-			reads.Go(func() {
+			workers.Go(func() {
 				defer close(j.data)
 				j.err = r.fetch(ctx, j)
 			})
+			if r.store.cadence(0) > r.flushInterval && waitContext(ctx, j.head) != nil {
+				return // One speculative GET while the request budget is tight.
+			}
 		}
 	})
 	var misses int
 	var adjusted time.Time
 	for j := range jobs {
+		j.promoted = time.Now()
 		close(j.head) // Promotion never cancels a progressing request.
 		for b := range j.data {
 			if err := sendUntil(ctx, r.ch, b, nil, r.closing); err != nil && ctx.Err() != nil {
